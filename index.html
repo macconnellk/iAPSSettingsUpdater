@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>iAPS Parameter Optimizer - v13 FIXED</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+        const { useState } = React;
+        
+        // Icons
+        const Activity = () => (
+            <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+        );
+        
+        const Server = () => (
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
+            </svg>
+        );
+
+        const ConfidenceBadge = ({ level, score }) => {
+            const colors = {
+                High: 'bg-green-100 text-green-800 border-green-300',
+                Medium: 'bg-yellow-100 text-yellow-800 border-yellow-300',
+                Low: 'bg-orange-100 text-orange-800 border-orange-300'
+            };
+            
+            return (
+                <span className={`px-3 py-1 rounded-full text-sm font-semibold border ${colors[level] || 'bg-gray-100'}`}>
+                    {level} ({score}%)
+                </span>
+            );
+        };
+
+        const IAPSOptimizer = () => {
+            const [nightscoutData, setNightscoutData] = useState(null);
+            const [analysisResults, setAnalysisResults] = useState(null);
+            const [analyzing, setAnalyzing] = useState(false);
+            const [error, setError] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [fetchStatus, setFetchStatus] = useState('');
+            const [analysisWindow, setAnalysisWindow] = useState(1);
+            
+            const [nsConfig, setNsConfig] = useState(() => {
+                try {
+                    const saved = localStorage.getItem('nightscoutConfig');
+                    if (saved) return JSON.parse(saved);
+                } catch (e) {}
+                return { 
+                    baseUrl: 'https://bmac.us.nightscoutpro.com', 
+                    apiSecret: 'uFhaZjS2jLaz', 
+                    token: 'cockpit-cdbc465a76b45661' 
+                };
+            });
+
+            const updateNsConfig = (newConfig) => {
+                setNsConfig(newConfig);
+                try {
+                    localStorage.setItem('nightscoutConfig', JSON.stringify(newConfig));
+                } catch (e) {}
+            };
+
+            // Find which CR schedule entry applies to a given time
+            const getCRForTime = (timeStr, crSchedule) => {
+                const dt = new Date(timeStr);
+                const hours = dt.getHours();
+                const minutes = dt.getMinutes();
+                const timeInMinutes = hours * 60 + minutes;
+                
+                // Convert schedule to minutes
+                const scheduleInMinutes = crSchedule.map(entry => {
+                    const [h, m] = entry.time.split(':').map(Number);
+                    return { minutes: h * 60 + m, value: entry.value, time: entry.time };
+                }).sort((a, b) => a.minutes - b.minutes);
+                
+                // Find the applicable schedule entry
+                let applicable = scheduleInMinutes[0];
+                for (let entry of scheduleInMinutes) {
+                    if (timeInMinutes >= entry.minutes) {
+                        applicable = entry;
+                    } else {
+                        break;
+                    }
+                }
+                
+                return applicable;
+            };
+
+            // Analysis Functions
+            const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
+                const now = new Date();
+                const eventTime = new Date(timestamp);
+                const ageHours = (now - eventTime) / (1000 * 60 * 60);
+                const windowHours = analysisWindowDays * 24;
+                
+                const decayFactor = 0.3;
+                const weight = Math.exp(-decayFactor * (ageHours / windowHours));
+                
+                return weight;
+            };
+
+            const groupProblemsByDay = (problems) => {
+                const groups = {};
+                problems.forEach(p => {
+                    const date = new Date(p.time).toLocaleDateString();
+                    if (!groups[date]) groups[date] = [];
+                    groups[date].push(p);
+                });
+                return groups;
+            };
+
+            const calculateConfidenceScore = (problems, analysisWindowDays) => {
+                if (problems.length === 0) return { level: 'None', score: 0 };
+                
+                const now = new Date();
+                const last24h = problems.filter(p => {
+                    const age = (now - new Date(p.time)) / (1000 * 60 * 60);
+                    return age <= 24;
+                });
+                
+                if (problems.length >= 3 && last24h.length >= 2) {
+                    return {
+                        level: 'High',
+                        score: 90,
+                        details: `${problems.length} events total, ${last24h.length} in last 24h`,
+                        recommendation: '100% of calculated adjustment'
+                    };
+                }
+                
+                if (problems.length >= 2 && last24h.length >= 1) {
+                    return {
+                        level: 'Medium',
+                        score: 60,
+                        details: `${problems.length} events, ${last24h.length} recent`,
+                        recommendation: '75% of calculated adjustment'
+                    };
+                }
+                
+                return {
+                    level: 'Low',
+                    score: 35,
+                    details: `Only ${problems.length} event(s)`,
+                    recommendation: '50% of calculated adjustment'
+                };
+            };
+
+            const runAnalysis = async () => {
+                setAnalyzing(true);
+                setError(null);
+                
+                try {
+                    console.log('Starting analysis...', nightscoutData);
+                    
+                    if (!nightscoutData || !nightscoutData.glucose) {
+                        throw new Error('No glucose data available');
+                    }
+                    
+                    // Extract profile data
+                    let crSchedule = [];
+                    let isfSchedule = [];
+                    
+                    if (nightscoutData.profile && nightscoutData.profile.length > 0) {
+                        const profile = nightscoutData.profile[0];
+                        if (profile.store && profile.store.default) {
+                            crSchedule = profile.store.default.carbratio || [];
+                            isfSchedule = profile.store.default.sens || [];
+                        }
+                    }
+                    
+                    console.log('CR Schedule:', crSchedule);
+                    console.log('Processing glucose readings:', nightscoutData.glucose.length);
+                    
+                    // Step 1B: Low Problem Identification - FIXED
+                    const lowProblems = [];
+                    nightscoutData.glucose.forEach((reading, idx) => {
+                        console.log(`Reading ${idx}: ${reading.localDateTime} = ${reading.sgv} mg/dL`);
+                        if (reading.sgv <= 75) {
+                            const severity = reading.sgv < 55 ? 'severe' : 
+                                           reading.sgv < 65 ? 'moderate' : 'minor';
+                            const weight = calculateRecencyWeight(reading.dateString, analysisWindow);
+                            
+                            // Determine which CR schedule this falls under
+                            const crEntry = getCRForTime(reading.localDateTime, crSchedule);
+                            
+                            lowProblems.push({
+                                time: reading.dateString,
+                                localTime: reading.localDateTime,
+                                bg: reading.sgv,
+                                severity,
+                                weight,
+                                direction: 'Weaken',
+                                crScheduleTime: crEntry.time,
+                                currentCR: crEntry.value
+                            });
+                            console.log(`LOW DETECTED: ${reading.localDateTime} = ${reading.sgv} mg/dL`);
+                        }
+                    });
+                    
+                    console.log(`Total lows found: ${lowProblems.length}`);
+                    
+                    // Step 1C: High Problem Identification
+                    const highProblems = [];
+                    let currentHigh = null;
+                    
+                    nightscoutData.glucose.forEach((reading, idx) => {
+                        if (reading.sgv > 160) {
+                            if (!currentHigh) {
+                                currentHigh = {
+                                    startTime: reading.dateString,
+                                    localStartTime: reading.localDateTime,
+                                    startBG: reading.sgv,
+                                    readings: [reading]
+                                };
+                            } else {
+                                currentHigh.readings.push(reading);
+                            }
+                        } else if (currentHigh) {
+                            const durationHours = currentHigh.readings.length * 5 / 60;
+                            if (durationHours >= 3) {
+                                const avgBG = currentHigh.readings.reduce((sum, r) => sum + r.sgv, 0) / currentHigh.readings.length;
+                                const weight = calculateRecencyWeight(currentHigh.startTime, analysisWindow);
+                                
+                                // Determine which CR schedule this falls under
+                                const crEntry = getCRForTime(currentHigh.localStartTime, crSchedule);
+                                
+                                highProblems.push({
+                                    time: currentHigh.startTime,
+                                    localTime: currentHigh.localStartTime,
+                                    bg: Math.round(avgBG),
+                                    duration: durationHours.toFixed(1),
+                                    severity: avgBG > 220 ? 'severe' : avgBG > 180 ? 'moderate' : 'minor',
+                                    weight,
+                                    direction: 'Strengthen',
+                                    crScheduleTime: crEntry.time,
+                                    currentCR: crEntry.value
+                                });
+                            }
+                            currentHigh = null;
+                        }
+                    });
+                    
+                    // Check for ongoing high
+                    if (currentHigh) {
+                        const durationHours = currentHigh.readings.length * 5 / 60;
+                        if (durationHours >= 3) {
+                            const avgBG = currentHigh.readings.reduce((sum, r) => sum + r.sgv, 0) / currentHigh.readings.length;
+                            const weight = calculateRecencyWeight(currentHigh.startTime, analysisWindow);
+                            const crEntry = getCRForTime(currentHigh.localStartTime, crSchedule);
+                            
+                            highProblems.push({
+                                time: currentHigh.startTime,
+                                localTime: currentHigh.localStartTime,
+                                bg: Math.round(avgBG),
+                                duration: durationHours.toFixed(1),
+                                severity: avgBG > 220 ? 'severe' : avgBG > 180 ? 'moderate' : 'minor',
+                                weight,
+                                direction: 'Strengthen',
+                                crScheduleTime: crEntry.time,
+                                currentCR: crEntry.value
+                            });
+                        }
+                    }
+                    
+                    // Calculate recommendations by CR schedule time
+                    const recommendations = [];
+                    
+                    // Group problems by CR schedule time
+                    const problemsByCRTime = {};
+                    
+                    lowProblems.forEach(p => {
+                        if (!problemsByCRTime[p.crScheduleTime]) {
+                            problemsByCRTime[p.crScheduleTime] = { lows: [], highs: [] };
+                        }
+                        problemsByCRTime[p.crScheduleTime].lows.push(p);
+                    });
+                    
+                    highProblems.forEach(p => {
+                        if (!problemsByCRTime[p.crScheduleTime]) {
+                            problemsByCRTime[p.crScheduleTime] = { lows: [], highs: [] };
+                        }
+                        problemsByCRTime[p.crScheduleTime].highs.push(p);
+                    });
+                    
+                    // Generate recommendations for each time period
+                    Object.keys(problemsByCRTime).sort().forEach(scheduleTime => {
+                        const { lows, highs } = problemsByCRTime[scheduleTime];
+                        
+                        // SAFETY FIRST: Process lows before highs
+                        if (lows.length > 0) {
+                            const confidence = calculateConfidenceScore(lows, analysisWindow);
+                            const avgBG = lows.reduce((sum, p) => sum + p.bg, 0) / lows.length;
+                            const currentCR = lows[0].currentCR;
+                            
+                            // Calculate adjustment based on severity
+                            let adjustmentPercent = 5;
+                            if (avgBG < 55) adjustmentPercent = 15;
+                            else if (avgBG < 65) adjustmentPercent = 10;
+                            
+                            // Scale by confidence
+                            const scalingFactor = confidence.score / 100;
+                            const finalAdjustmentPercent = Math.round(adjustmentPercent * scalingFactor);
+                            const multiplier = 1 + (finalAdjustmentPercent / 100);
+                            const newCR = (currentCR * multiplier).toFixed(1);
+                            
+                            recommendations.push({
+                                type: `CR Weakening @ ${scheduleTime}`,
+                                reason: `${lows.length} low BG events detected`,
+                                confidence: confidence,
+                                adjustment: `+${finalAdjustmentPercent}%`,
+                                currentCR: currentCR,
+                                newCR: parseFloat(newCR),
+                                calculation: `${currentCR} g/U × ${multiplier.toFixed(3)} = ${newCR} g/U`,
+                                scheduleTime: scheduleTime,
+                                details: `Average BG: ${Math.round(avgBG)} mg/dL`,
+                                problems: lows,
+                                priority: 'HIGH'
+                            });
+                        }
+                        
+                        if (highs.length > 0) {
+                            const confidence = calculateConfidenceScore(highs, analysisWindow);
+                            const avgBG = highs.reduce((sum, p) => sum + p.bg, 0) / highs.length;
+                            const currentCR = highs[0].currentCR;
+                            
+                            // Calculate adjustment based on severity
+                            let adjustmentPercent = 5;
+                            if (avgBG > 220) adjustmentPercent = 10;
+                            else if (avgBG > 180) adjustmentPercent = 7.5;
+                            
+                            const scalingFactor = confidence.score / 100;
+                            const finalAdjustmentPercent = (adjustmentPercent * scalingFactor).toFixed(1);
+                            const multiplier = 1 - (finalAdjustmentPercent / 100);
+                            const newCR = (currentCR * multiplier).toFixed(1);
+                            
+                            recommendations.push({
+                                type: `CR Strengthening @ ${scheduleTime}`,
+                                reason: `${highs.length} persistent high BG period detected`,
+                                confidence: confidence,
+                                adjustment: `-${finalAdjustmentPercent}%`,
+                                currentCR: currentCR,
+                                newCR: parseFloat(newCR),
+                                calculation: `${currentCR} g/U × ${multiplier.toFixed(3)} = ${newCR} g/U`,
+                                scheduleTime: scheduleTime,
+                                details: `Average BG: ${Math.round(avgBG)} mg/dL`,
+                                problems: highs,
+                                priority: 'MEDIUM'
+                            });
+                        }
+                    });
+                    
+                    if (recommendations.length === 0) {
+                        recommendations.push({
+                            type: 'No Changes',
+                            reason: 'No significant problems detected',
+                            confidence: { level: 'High', score: 100 },
+                            adjustment: '0%',
+                            details: 'Current parameters appear appropriate',
+                            priority: 'INFO'
+                        });
+                    }
+                    
+                    setAnalysisResults({
+                        lowProblems,
+                        highProblems,
+                        recommendations,
+                        analysisWindow,
+                        crSchedule
+                    });
+                    
+                } catch (err) {
+                    console.error('Analysis error:', err);
+                    setError(err.message);
+                } finally {
+                    setAnalyzing(false);
+                }
+            };
+
+            const fetchNightscoutData = async (baseUrl, endpoint, params) => {
+                const url = new URL(baseUrl + endpoint);
+                Object.keys(params).forEach(key => {
+                    if (params[key]) url.searchParams.append(key, params[key]);
+                });
+                
+                const authMethods = [
+                    { headers: { 'api-secret': nsConfig.apiSecret } },
+                    { headers: { 'Authorization': `Bearer ${nsConfig.apiSecret}` } },
+                    (() => {
+                        const urlCopy = new URL(url.toString());
+                        if (nsConfig.token) urlCopy.searchParams.append('token', nsConfig.token);
+                        return { url: urlCopy };
+                    })()
+                ];
+                
+                for (const method of authMethods) {
+                    try {
+                        const fetchUrl = method.url || url;
+                        const response = await fetch(fetchUrl.toString(), {
+                            method: 'GET',
+                            headers: { 'Accept': 'application/json', ...method.headers }
+                        });
+                        if (response.ok) return await response.json();
+                    } catch (error) {
+                        console.log(`Auth method failed:`, error.message);
+                    }
+                }
+                throw new Error(`Failed to fetch ${endpoint}`);
+            };
+
+            const fetchFromNightscout = async (days = analysisWindow) => {
+                setLoading(true);
+                setError(null);
+                setFetchStatus('🔄 Connecting to Nightscout...');
+                
+                try {
+                    if (!nsConfig.baseUrl) throw new Error('Please enter your Nightscout URL');
+                    
+                    const baseUrl = nsConfig.baseUrl.replace(/\/$/, '');
+                    const endTime = new Date();
+                    const startDate = new Date(endTime.getTime() - (days * 24 * 60 * 60 * 1000));
+                    const dateString = startDate.toISOString();
+                    
+                    setFetchStatus(`📊 Fetching ${days}-day data...`);
+                    
+                    const [entries, treatments, profile] = await Promise.all([
+                        fetchNightscoutData(baseUrl, '/api/v1/entries.json', { 
+                            count: days * 288,
+                            'find[dateString][$gte]': dateString 
+                        }),
+                        fetchNightscoutData(baseUrl, '/api/v1/treatments.json', { 
+                            count: days * 100,
+                            'find[created_at][$gte]': dateString 
+                        }),
+                        fetchNightscoutData(baseUrl, '/api/v1/profile.json', {}).catch(() => [])
+                    ]);
+                    
+                    console.log('Fetched:', entries.length, 'glucose entries');
+                    console.log('Fetched:', treatments.length, 'treatments');
+                    console.log('Profile:', profile?.length || 0);
+                    
+                    // Add localDateTime to glucose (matching export format)
+                    const glucoseWithLocal = entries.map(e => {
+                        const date = new Date(e.dateString);
+                        return {
+                            ...e,
+                            localDateTime: date.toISOString().slice(0, 19)
+                        };
+                    });
+                    
+                    // Add localDateTime to treatments (matching export format)
+                    const treatmentsWithLocal = treatments.map(t => {
+                        const date = new Date(t.created_at);
+                        return {
+                            ...t,
+                            localDateTime: date.toISOString().slice(0, 19)
+                        };
+                    });
+                    
+                    const exportData = {
+                        exportInfo: {
+                            timestamp: endTime.toISOString(),
+                            dataPoints: {
+                                glucose: entries.length,
+                                treatments: treatments.length
+                            }
+                        },
+                        glucose: glucoseWithLocal,
+                        treatments: treatmentsWithLocal,
+                        profile: profile
+                    };
+                    
+                    setNightscoutData(exportData);
+                    setFetchStatus(`✅ Data loaded! ${entries.length} glucose readings, ${treatments.length} treatments`);
+                    setLoading(false);
+                    
+                } catch (err) {
+                    console.error('Fetch error:', err);
+                    setError('Failed to fetch: ' + err.message);
+                    setFetchStatus('');
+                    setLoading(false);
+                }
+            };
+
+            const handleFileUpload = (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+                
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = JSON.parse(e.target.result);
+                        setNightscoutData(data);
+                    } catch (err) {
+                        setError('Invalid JSON file');
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-6">
+                    <div className="max-w-4xl mx-auto">
+                        <div className="bg-white rounded-lg shadow-xl p-6 mb-6">
+                            <div className="flex items-center gap-3 mb-2">
+                                <Activity />
+                                <h1 className="text-3xl font-bold text-gray-800">iAPS Parameter Optimizer</h1>
+                            </div>
+                            <p className="text-gray-600">Multi-day analysis with confidence scoring - v13 FIXED</p>
+                            <p className="text-sm text-green-600 font-semibold mt-2">
+                                ✅ Low detection bug FIXED | ✅ CR calculations added
+                            </p>
+                        </div>
+
+                        {error && (
+                            <div className="bg-red-50 border border-red-300 text-red-800 px-4 py-3 rounded-lg mb-6">
+                                <strong>Error:</strong> {error}
+                            </div>
+                        )}
+
+                        {!nightscoutData && !loading && (
+                            <div className="bg-white rounded-lg shadow-lg p-6">
+                                <h2 className="text-xl font-bold mb-4">Load Data</h2>
+                                
+                                <div className="mb-4">
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        Analysis Window
+                                    </label>
+                                    <select 
+                                        value={analysisWindow}
+                                        onChange={(e) => setAnalysisWindow(Number(e.target.value))}
+                                        className="w-full px-4 py-2 border border-gray-300 rounded-lg"
+                                    >
+                                        <option value={1}>Last 24 hours</option>
+                                        <option value={3}>Last 3 days</option>
+                                        <option value={7}>Last 7 days</option>
+                                    </select>
+                                </div>
+
+                                <div className="space-y-3">
+                                    <button
+                                        onClick={() => fetchFromNightscout(analysisWindow)}
+                                        disabled={loading}
+                                        className="w-full py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition disabled:bg-gray-400 font-semibold flex items-center justify-center gap-2"
+                                    >
+                                        <Server />
+                                        {loading ? 'Fetching...' : 'Fetch from Nightscout'}
+                                    </button>
+                                    
+                                    <div className="text-xs text-gray-500 text-center px-2">
+                                        Note: Direct fetch may not work when opening HTML file locally due to CORS restrictions. Use Upload instead.
+                                    </div>
+                                    
+                                    <div className="text-center text-gray-500">or</div>
+                                    
+                                    <label className="w-full py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition cursor-pointer font-semibold flex items-center justify-center gap-2">
+                                        📁 Upload JSON File
+                                        <input
+                                            type="file"
+                                            accept=".json"
+                                            onChange={handleFileUpload}
+                                            className="hidden"
+                                        />
+                                    </label>
+                                    
+                                    <div className="text-xs text-green-600 text-center px-2 font-semibold">
+                                        ✅ Recommended: Use your Nightscout JSON export
+                                    </div>
+                                </div>
+
+                                {fetchStatus && (
+                                    <div className="mt-4 text-center text-indigo-600">
+                                        {fetchStatus}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {nightscoutData && !analysisResults && (
+                            <div className="bg-white rounded-lg shadow-lg p-6">
+                                <h2 className="text-xl font-bold mb-3">Data Loaded Successfully!</h2>
+                                
+                                <div className="grid grid-cols-3 gap-4 text-sm mb-4">
+                                    <div>
+                                        <div className="text-gray-600">Glucose Readings</div>
+                                        <div className="text-2xl font-bold text-indigo-600">
+                                            {nightscoutData.glucose?.length || 0}
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <div className="text-gray-600">Treatments</div>
+                                        <div className="text-2xl font-bold text-indigo-600">
+                                            {nightscoutData.treatments?.length || 0}
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <div className="text-gray-600">Profile Data</div>
+                                        <div className="text-xl font-bold text-green-600">
+                                            {nightscoutData.profile ? '✓' : '✗'}
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <button
+                                    onClick={runAnalysis}
+                                    disabled={analyzing}
+                                    className="w-full py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition disabled:bg-gray-400 font-semibold"
+                                >
+                                    {analyzing ? '🔄 Analyzing...' : '🚀 Analyze Data'}
+                                </button>
+                                
+                                <button
+                                    onClick={() => setNightscoutData(null)}
+                                    className="mt-3 text-sm text-indigo-600 hover:underline"
+                                >
+                                    ← Load different data
+                                </button>
+                            </div>
+                        )}
+
+                        {analysisResults && (
+                            <div className="space-y-6">
+                                <div className="bg-white rounded-lg shadow-lg p-6">
+                                    <h2 className="text-2xl font-bold mb-4">📊 Analysis Results</h2>
+                                    
+                                    <div className="grid grid-cols-2 gap-4 mb-6">
+                                        <div className="p-4 bg-red-50 rounded-lg border border-red-200">
+                                            <div className="text-sm text-gray-600">Low BG Events</div>
+                                            <div className="text-3xl font-bold text-red-600">
+                                                {analysisResults.lowProblems.length}
+                                            </div>
+                                        </div>
+                                        <div className="p-4 bg-orange-50 rounded-lg border border-orange-200">
+                                            <div className="text-sm text-gray-600">Persistent Highs</div>
+                                            <div className="text-3xl font-bold text-orange-600">
+                                                {analysisResults.highProblems.length}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <h3 className="text-xl font-bold mb-3">🎯 Recommendations</h3>
+                                    
+                                    {analysisResults.recommendations.map((rec, idx) => (
+                                        <div key={idx} className={`mb-4 p-4 rounded-lg border-2 ${
+                                            rec.priority === 'HIGH' ? 'bg-red-50 border-red-300' :
+                                            rec.priority === 'MEDIUM' ? 'bg-orange-50 border-orange-300' :
+                                            'bg-blue-50 border-blue-300'
+                                        }`}>
+                                            <div className="flex items-center justify-between mb-2">
+                                                <h4 className="text-lg font-bold">{rec.type}</h4>
+                                                <ConfidenceBadge level={rec.confidence.level} score={rec.confidence.score} />
+                                            </div>
+                                            
+                                            <p className="text-gray-700 mb-2">{rec.reason}</p>
+                                            
+                                            {rec.currentCR && (
+                                                <div className="bg-white p-3 rounded border border-gray-200 mb-3">
+                                                    <div className="grid grid-cols-2 gap-3 text-sm mb-2">
+                                                        <div>
+                                                            <span className="font-semibold">Schedule Time:</span>
+                                                            <span className="ml-2 text-lg font-bold text-purple-600">{rec.scheduleTime}</span>
+                                                        </div>
+                                                        <div>
+                                                            <span className="font-semibold">Adjustment:</span>
+                                                            <span className="ml-2 text-lg font-bold text-indigo-600">{rec.adjustment}</span>
+                                                        </div>
+                                                    </div>
+                                                    <div className="text-sm">
+                                                        <span className="font-semibold">Current CR:</span>
+                                                        <span className="ml-2">{rec.currentCR} g/U</span>
+                                                        <span className="mx-2">→</span>
+                                                        <span className="font-semibold">New CR:</span>
+                                                        <span className="ml-2 text-lg font-bold text-green-600">{rec.newCR} g/U</span>
+                                                    </div>
+                                                    <div className="text-xs text-gray-600 mt-1">
+                                                        Calculation: {rec.calculation}
+                                                    </div>
+                                                </div>
+                                            )}
+                                            
+                                            <p className="text-xs text-gray-600 mt-2">{rec.details}</p>
+                                            
+                                            {rec.confidence.details && (
+                                                <p className="text-xs text-gray-500 mt-1">
+                                                    📈 Pattern: {rec.confidence.details}
+                                                </p>
+                                            )}
+                                            
+                                            <p className="text-xs font-semibold text-gray-700 mt-2">
+                                                Apply: {rec.confidence.recommendation}
+                                            </p>
+                                            
+                                            {rec.problems && rec.problems.length > 0 && (
+                                                <details className="mt-3">
+                                                    <summary className="text-sm text-gray-600 cursor-pointer hover:text-gray-800">
+                                                        View {rec.problems.length} events
+                                                    </summary>
+                                                    <div className="mt-2 space-y-1 text-xs">
+                                                        {Object.entries(groupProblemsByDay(rec.problems)).map(([date, dayProblems], dayIdx) => (
+                                                            <div key={dayIdx} className="pl-3 border-l-2 border-gray-300">
+                                                                <div className="font-semibold text-gray-700">{date}</div>
+                                                                {dayProblems.map((p, pIdx) => (
+                                                                    <div key={pIdx} className="text-gray-600">
+                                                                        {new Date(p.time).toLocaleTimeString()}: {p.bg} mg/dL
+                                                                        {p.duration && ` (${p.duration}h)`}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </details>
+                                            )}
+                                        </div>
+                                    ))}
+                                    
+                                    {analysisResults.crSchedule && analysisResults.crSchedule.length > 0 && (
+                                        <div className="mt-6 p-4 bg-gray-50 rounded-lg">
+                                            <h4 className="font-bold mb-2">📋 Current CR Schedule</h4>
+                                            <div className="grid grid-cols-2 gap-2 text-sm">
+                                                {analysisResults.crSchedule.map((entry, idx) => (
+                                                    <div key={idx} className="flex justify-between">
+                                                        <span className="font-mono">{entry.time}</span>
+                                                        <span>{entry.value} g/U</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                    
+                                    <button
+                                        onClick={() => {
+                                            setAnalysisResults(null);
+                                            setNightscoutData(null);
+                                        }}
+                                        className="mt-4 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700"
+                                    >
+                                        ← Analyze Different Data
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        ReactDOM.render(<IAPSOptimizer />, document.getElementById('root'));
+    </script>
+</body>
+</html>
