@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>iAPS Parameter Optimizer - v13 FIXED</title>
+    <title>iAPS Parameter Optimizer - v14 CR Attribution Fix</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -180,7 +180,7 @@
                     console.log('CR Schedule:', crSchedule);
                     console.log('Processing glucose readings:', nightscoutData.glucose.length);
                     
-                    // Step 1B: Low Problem Identification - FIXED
+                    // Step 1B: Low Problem Identification - FIXED v14
                     const lowProblems = [];
                     nightscoutData.glucose.forEach((reading, idx) => {
                         console.log(`Reading ${idx}: ${reading.localDateTime} = ${reading.sgv} mg/dL`);
@@ -189,8 +189,34 @@
                                            reading.sgv < 65 ? 'moderate' : 'minor';
                             const weight = calculateRecencyWeight(reading.dateString, analysisWindow);
                             
-                            // Determine which CR schedule this falls under
-                            const crEntry = getCRForTime(reading.localDateTime, crSchedule);
+                            // Find the most recent meal/carb entry BEFORE this low
+                            // Look back up to 6 hours (insulin action time)
+                            const lowTime = new Date(reading.dateString);
+                            const lookbackWindow = 6 * 60 * 60 * 1000; // 6 hours in ms
+                            const earliestMealTime = new Date(lowTime - lookbackWindow);
+                            
+                            let relevantMeal = null;
+                            if (nightscoutData.treatments) {
+                                for (let treatment of nightscoutData.treatments) {
+                                    const treatmentTime = new Date(treatment.created_at || treatment.dateString);
+                                    
+                                    // Must be before the low, within lookback window, and have carbs
+                                    if (treatmentTime <= lowTime && 
+                                        treatmentTime >= earliestMealTime &&
+                                        treatment.carbs > 0) {
+                                        
+                                        if (!relevantMeal || treatmentTime > new Date(relevantMeal.created_at || relevantMeal.dateString)) {
+                                            relevantMeal = treatment;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Determine CR slot: use meal time if found, otherwise use low time
+                            const timeForCR = relevantMeal 
+                                ? (relevantMeal.localDateTime || relevantMeal.created_at)
+                                : reading.localDateTime;
+                            const crEntry = getCRForTime(timeForCR, crSchedule);
                             
                             lowProblems.push({
                                 time: reading.dateString,
@@ -200,15 +226,17 @@
                                 weight,
                                 direction: 'Weaken',
                                 crScheduleTime: crEntry.time,
-                                currentCR: crEntry.value
+                                currentCR: crEntry.value,
+                                mealTime: relevantMeal ? (relevantMeal.localDateTime || relevantMeal.created_at) : null,
+                                mealCarbs: relevantMeal ? relevantMeal.carbs : null
                             });
-                            console.log(`LOW DETECTED: ${reading.localDateTime} = ${reading.sgv} mg/dL`);
+                            console.log(`LOW DETECTED: ${reading.localDateTime} = ${reading.sgv} mg/dL, meal at ${relevantMeal ? (relevantMeal.localDateTime || relevantMeal.created_at) : 'unknown'}, CR slot: ${crEntry.time}`);
                         }
                     });
                     
                     console.log(`Total lows found: ${lowProblems.length}`);
                     
-                    // Step 1C: High Problem Identification
+                    // Step 1C: High Problem Identification - FIXED v14
                     const highProblems = [];
                     let currentHigh = null;
                     
@@ -230,8 +258,32 @@
                                 const avgBG = currentHigh.readings.reduce((sum, r) => sum + r.sgv, 0) / currentHigh.readings.length;
                                 const weight = calculateRecencyWeight(currentHigh.startTime, analysisWindow);
                                 
-                                // Determine which CR schedule this falls under
-                                const crEntry = getCRForTime(currentHigh.localStartTime, crSchedule);
+                                // Find the most recent meal BEFORE this high started
+                                const highStartTime = new Date(currentHigh.startTime);
+                                const lookbackWindow = 4 * 60 * 60 * 1000; // 4 hours
+                                const earliestMealTime = new Date(highStartTime - lookbackWindow);
+                                
+                                let relevantMeal = null;
+                                if (nightscoutData.treatments) {
+                                    for (let treatment of nightscoutData.treatments) {
+                                        const treatmentTime = new Date(treatment.created_at || treatment.dateString);
+                                        
+                                        if (treatmentTime <= highStartTime && 
+                                            treatmentTime >= earliestMealTime &&
+                                            treatment.carbs > 0) {
+                                            
+                                            if (!relevantMeal || treatmentTime > new Date(relevantMeal.created_at || relevantMeal.dateString)) {
+                                                relevantMeal = treatment;
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Use meal time for CR determination
+                                const timeForCR = relevantMeal 
+                                    ? (relevantMeal.localDateTime || relevantMeal.created_at)
+                                    : currentHigh.localStartTime;
+                                const crEntry = getCRForTime(timeForCR, crSchedule);
                                 
                                 highProblems.push({
                                     time: currentHigh.startTime,
@@ -242,7 +294,9 @@
                                     weight,
                                     direction: 'Strengthen',
                                     crScheduleTime: crEntry.time,
-                                    currentCR: crEntry.value
+                                    currentCR: crEntry.value,
+                                    mealTime: relevantMeal ? (relevantMeal.localDateTime || relevantMeal.created_at) : null,
+                                    mealCarbs: relevantMeal ? relevantMeal.carbs : null
                                 });
                             }
                             currentHigh = null;
@@ -255,7 +309,32 @@
                         if (durationHours >= 3) {
                             const avgBG = currentHigh.readings.reduce((sum, r) => sum + r.sgv, 0) / currentHigh.readings.length;
                             const weight = calculateRecencyWeight(currentHigh.startTime, analysisWindow);
-                            const crEntry = getCRForTime(currentHigh.localStartTime, crSchedule);
+                            
+                            // Find the most recent meal BEFORE this high started
+                            const highStartTime = new Date(currentHigh.startTime);
+                            const lookbackWindow = 4 * 60 * 60 * 1000;
+                            const earliestMealTime = new Date(highStartTime - lookbackWindow);
+                            
+                            let relevantMeal = null;
+                            if (nightscoutData.treatments) {
+                                for (let treatment of nightscoutData.treatments) {
+                                    const treatmentTime = new Date(treatment.created_at || treatment.dateString);
+                                    
+                                    if (treatmentTime <= highStartTime && 
+                                        treatmentTime >= earliestMealTime &&
+                                        treatment.carbs > 0) {
+                                        
+                                        if (!relevantMeal || treatmentTime > new Date(relevantMeal.created_at || relevantMeal.dateString)) {
+                                            relevantMeal = treatment;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            const timeForCR = relevantMeal 
+                                ? (relevantMeal.localDateTime || relevantMeal.created_at)
+                                : currentHigh.localStartTime;
+                            const crEntry = getCRForTime(timeForCR, crSchedule);
                             
                             highProblems.push({
                                 time: currentHigh.startTime,
@@ -266,7 +345,9 @@
                                 weight,
                                 direction: 'Strengthen',
                                 crScheduleTime: crEntry.time,
-                                currentCR: crEntry.value
+                                currentCR: crEntry.value,
+                                mealTime: relevantMeal ? (relevantMeal.localDateTime || relevantMeal.created_at) : null,
+                                mealCarbs: relevantMeal ? relevantMeal.carbs : null
                             });
                         }
                     }
@@ -528,9 +609,9 @@
                                 <Activity />
                                 <h1 className="text-3xl font-bold text-gray-800">iAPS Parameter Optimizer</h1>
                             </div>
-                            <p className="text-gray-600">Multi-day analysis with confidence scoring - v13 FIXED</p>
+                            <p className="text-gray-600">Multi-day analysis with confidence scoring - v14 CR Attribution Fix</p>
                             <p className="text-sm text-green-600 font-semibold mt-2">
-                                ✅ Low detection bug FIXED | ✅ CR calculations added
+                                ✅ Low detection bug FIXED | ✅ CR calculations added | ✅ CR attribution fixed
                             </p>
                         </div>
 
