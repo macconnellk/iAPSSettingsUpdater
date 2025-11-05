@@ -433,11 +433,11 @@
                     
                     const [entries, treatments, profile] = await Promise.all([
                         fetchNightscoutData(baseUrl, '/api/v1/entries.json', { 
-                            count: days * 288,
+                            count: days * 600,  // Increased from 288 to handle duplicates
                             'find[dateString][$gte]': dateString 
                         }),
                         fetchNightscoutData(baseUrl, '/api/v1/treatments.json', { 
-                            count: days * 100,
+                            count: days * 200,  // Increased from 100 to handle duplicates
                             'find[created_at][$gte]': dateString 
                         }),
                         fetchNightscoutData(baseUrl, '/api/v1/profile.json', {}).catch(() => [])
@@ -447,8 +447,22 @@
                     console.log('Fetched:', treatments.length, 'treatments');
                     console.log('Profile:', profile?.length || 0);
                     
+                    // Deduplicate glucose readings (keep most recent when timestamps are within 1 minute)
+                    const deduplicatedGlucose = [];
+                    const seenTimes = new Set();
+                    
+                    for (const entry of entries) {
+                        const timeKey = Math.floor(new Date(entry.dateString).getTime() / 60000); // Round to minute
+                        if (!seenTimes.has(timeKey)) {
+                            seenTimes.add(timeKey);
+                            deduplicatedGlucose.push(entry);
+                        }
+                    }
+                    
+                    console.log('After deduplication:', deduplicatedGlucose.length, 'unique glucose entries');
+                    
                     // Add localDateTime to glucose (matching export format)
-                    const glucoseWithLocal = entries.map(e => {
+                    const glucoseWithLocal = deduplicatedGlucose.map(e => {
                         const date = new Date(e.dateString);
                         return {
                             ...e,
@@ -469,7 +483,7 @@
                         exportInfo: {
                             timestamp: endTime.toISOString(),
                             dataPoints: {
-                                glucose: entries.length,
+                                glucose: deduplicatedGlucose.length,
                                 treatments: treatments.length
                             }
                         },
@@ -479,7 +493,7 @@
                     };
                     
                     setNightscoutData(exportData);
-                    setFetchStatus(`✅ Data loaded! ${entries.length} glucose readings, ${treatments.length} treatments`);
+                    setFetchStatus(`✅ Data loaded! ${deduplicatedGlucose.length} glucose readings, ${treatments.length} treatments`);
                     setLoading(false);
                     
                 } catch (err) {
