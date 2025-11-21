@@ -223,9 +223,108 @@
             // ===== SECTION 2: THE 5 DETECTORS =====
             
             /**
+             * HELPER: Detect Schedule Boundary Issues
+             * Identifies meals that use the "wrong" CR due to schedule timing
+             * and cause subsequent problems
+             */
+            const detectScheduleBoundaryIssues = (nightscoutData, crSchedule, lowProblems) => {
+                console.log('\n=== Schedule Boundary Analysis ===');
+                const issues = [];
+                
+                // For each meal, check if it's using a schedule that might be inappropriate
+                nightscoutData.treatments.forEach(meal => {
+                    if (!meal.created_at || !meal.carbs || meal.carbs <= 0) return;
+                    
+                    const mealTime = new Date(meal.created_at);
+                    const crEntry = getCRForTime(meal.localDateTime, crSchedule);
+                    
+                    // Find the next schedule entry
+                    const mealMinutes = mealTime.getHours() * 60 + mealTime.getMinutes();
+                    const nextCREntry = crSchedule.find(entry => {
+                        const [h, m] = entry.time.split(':').map(Number);
+                        const entryMinutes = h * 60 + m;
+                        return entryMinutes > mealMinutes;
+                    });
+                    
+                    if (!nextCREntry || crEntry.time === nextCREntry.time) return;
+                    
+                    // Calculate time until next boundary
+                    const [nextH, nextM] = nextCREntry.time.split(':').map(Number);
+                    const nextMinutes = nextH * 60 + nextM;
+                    const minutesUntilBoundary = nextMinutes - mealMinutes;
+                    
+                    // If within 2 hours of boundary
+                    if (minutesUntilBoundary > 0 && minutesUntilBoundary < 120) {
+                        // Check if current CR is significantly stronger (lower value = more insulin per carb)
+                        const crDifference = ((nextCREntry.value - crEntry.value) / crEntry.value) * 100;
+                        
+                        if (crDifference > 20) { // Next CR is >20% weaker
+                            console.log(`  Potential boundary issue: ${meal.localDateTime}`);
+                            console.log(`    Using ${crEntry.time} CR (${crEntry.value}) but ${nextCREntry.time} CR (${nextCREntry.value}) is ${crDifference.toFixed(1)}% weaker`);
+                            console.log(`    ${minutesUntilBoundary} min before boundary`);
+                            
+                            // Check if there was a low within 4 hours after this meal
+                            const fourHoursAfter = new Date(mealTime.getTime() + 4 * 60 * 60 * 1000);
+                            const hadSubsequentLow = lowProblems.some(low => {
+                                const lowTime = new Date(low.time);
+                                return lowTime > mealTime && lowTime <= fourHoursAfter;
+                            });
+                            
+                            if (hadSubsequentLow) {
+                                console.log(`    → Subsequent low detected - boundary adjustment recommended`);
+                                
+                                issues.push({
+                                    meal: meal,
+                                    mealTime: meal.localDateTime,
+                                    currentSchedule: crEntry.time,
+                                    currentCR: crEntry.value,
+                                    nextSchedule: nextCREntry.time,
+                                    nextCR: nextCREntry.value,
+                                    minutesBeforeBoundary: minutesUntilBoundary,
+                                    crDifference: crDifference,
+                                    hadSubsequentLow: true
+                                });
+                            }
+                        }
+                    }
+                });
+                
+                // Generate recommendations for schedule boundary adjustments
+                const recommendations = [];
+                issues.forEach(issue => {
+                    // Suggest moving the boundary earlier to cover the problematic meal
+                    // Calculate suggested new boundary time (round to 30-min intervals)
+                    const mealTime = new Date(issue.meal.created_at);
+                    const suggestedHour = mealTime.getHours();
+                    const suggestedMin = mealTime.getMinutes() < 30 ? 0 : 30;
+                    const suggestedBoundary = `${suggestedHour.toString().padStart(2, '0')}:${suggestedMin.toString().padStart(2, '0')}`;
+                    
+                    recommendations.push({
+                        detector: 'Schedule Boundary Optimization',
+                        type: 'Schedule Boundary Adjustment',
+                        reason: `Meal using strong breakfast CR (${issue.currentCR} g/U) caused subsequent low. Moving boundary earlier would use weaker lunch CR (${issue.nextCR} g/U).`,
+                        scheduleTime: issue.nextSchedule,
+                        currentValue: issue.nextCR,
+                        newValue: issue.nextCR, // Value stays same, timing changes
+                        adjustment: `Move boundary: ${issue.nextSchedule} → ${suggestedBoundary}`,
+                        calculation: `Meal at ${issue.mealTime} is ${issue.minutesBeforeBoundary} min before ${issue.nextSchedule} boundary. Used ${issue.currentCR} g/U (${issue.crDifference.toFixed(0)}% stronger) instead of ${issue.nextCR} g/U.`,
+                        details: `Meal at ${issue.mealTime} (${issue.meal.carbs}g) used ${issue.currentSchedule} CR (${issue.currentCR} g/U) but occurred ${issue.minutesBeforeBoundary} minutes before ${issue.nextSchedule} boundary. This schedule is ${issue.crDifference.toFixed(0)}% stronger than the ${issue.nextSchedule} CR (${issue.nextCR} g/U), causing subsequent low. Recommend moving ${issue.nextSchedule} boundary to ${suggestedBoundary} to use appropriate CR for mid-morning/afternoon snacks.`,
+                        confidence: { level: 'High', score: 85 },
+                        priority: 'MEDIUM',
+                        events: [issue.meal],
+                        safetyNote: `Schedule boundary mismatch - meal using too-strong CR due to timing`,
+                        suggestedBoundary: suggestedBoundary
+                    });
+                });
+                
+                console.log(`Schedule Boundary Analysis complete: ${recommendations.length} boundary adjustments recommended\n`);
+                return recommendations;
+            };
+            
+            /**
              * DETECTOR 1: Direct Meal-Induced Lows
              * Priority: 1.5 (Safety - Less Specific Pattern)
-             * Pattern: Meal [WARNING]¢ Low (1-4 hours later) with NO high >180 in between
+             * Pattern: Meal [WARNING]Â¢ Low (1-4 hours later) with NO high >180 in between
              * Conclusion: CR too strong (too much upfront insulin)
              */
             const detectDirectMealInducedLows = (lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds) => {
@@ -253,7 +352,7 @@
                     });
                     
                     if (recentMeals.length === 0) {
-                        console.log(`  [WARNING]¢ No meals found`);
+                        console.log(`  [WARNING]Â¢ No meals found`);
                         return;
                     }
                     
@@ -266,7 +365,7 @@
                     
                     const mealId = getEventId(relevantMeal);
                     if (claimedEvents.meals.has(mealId)) {
-                        console.log(`  [WARNING]¢ Meal already claimed: ${relevantMeal.localDateTime}`);
+                        console.log(`  [WARNING]Â¢ Meal already claimed: ${relevantMeal.localDateTime}`);
                         return;
                     }
                     
@@ -281,8 +380,21 @@
                     console.log(`  High >180 between meal and low: ${hadHigh ? 'YES' : 'NO'}`);
                     
                     if (hadHigh) {
-                        console.log(`  [WARNING]¢ Had high - leaving for Detector 3`);
+                        console.log(`  [WARNING]Â¢ Had high - leaving for Detector 3`);
                         return; // This is a pattern for Detector 3, not Detector 1
+                    }
+                    
+                    // SAFETY CHECK: Skip if meal was given during existing low
+                    const bgAtMealTime = nightscoutData.glucose.find(reading => {
+                        const rTime = new Date(reading.dateString);
+                        const timeDiff = Math.abs(rTime - mealTime);
+                        return timeDiff < 10 * 60 * 1000; // Within 10 minutes
+                    });
+                    
+                    if (bgAtMealTime && bgAtMealTime.sgv < 80) {
+                        console.log(`  ⚠️ SAFETY: Meal given during low (${bgAtMealTime.sgv} mg/dL) - skipping attribution`);
+                        console.log(`  → Low not caused by this meal's CR - meal eaten during unsafe conditions`);
+                        return; // Don't attribute low to this meal
                     }
                     
                     // This is a direct meal-induced low!
@@ -307,8 +419,8 @@
                         currentValue: crEntry.value,
                         newValue: parseFloat(newCR.toFixed(2)),
                         adjustment: `+${adjustmentPercent}%`,
-                        calculation: `${crEntry.value} [WARNING] ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
-                        details: `Meal at ${relevantMeal.localDateTime} (${relevantMeal.carbs}g) [WARNING]¢ Low ${low.bg} mg/dL at ${low.localTime}. BG stayed < 180 between meal and low.`,
+                        calculation: `${crEntry.value} [WARNING]Â ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
+                        details: `Meal at ${relevantMeal.localDateTime} (${relevantMeal.carbs}g) [WARNING]Â¢ Low ${low.bg} mg/dL at ${low.localTime}. BG stayed < 180 between meal and low.`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'HIGH',
                         events: [relevantMeal, low],
@@ -318,7 +430,7 @@
                     // Track that this low was processed
                     processedLowIds.add(lowId);
                     
-                    console.log(`  [WARNING]¦ DETECTED: ${relevantMeal.localDateTime} [WARNING]¢ ${low.localTime}`);
+                    console.log(`  [WARNING]Â¦ DETECTED: ${relevantMeal.localDateTime} [WARNING]Â¢ ${low.localTime}`);
                 });
                 
                 console.log(`Detector 1 complete: ${recommendations.length} recommendations\n`);
@@ -328,7 +440,7 @@
             /**
              * DETECTOR 1b: Transient High with Subsequent Low
              * Priority: 1 (Safety First - More Specific Pattern)
-             * Pattern: Meal [WARNING] ↑ Brief High >180 (<60 min) [WARNING] ↑Â¢ Low (within 3 hours)
+             * Pattern: Meal [WARNING]Â â†‘ Brief High >180 (<60 min) [WARNING]Â â†‘Ã‚Â¢ Low (within 3 hours)
              * Conclusion: CR too strong (too much upfront insulin caused brief spike then crash)
              */
             const detectTransientHighWithLow = (lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds) => {
@@ -359,7 +471,7 @@
                     
                     console.log(`  Found ${recentMeals.length} meals in lookback window`);
                     if (recentMeals.length === 0) {
-                        console.log(`  ↑ No meals found`);
+                        console.log(`  â†‘ No meals found`);
                         return;
                     }
                     
@@ -391,7 +503,7 @@
                         console.log(`    High readings >180: ${highReadings.length}`);
                         
                         if (highReadings.length === 0) {
-                            console.log(`    ↑ No high after this meal`);
+                            console.log(`    â†‘ No high after this meal`);
                             continue; // No high after this meal
                         }
                         
@@ -408,7 +520,7 @@
                         // Check if high was TRANSIENT (<60 minutes)
                         const HIGH_DURATION_THRESHOLD = 60;
                         if (highDurationMinutes >= HIGH_DURATION_THRESHOLD) {
-                            console.log(`    ↑ High too sustained (${highDurationMinutes.toFixed(1)} min >= ${HIGH_DURATION_THRESHOLD} min)`);
+                            console.log(`    â†‘ High too sustained (${highDurationMinutes.toFixed(1)} min >= ${HIGH_DURATION_THRESHOLD} min)`);
                             continue; // Sustained high - not transient
                         }
                         
@@ -418,7 +530,7 @@
                         
                         const TIME_TO_LOW_THRESHOLD = 3;
                         if (timeFromHighToLowHours > TIME_TO_LOW_THRESHOLD) {
-                            console.log(`    ↑ Low too delayed (${timeFromHighToLowHours.toFixed(1)} hrs > ${TIME_TO_LOW_THRESHOLD} hrs)`);
+                            console.log(`    â†‘ Low too delayed (${timeFromHighToLowHours.toFixed(1)} hrs > ${TIME_TO_LOW_THRESHOLD} hrs)`);
                             continue; // Low too far after high
                         }
                         
@@ -432,14 +544,14 @@
                         console.log(`    Corrections during period: ${correctionsDuringPeriod.length}`);
                         
                         if (correctionsDuringPeriod.length > 0) {
-                            console.log(`    ↑ Corrections were given - not pure meal effect`);
+                            console.log(`    â†‘ Corrections were given - not pure meal effect`);
                             continue; // Corrections given - not pure meal effect
                         }
                         
                         // This meal has the transient high pattern!
                         // Score it based on peak BG and how close the timing is
                         const score = peakBG + (100 / (timeFromHighToLowHours + 0.1)); // Higher peak + shorter time = higher score
-                        console.log(`    ↑ MATCH! Score: ${score.toFixed(1)}`);
+                        console.log(`    â†‘ MATCH! Score: ${score.toFixed(1)}`);
                         
                         if (score > bestMatchScore) {
                             bestMatch = {
@@ -460,16 +572,16 @@
                     
                     // If no meal matched the transient high pattern, skip this low
                     if (!bestMatch) {
-                        console.log(`  ↑ No meal with transient high pattern found`);
+                        console.log(`  â†‘ No meal with transient high pattern found`);
                         return;
                     }
                     
-                    console.log(`  ↑ Best match: ${bestMatch.meal.created_at} (${bestMatch.meal.carbs}g) with score ${bestMatchScore.toFixed(1)}`);
+                    console.log(`  â†‘ Best match: ${bestMatch.meal.created_at} (${bestMatch.meal.carbs}g) with score ${bestMatchScore.toFixed(1)}`);
                     
                     // STEP 3: TRANSIENT HIGH DETECTED!
-                    console.log(`  [WARNING]¦ TRANSIENT HIGH DETECTED!`);
-                    console.log(`  [WARNING] ↑ Brief spike (${bestMatch.highDurationMinutes.toFixed(1)} min) [WARNING] ↑Â¢ crash (${bestMatch.timeFromHighToLowHours.toFixed(1)} hrs)`);
-                    console.log(`  [WARNING] ↑ Excessive insulin dosing`);
+                    console.log(`  [WARNING]Â¦ TRANSIENT HIGH DETECTED!`);
+                    console.log(`  [WARNING]Â â†‘ Brief spike (${bestMatch.highDurationMinutes.toFixed(1)} min) [WARNING]Â â†‘Ã‚Â¢ crash (${bestMatch.timeFromHighToLowHours.toFixed(1)} hrs)`);
+                    console.log(`  [WARNING]Â â†‘ Excessive insulin dosing`);
                     
                     // Use MEAL TIME for CR schedule
                     const crEntry = getCRForTime(bestMatch.meal.created_at, crSchedule);
@@ -502,7 +614,7 @@
                         newValue: parseFloat(newCR.toFixed(2)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value}  ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
-                        details: `Meal at ${bestMatch.meal.created_at} (${bestMatch.meal.carbs}g) [WARNING] ↑ Brief high ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min) [WARNING] ↑Â¢ Low ${low.bg} mg/dL at ${low.localTime} (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later). Peak-to-crash pattern indicates excessive insulin.`,
+                        details: `Meal at ${bestMatch.meal.created_at} (${bestMatch.meal.carbs}g) [WARNING]Â â†‘ Brief high ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min) [WARNING]Â â†‘Ã‚Â¢ Low ${low.bg} mg/dL at ${low.localTime} (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later). Peak-to-crash pattern indicates excessive insulin.`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'HIGH',
                         events: [bestMatch.meal, bestMatch.firstHigh, bestMatch.lastHigh, low],
@@ -512,7 +624,7 @@
                     // Track that this low was processed
                     processedLowIds.add(lowId);
                     
-                    console.log(`  [WARNING]¦ DETECTED: ${bestMatch.meal.created_at} [WARNING] ↑ ${low.localTime}`);
+                    console.log(`  [WARNING]Â¦ DETECTED: ${bestMatch.meal.created_at} [WARNING]Â â†‘ ${low.localTime}`);
                 });
                 
                 console.log(`Detector 1b complete: ${recommendations.length} recommendations\n`);
@@ -522,7 +634,7 @@
             /**
              * DETECTOR 2: Correction Overcorrection
              * Priority: 2 (ISF Issue)
-             * Pattern: High >180 [WARNING]¢ Corrections (within 1hr) [WARNING]¢ Low (1-3 hours later)
+             * Pattern: High >180 [WARNING]Â¢ Corrections (within 1hr) [WARNING]Â¢ Low (1-3 hours later)
              * Conclusion: ISF too strong (corrections too aggressive)
              */
             const detectCorrectionOvercorrection = (lowProblems, nightscoutData, isfSchedule, claimedEvents, processedLowIds) => {
@@ -534,8 +646,8 @@
                     
                     // NOTE: We intentionally do NOT skip lows in processedLowIds here.
                     // This allows us to detect stacking scenarios where BOTH:
-                    // - Detector 1 found: Meal [WARNING]¢ Low (CR too strong)
-                    // - Detector 2 finds: Corrections [WARNING]¢ Same Low (ISF too strong)
+                    // - Detector 1 found: Meal [WARNING]Â¢ Low (CR too strong)
+                    // - Detector 2 finds: Corrections [WARNING]Â¢ Same Low (ISF too strong)
                     // Both recommendations may be valid if meal + corrections stacked.
                     
                     console.log(`\nDetector 2: Checking low at ${low.localTime} (${low.bg} mg/dL)`);
@@ -574,7 +686,7 @@
                     });
                     
                     if (recentCorrections.length === 0) {
-                        console.log(`  [WARNING]¢ No corrections found (after filtering)`);
+                        console.log(`  [WARNING]Â¢ No corrections found (after filtering)`);
                         return; // No corrections
                     }
                     
@@ -637,7 +749,7 @@
                     
                     let reason = 'Corrections too aggressive for high (ISF too strong)';
                     let confidence = { level: 'Medium', score: 70 };
-                    let details = `High ${lastHighReading.sgv} mg/dL at ${lastHighReading.localDateTime} [WARNING]¢ ${recentCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) [WARNING]¢ Low ${low.bg} mg/dL at ${low.localTime}`;
+                    let details = `High ${lastHighReading.sgv} mg/dL at ${lastHighReading.localDateTime} [WARNING]Â¢ ${recentCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) [WARNING]Â¢ Low ${low.bg} mg/dL at ${low.localTime}`;
                     
                     if (hasStacking) {
                         reason += ' - possible insulin stacking with meal';
@@ -653,7 +765,7 @@
                         currentValue: isfEntry.value,
                         newValue: parseFloat(newISF.toFixed(2)),
                         adjustment: `+${adjustmentPercent}%`,
-                        calculation: `${isfEntry.value} [WARNING] ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newISF.toFixed(2)}`,
+                        calculation: `${isfEntry.value} [WARNING]Â ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newISF.toFixed(2)}`,
                         details: details,
                         confidence: confidence,
                         priority: 'MEDIUM',
@@ -664,7 +776,7 @@
                     // Track that this low was processed
                     processedLowIds.add(lowId);
                     
-                    console.log(`[WARNING]¦ Found correction overcorrection: High at ${lastHighReading.localDateTime} [WARNING]¢ Low at ${low.localTime}${hasStacking ? ' (with stacking)' : ''}`);
+                    console.log(`[WARNING]Â¦ Found correction overcorrection: High at ${lastHighReading.localDateTime} [WARNING]Â¢ Low at ${low.localTime}${hasStacking ? ' (with stacking)' : ''}`);
                 });
                 
                 console.log(`Detector 2 complete: ${recommendations.length} recommendations`);
@@ -674,14 +786,14 @@
             /**
              * DETECTOR 3: Post-Meal Highs with Corrections
              * Priority: 3 (CR Weakness)
-             * Pattern: Meal [WARNING]¢ High >180 [WARNING]¢ Corrections (with or without subsequent low)
+             * Pattern: Meal [WARNING]Â¢ High >180 [WARNING]Â¢ Corrections (with or without subsequent low)
              * Conclusion: CR too weak (not enough upfront insulin)
              */
             const detectPostMealHighsWithCorrections = (lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds) => {
                 console.log('=== DETECTOR 3: Post-Meal Highs with Corrections ===');
                 const recommendations = [];
                 
-                // PASS 1: Traditional pattern - Meal [WARNING]¢ High [WARNING]¢ Corrections [WARNING]¢ Low
+                // PASS 1: Traditional pattern - Meal [WARNING]Â¢ High [WARNING]Â¢ Corrections [WARNING]Â¢ Low
                 lowProblems.forEach(low => {
                     const lowId = getEventId(low);
                     
@@ -802,8 +914,8 @@
                         currentValue: crEntry.value,
                         newValue: parseFloat(newCR.toFixed(2)),
                         adjustment: `-${adjustmentPercent}%`,
-                        calculation: `${crEntry.value} [WARNING] ${(1 - adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
-                        details: `Meal at ${relevantMeal.localDateTime} (${relevantMeal.carbs}g) [WARNING]¢ High ${peakBG} mg/dL at ${lastHighReading.localDateTime} [WARNING]¢ ${recentCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) [WARNING]¢ Low ${low.bg} mg/dL at ${low.localTime}`,
+                        calculation: `${crEntry.value} [WARNING]Â ${(1 - adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
+                        details: `Meal at ${relevantMeal.localDateTime} (${relevantMeal.carbs}g) [WARNING]Â¢ High ${peakBG} mg/dL at ${lastHighReading.localDateTime} [WARNING]Â¢ ${recentCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) [WARNING]Â¢ Low ${low.bg} mg/dL at ${low.localTime}`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'MEDIUM',
                         events: [relevantMeal, earliestHighReading, ...recentCorrections, low],
@@ -813,10 +925,10 @@
                     // Track that this low was processed
                     processedLowIds.add(lowId);
                     
-                    console.log(`[WARNING]¦ Found post-meal high with corrections [WARNING]¢ low: ${relevantMeal.localDateTime}`);
+                    console.log(`[WARNING]Â¦ Found post-meal high with corrections [WARNING]Â¢ low: ${relevantMeal.localDateTime}`);
                 });
                 
-                // PASS 2: NEW - Meal [WARNING]¢ High [WARNING]¢ Corrections (NO low required)
+                // PASS 2: NEW - Meal [WARNING]Â¢ High [WARNING]Â¢ Corrections (NO low required)
                 // Look through all unclaimed meals that caused highs requiring corrections
                 const meals = nightscoutData.treatments.filter(t => 
                     t.localDateTime && t.carbs && t.carbs > 0 && !claimedEvents.meals.has(getEventId(t))
@@ -838,7 +950,7 @@
                     console.log(`  Post-meal readings: ${postMealReadings.length}`);
                     
                     if (postMealReadings.length === 0) {
-                        console.log(`  [WARNING]¢ No post-meal readings`);
+                        console.log(`  [WARNING]Â¢ No post-meal readings`);
                         return;
                     }
                     
@@ -847,7 +959,7 @@
                     console.log(`  High readings >180: ${highReadings.length}`);
                     
                     if (highReadings.length === 0) {
-                        console.log(`  [WARNING]¢ No high >180`);
+                        console.log(`  [WARNING]Â¢ No high >180`);
                         return; // No high
                     }
                     
@@ -887,11 +999,11 @@
                     let details, confidence, reason;
                     if (allCorrections.length > 0) {
                         const totalCorrectionInsulin = allCorrections.reduce((sum, c) => sum + c.insulin, 0);
-                        details = `Meal at ${meal.localDateTime} (${meal.carbs}g) [WARNING]¢ High ${peakBG} mg/dL at ${peakReading.localDateTime} [WARNING]¢ ${allCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) given. High requiring corrections indicates insufficient upfront insulin.`;
+                        details = `Meal at ${meal.localDateTime} (${meal.carbs}g) [WARNING]Â¢ High ${peakBG} mg/dL at ${peakReading.localDateTime} [WARNING]Â¢ ${allCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) given. High requiring corrections indicates insufficient upfront insulin.`;
                         confidence = { level: 'High', score: 85 };
                         reason = 'Meal caused high requiring corrections (CR too weak)';
                     } else {
-                        details = `Meal at ${meal.localDateTime} (${meal.carbs}g) [WARNING]¢ High ${peakBG} mg/dL at ${peakReading.localDateTime}. High indicates insufficient upfront insulin.`;
+                        details = `Meal at ${meal.localDateTime} (${meal.carbs}g) [WARNING]Â¢ High ${peakBG} mg/dL at ${peakReading.localDateTime}. High indicates insufficient upfront insulin.`;
                         confidence = { level: 'Medium', score: 70 };
                         reason = 'Meal caused high (CR too weak)';
                     }
@@ -904,7 +1016,7 @@
                         currentValue: crEntry.value,
                         newValue: parseFloat(newCR.toFixed(2)),
                         adjustment: `-${adjustmentPercent}%`,
-                        calculation: `${crEntry.value} [WARNING] ${(1 - adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
+                        calculation: `${crEntry.value} [WARNING]Â ${(1 - adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
                         details: details,
                         confidence: confidence,
                         priority: 'MEDIUM',
@@ -912,7 +1024,7 @@
                         safetyNote: 'Meal causing high - strengthen CR'
                     });
                     
-                    console.log(`[WARNING]¦ Found post-meal high: ${meal.localDateTime} [WARNING]¢ ${peakBG} mg/dL (${allCorrections.length} corrections)`);
+                    console.log(`[WARNING]Â¦ Found post-meal high: ${meal.localDateTime} [WARNING]Â¢ ${peakBG} mg/dL (${allCorrections.length} corrections)`);
                 });
                 
                 console.log(`Detector 3 complete: ${recommendations.length} recommendations\n`);
@@ -1111,10 +1223,10 @@
                     } else if (calculatedTDD > 0) {
                         finalTDD = calculatedTDD;
                         tddSource = `calculated ${analysisWindowDays}-day average`;
-                        warning = '⚠️  WARNING: iAPS TDD not found in deviceStatus. Using calculated average which may be less accurate.';
+                        warning = 'âš ï¸  WARNING: iAPS TDD not found in deviceStatus. Using calculated average which may be less accurate.';
                     } else {
                         // No TDD available at all
-                        console.log(`  ❌ ERROR: Cannot calculate TDD - no iAPS data and insufficient treatment data`);
+                        console.log(`  âŒ ERROR: Cannot calculate TDD - no iAPS data and insufficient treatment data`);
                         return null;
                     }
                     
@@ -1201,7 +1313,7 @@
                                 iob: nearestIOB.totalIOB
                             });
                             
-                            console.log(`    ->’ Marking ${basalEntry.time} basal for 5% reduction`);
+                            console.log(`    ->â€™ Marking ${basalEntry.time} basal for 5% reduction`);
                         }
                     }
                 });
@@ -1246,7 +1358,7 @@
                 
                 // Skip basal optimization if TDD cannot be calculated
                 if (!tddResult || !tddResult.tdd) {
-                    console.log(`  ⚠️  Stage 2 skipped: TDD data unavailable`);
+                    console.log(`  âš ï¸  Stage 2 skipped: TDD data unavailable`);
                     console.log(`  Note: Basal optimization requires iAPS TDD from deviceStatus or sufficient treatment history`);
                     console.log(`\nDetector 4 complete: ${recommendations.length} basal recommendations`);
                     return recommendations;
@@ -1413,14 +1525,14 @@
                         currentValue: crEntry.value,
                         newValue: parseFloat(newCR.toFixed(2)),
                         adjustment: `+${adjustmentPercent}%`,
-                        calculation: `${crEntry.value} [WARNING] ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
+                        calculation: `${crEntry.value} [WARNING]Â ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(2)}`,
                         details: `Low ${low.bg} mg/dL at ${low.localTime}${relevantMeal ? `, possible meal at ${relevantMeal.localDateTime}` : ''}`,
                         confidence: { level: relevantMeal ? 'Medium' : 'Low', score: relevantMeal ? 60 : 40 },
                         priority: 'LOW',
                         events: [low]
                     });
                     
-                    console.log(`[WARNING]¦ Found regular low: ${low.localTime}`);
+                    console.log(`[WARNING]Â¦ Found regular low: ${low.localTime}`);
                 });
                 
                 console.log(`Detector 5 complete: ${recommendations.length} recommendations`);
@@ -1501,6 +1613,12 @@
                     lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds
                 );
                 allRecommendations.push(...detector5Results);
+                
+                // Schedule Boundary Analysis: Identify timing mismatches
+                const scheduleBoundaryResults = detectScheduleBoundaryIssues(
+                    nightscoutData, crSchedule, lowProblems
+                );
+                allRecommendations.push(...scheduleBoundaryResults);
                 
                 console.log('\n========== DETECTION COMPLETE ==========');
                 console.log(`Total recommendations: ${allRecommendations.length}`);
@@ -1739,7 +1857,7 @@
             const fetchFromNightscout = async (days = analysisWindow) => {
                 setLoading(true);
                 setError(null);
-                setFetchStatus('[WARNING]¾ Connecting to Nightscout...');
+                setFetchStatus('[WARNING]Â¾ Connecting to Nightscout...');
                 
                 try {
                     if (!nsConfig.baseUrl) throw new Error('Please enter your Nightscout URL');
@@ -1876,7 +1994,7 @@
                     
                     console.log('Nightscout data prepared:', exportData);
                     setNightscoutData(exportData);
-                    setFetchStatus('[WARNING]¦ Data loaded successfully!');
+                    setFetchStatus('[WARNING]Â¦ Data loaded successfully!');
                     
                 } catch (err) {
                     console.error('Fetch error:', err);
@@ -1990,7 +2108,7 @@
                         {nightscoutData && (
                             <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-6">
                                 <p className="text-green-800">
-                                    [WARNING]¬↑ Data loaded: {nightscoutData.glucose?.length || 0} glucose readings, 
+                                    [WARNING]Â¬â†‘ Data loaded: {nightscoutData.glucose?.length || 0} glucose readings, 
                                     {' '}{nightscoutData.treatments?.length || 0} treatments
                                 </p>
                             </div>
@@ -2048,7 +2166,7 @@
                                 {analysisResults.conflicts && analysisResults.conflicts.length > 0 && (
                                     <div className="bg-yellow-50 border-2 border-yellow-400 rounded-lg p-6 mb-6">
                                         <h3 className="text-lg font-bold text-yellow-800 mb-2">
-                                            [WARNING] Conflicting Recommendations Detected
+                                            [WARNING]Â Conflicting Recommendations Detected
                                         </h3>
                                         <p className="text-yellow-700 mb-4">
                                             Multiple patterns detected at the same schedule time. Review carefully.
@@ -2098,7 +2216,7 @@
                                                         {rec.adjustment}
                                                     </div>
                                                     <div className="text-sm text-gray-500">
-                                                        {rec.currentValue} [WARNING]¢ {rec.newValue}
+                                                        {rec.currentValue} [WARNING]Â¢ {rec.newValue}
                                                     </div>
                                                 </div>
                                             </div>
@@ -2112,7 +2230,7 @@
                                             {rec.safetyNote && (
                                                 <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4">
                                                     <p className="text-sm text-red-800">
-                                                        <strong>[WARNING] Safety Note:</strong> {rec.safetyNote}
+                                                        <strong>[WARNING]Â Safety Note:</strong> {rec.safetyNote}
                                                     </p>
                                                 </div>
                                             )}
@@ -2123,7 +2241,7 @@
 
                                             {rec.multipleDetections && (
                                                 <div className="mt-3 text-sm text-blue-600">
-                                                    [WARNING] {rec.multipleDetections} similar patterns detected
+                                                    [WARNING]Â {rec.multipleDetections} similar patterns detected
                                                 </div>
                                             )}
                                         </div>
@@ -2169,8 +2287,8 @@
                                             return (
                                                 <div>
                                                     <div className="mb-4 p-3 bg-blue-50 rounded">
-                                                        <p className="text-sm">Pattern: {basalRec.patternAnalysis.before.type} → {basalRec.patternAnalysis.after.type}</p>
-                                                        <p className="text-sm">Total: {basalRec.currentValue.toFixed(2)} → {basalRec.newValue.toFixed(2)} U/day</p>
+                                                        <p className="text-sm">Pattern: {basalRec.patternAnalysis.before.type} â†’ {basalRec.patternAnalysis.after.type}</p>
+                                                        <p className="text-sm">Total: {basalRec.currentValue.toFixed(2)} â†’ {basalRec.newValue.toFixed(2)} U/day</p>
                                                     </div>
                                                     
                                                     {basalRec.safetyNote && (
@@ -2200,7 +2318,7 @@
                                             return (
                                                 <div>
                                                     <div className="mb-4 p-3 bg-green-50 rounded">
-                                                        <p className="text-sm text-green-800">✓ No basal adjustment recommended - current schedule is well-optimized</p>
+                                                        <p className="text-sm text-green-800">âœ“ No basal adjustment recommended - current schedule is well-optimized</p>
                                                         <p className="text-sm text-gray-600">Total: {totalBasal.toFixed(2)} U/day</p>
                                                     </div>
                                                     <div className="grid grid-cols-6 gap-2 text-xs">
