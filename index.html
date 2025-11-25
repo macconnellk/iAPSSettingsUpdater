@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>iAPS Parameter Optimizer - v24 Multi-Detector System (with Detector 1b)</title>
+    <title>iAPS Parameter Optimizer - v24 Unified Basal</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -253,7 +253,7 @@
             
             // Create unique identifiers for events
             const getEventId = (event) => {
-                return event.localDateTime || event.dateString || event.created_at;
+                return event.localDateTime || event.localTime || event.dateString || event.time || event.created_at;
             };
 
             // Helper to convert schedule time to minutes for sorting
@@ -1573,13 +1573,22 @@
 
             // Distribute basal adjustment across 24 hours using discrete increments
             // Strategy: First exhaust highest-rate hours, then distribute remainder across 4-hour blocks
-            const distributeBasalAdjustment = (currentSchedule, targetTotalDaily) => {
+            // protectedHours: Set of hour strings (e.g., "00:00") that should NOT receive increases (safety hours)
+            const distributeBasalAdjustment = (currentSchedule, targetTotalDaily, protectedHours = new Set()) => {
                 const PUMP_INCREMENT = 0.05;
                 const currentTotal = currentSchedule.reduce((sum, entry) => sum + entry.value, 0);
                 const difference = targetTotalDaily - currentTotal;
                 
                 // Calculate increments needed (positive = increase, negative = decrease)
                 const incrementsNeeded = Math.round(difference / PUMP_INCREMENT);
+                
+                const isIncrease = incrementsNeeded > 0;
+                
+                // Log protection status
+                if (protectedHours.size > 0 && isIncrease) {
+                    console.log(`    TDD Distribution: Protecting ${protectedHours.size} safety hours from increases`);
+                    console.log(`    Protected hours: ${Array.from(protectedHours).sort().join(', ')}`);
+                }
                 
                 if (incrementsNeeded === 0) {
                     return currentSchedule.map((entry, idx) => ({
@@ -1618,9 +1627,17 @@
                 const medianRate = sortedRates[Math.floor(sortedRates.length / 2)];
                 
                 // Find hours with non-median rates (outliers)
-                const outlierHours = result.filter(e => 
-                    isReduction ? e.value > medianRate + 0.001 : e.value < medianRate - 0.001
-                );
+                // For increases: exclude protected hours from consideration
+                const outlierHours = result.filter(e => {
+                    const hourStr = `${e.hour.toString().padStart(2, '0')}:00`;
+                    
+                    // For increases, skip protected hours entirely
+                    if (isIncrease && protectedHours.has(hourStr)) {
+                        return false;
+                    }
+                    
+                    return isReduction ? e.value > medianRate + 0.001 : e.value < medianRate - 0.001;
+                });
                 
                 // Sort outliers by how far they are from median
                 outlierHours.sort((a, b) => {
@@ -1646,13 +1663,24 @@
                 
                 // PHASE 2: Distribute remaining increments across 4-hour blocks
                 // EXCLUDE blocks where all hours were adjusted in Phase 1
+                // For increases: also exclude protected hours
                 if (incrementsRemaining > 0) {
                     // Track which blocks had all their hours adjusted
                     const adjustedHours = new Set(outlierHours.map(o => o.hour));
                     
-                    // Filter to blocks that still have unadjusted hours
+                    // Filter to blocks that still have unadjusted, eligible hours
                     const eligibleBlocks = blocks.filter(block => {
-                        const unadjustedInBlock = block.hours.filter(h => !adjustedHours.has(h));
+                        const unadjustedInBlock = block.hours.filter(h => {
+                            if (adjustedHours.has(h)) return false;
+                            
+                            // For increases, also exclude protected hours
+                            if (isIncrease) {
+                                const hourStr = `${h.toString().padStart(2, '0')}:00`;
+                                if (protectedHours.has(hourStr)) return false;
+                            }
+                            
+                            return true;
+                        });
                         return unadjustedInBlock.length > 0;
                     }).map(block => {
                         const blockHours = block.hours.map(h => result[h]);
@@ -1673,25 +1701,34 @@
                     while (incrementsRemaining > 0 && eligibleBlocks.length > 0) {
                         const targetBlock = eligibleBlocks[blockIdx % eligibleBlocks.length];
                         
-                        // Find best hour in this block (prefer unadjusted hours)
-                        const blockHours = targetBlock.hours
-                            .map(h => result[h])
-                            .filter(e => !adjustedHours.has(e.hour));
+                        // Compute spread order for block: [0,1,2,3] -> [0,2,1,3]
+                        // This distributes changes across the block instead of concentrating at start
+                        const sortedBlockHours = [...targetBlock.hours].sort((a, b) => a - b);
+                        const spreadOrder = [
+                            ...sortedBlockHours.filter((_, i) => i % 2 === 0),  // positions 0, 2, 4...
+                            ...sortedBlockHours.filter((_, i) => i % 2 === 1)   // positions 1, 3, 5...
+                        ];
                         
-                        if (blockHours.length === 0) {
+                        // Filter to available hour indices, maintaining spread order
+                        const availableHourIndices = spreadOrder.filter(h => {
+                            if (adjustedHours.has(h)) return false;
+                            
+                            // For increases, also exclude protected hours
+                            if (isIncrease) {
+                                const hourStr = `${h.toString().padStart(2, '0')}:00`;
+                                if (protectedHours.has(hourStr)) return false;
+                            }
+                            
+                            return true;
+                        });
+                        
+                        if (availableHourIndices.length === 0) {
                             blockIdx++;
                             continue;
                         }
                         
-                        blockHours.sort((a, b) => {
-                            if (isReduction) {
-                                return b.value - a.value;
-                            } else {
-                                return a.value - b.value;
-                            }
-                        });
-                        
-                        const targetHour = blockHours[0];
+                        // Get the target entry from result using spread order
+                        const targetHour = result[availableHourIndices[0]];
                         const newValue = targetHour.value + incrementValue;
                         
                         if (newValue >= PUMP_INCREMENT) {
@@ -1713,56 +1750,48 @@
                 });
             };
 
+
             /**
-             * DETECTOR 4: Two-Stage Basal Optimization
-             * Stage 1: Safety Scrubber - Fix resistant lows (basal too high)
-             * Stage 2: Circadian Scaler - Apply 35% TDD target while preserving shape
+             * DETECTOR 4: Unified Basal Optimization
+             * Combines IOB-based safety reductions with 35% TDD optimization into ONE recommendation
+             * Flow: Original → Safety Adjusted → TDD Optimized → Final
              */
-            const detectBasalOptimization = (nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow) => {
-                console.log('=== DETECTOR 4: Two-Stage Basal Optimization ===');
+            const detectBasalOptimization = (nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents) => {
+                console.log('=== DETECTOR 4: Unified Basal Optimization ===');
                 const recommendations = [];
+                const PUMP_INCREMENT = 0.05; // U/hr - minimum pump adjustment
+                
+                // Helper to round to pump increment
+                const roundToPumpIncrement = (value) => {
+                    return Math.round(value / PUMP_INCREMENT) * PUMP_INCREMENT;
+                };
                 
                 // Calculate TDD (Total Daily Dose)
                 const calculateTDD = () => {
-                    // Try to get TDD from iAPS deviceStatus first (preferred - uses 2-week average)
                     let iapsTDD = null;
                     let iapsTwoWeekTDD = null;
                     
                     if (nightscoutData.deviceStatus && nightscoutData.deviceStatus.length > 0) {
-                        // Look through recent deviceStatus entries for TDD data
                         for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
                             const status = nightscoutData.deviceStatus[i];
                             if (status.openaps && status.openaps.enacted && status.openaps.enacted.reason) {
                                 const reason = status.openaps.enacted.reason;
-                                
-                                // Parse TDD from reason string: "TDD 28.25 2week TDD 26.53"
                                 const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
                                 const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
                                 
-                                if (twoWeekMatch) {
-                                    iapsTwoWeekTDD = parseFloat(twoWeekMatch[1]);
-                                }
-                                if (currentMatch && !iapsTDD) {
-                                    iapsTDD = parseFloat(currentMatch[1]);
-                                }
-                                
-                                if (iapsTwoWeekTDD) break; // Found 2-week average, we're done
+                                if (twoWeekMatch) iapsTwoWeekTDD = parseFloat(twoWeekMatch[1]);
+                                if (currentMatch && !iapsTDD) iapsTDD = parseFloat(currentMatch[1]);
+                                if (iapsTwoWeekTDD) break;
                             }
                         }
                     }
                     
-                    // Calculate multi-day average TDD as fallback (uses analysisWindow: 1, 2, 3, or 7 days)
+                    // Fallback calculation
                     const now = new Date();
                     const analysisWindowDays = analysisWindow || 1;
                     const dailyTDDs = [];
+                    let totalBasalPerDay = basalSchedule.reduce((sum, e) => sum + e.value, 0);
                     
-                    // Calculate total basal per day from schedule
-                    let totalBasalPerDay = 0;
-                    basalSchedule.forEach(entry => {
-                        totalBasalPerDay += entry.value; // Each entry is U/hr
-                    });
-                    
-                    // Calculate TDD for each day in the analysis window
                     for (let day = 0; day < analysisWindowDays; day++) {
                         const dayEnd = new Date(now - (day * 24 * 60 * 60 * 1000));
                         const dayStart = new Date(dayEnd - 24 * 60 * 60 * 1000);
@@ -1771,93 +1800,54 @@
                         nightscoutData.treatments.forEach(t => {
                             if (!t.created_at || !t.insulin || t.insulin <= 0) return;
                             const tTime = new Date(t.created_at);
-                            if (tTime >= dayStart && tTime < dayEnd) {
-                                dayBolus += t.insulin;
-                            }
+                            if (tTime >= dayStart && tTime < dayEnd) dayBolus += t.insulin;
                         });
                         
                         const dayTDD = dayBolus + totalBasalPerDay;
                         if (dayTDD > 0) dailyTDDs.push(dayTDD);
                     }
                     
-                    // Calculate average
                     const calculatedTDD = dailyTDDs.length > 0 
-                        ? dailyTDDs.reduce((sum, tdd) => sum + tdd, 0) / dailyTDDs.length 
-                        : 0;
+                        ? dailyTDDs.reduce((sum, tdd) => sum + tdd, 0) / dailyTDDs.length : 0;
                     
-                    // Decide which TDD to use (prefer iAPS 2-week, then current iAPS, then multi-day average)
-                    let finalTDD = null;
-                    let tddSource = '';
-                    let warning = null;
-                    
-                    if (iapsTwoWeekTDD) {
-                        finalTDD = iapsTwoWeekTDD;
-                        tddSource = 'iAPS 2-week average';
-                    } else if (iapsTDD) {
-                        finalTDD = iapsTDD;
-                        tddSource = 'iAPS current';
-                        warning = 'Using iAPS current TDD (2-week average not found)';
-                    } else if (calculatedTDD > 0) {
-                        finalTDD = calculatedTDD;
-                        tddSource = `calculated ${analysisWindowDays}-day average`;
-                        warning = '! WARNING: iAPS TDD not found in deviceStatus. Using calculated average which may be less accurate.';
-                    } else {
-                        // No TDD available at all
-                        console.log(`  X ERROR: Cannot calculate TDD - no iAPS data and insufficient treatment data`);
-                        return null;
-                    }
-                    
-                    // Log all TDD values for comparison
-                    console.log(`  TDD Sources:`);
-                    console.log(`    iAPS 2-week TDD: ${iapsTwoWeekTDD ? iapsTwoWeekTDD.toFixed(2) + 'U' : 'not found'}`);
-                    console.log(`    iAPS current TDD: ${iapsTDD ? iapsTDD.toFixed(2) + 'U' : 'not found'}`);
-                    console.log(`    Calculated TDD (${analysisWindowDays}-day avg): ${calculatedTDD > 0 ? calculatedTDD.toFixed(2) + 'U' : 'insufficient data'}`);
-                    if (dailyTDDs.length > 0) {
-                        console.log(`      Daily breakdown: ${dailyTDDs.map(t => t.toFixed(1) + 'U').join(', ')}`);
-                    }
-                    console.log(`    Using: ${finalTDD.toFixed(2)}U (${tddSource})`);
-                    if (warning) {
-                        console.log(`    ${warning}`);
-                    }
-                    
-                    return { tdd: finalTDD, source: tddSource, warning: warning };
+                    if (iapsTwoWeekTDD) return { tdd: iapsTwoWeekTDD, source: 'iAPS 2-week average', warning: null };
+                    if (iapsTDD) return { tdd: iapsTDD, source: 'iAPS current', warning: 'Using iAPS current TDD (2-week average not found)' };
+                    if (calculatedTDD > 0) return { tdd: calculatedTDD, source: `calculated ${analysisWindowDays}-day average`, warning: '⚠️ iAPS TDD not found. Using calculated average.' };
+                    return null;
                 };
                 
-                // Parse IOB from deviceStatus
+                // Get IOB data
                 const getIOBData = () => {
                     const iobData = [];
-                    
                     if (nightscoutData.deviceStatus) {
                         nightscoutData.deviceStatus.forEach(status => {
-                            if (status.created_at && status.iob && typeof status.iob.totalIOB !== 'undefined') {
+                            if (status.created_at && status.openaps && status.openaps.iob && typeof status.openaps.iob.iob !== 'undefined') {
                                 iobData.push({
                                     time: new Date(status.created_at),
                                     localTime: status.created_at,
-                                    totalIOB: status.iob.totalIOB,
-                                    basalIOB: status.iob.basalIOB || 0,
-                                    bolusIOB: status.iob.bolusIOB || 0
+                                    totalIOB: status.openaps.iob.iob
                                 });
                             }
                         });
                     }
-                    
-                    console.log(`  Parsed ${iobData.length} IOB data points`);
+                    console.log(`  ✅ Parsed ${iobData.length} IOB data points`);
                     return iobData;
                 };
                 
-                // STAGE 1: Safety Scrubber
-                console.log('\n  Stage 1: Safety Scrubber (Resistant Lows)');
-                
                 const iobData = getIOBData();
-                const basalAdjustments = {}; // Track adjustments by schedule time
                 
-                // Find lows with negative IOB
+                // ============================================================
+                // STEP 1: Calculate IOB-based safety reductions (if any)
+                // ============================================================
+                console.log('\n  Step 1: Checking for IOB-based Safety Reductions');
+                
+                // Find resistant lows (lows with negative IOB)
+                const resistantLows = [];
                 nightscoutData.glucose.forEach(reading => {
                     const readingTime = new Date(reading.dateString);
                     if (readingTime < analysisStartDateTime) return;
                     
                     if (reading.sgv <= 70) {
-                        // Find the nearest IOB data point (within 10 minutes)
                         let nearestIOB = null;
                         let minTimeDiff = Infinity;
                         
@@ -1870,172 +1860,268 @@
                         });
                         
                         if (nearestIOB && nearestIOB.totalIOB < 0) {
-                            console.log(`    Resistant low found: ${reading.localDateTime} (${reading.sgv} mg/dL) with IOB ${nearestIOB.totalIOB.toFixed(3)}U`);
-                            
-                            // Find basal rate active 60-90 minutes prior
-                            const seventyFiveMinutesAgo = new Date(readingTime - 75 * 60 * 1000); // Middle of 60-90 min window
-                            const basalEntry = getBasalForTime(seventyFiveMinutesAgo.toISOString(), basalSchedule);
-                            
-                            // Track the adjustment (5% reduction)
-                            if (!basalAdjustments[basalEntry.time]) {
-                                basalAdjustments[basalEntry.time] = {
-                                    original: basalEntry.value,
-                                    reductions: []
-                                };
-                            }
-                            
-                            basalAdjustments[basalEntry.time].reductions.push({
-                                lowTime: reading.localDateTime,
-                                lowBG: reading.sgv,
-                                iob: nearestIOB.totalIOB
-                            });
-                            
-                            console.log(`    -> Marking ${basalEntry.time} basal for 5% reduction`);
+                            console.log(`    Resistant low: ${reading.localDateTime} (${reading.sgv} mg/dL) IOB: ${nearestIOB.totalIOB.toFixed(3)}U`);
+                            resistantLows.push({ reading, iob: nearestIOB.totalIOB, iobTime: nearestIOB.time });
+                            claimedEvents.lows.add(reading.localDateTime);
                         }
                     }
                 });
                 
-                // Apply Stage 1 reductions to the schedule
-                let modifiedBasalSchedule = [...basalSchedule];
-                Object.entries(basalAdjustments).forEach(([scheduleTime, adjustment]) => {
-                    const idx = modifiedBasalSchedule.findIndex(entry => entry.time === scheduleTime);
-                    if (idx >= 0) {
-                        const oldValue = modifiedBasalSchedule[idx].value;
-                        const newValue = oldValue * 0.95; // 5% reduction
-                        modifiedBasalSchedule[idx] = {
-                            ...modifiedBasalSchedule[idx],
-                            value: newValue
-                        };
+                // Group lows within 30 minutes into event windows
+                const eventWindows = [];
+                resistantLows.forEach(low => {
+                    const lowTime = new Date(low.reading.dateString);
+                    let foundWindow = false;
+                    for (const window of eventWindows) {
+                        const windowStart = new Date(window.lows[0].reading.dateString);
+                        if (Math.abs(lowTime - windowStart) / 60000 <= 30) {
+                            window.lows.push(low);
+                            foundWindow = true;
+                            break;
+                        }
+                    }
+                    if (!foundWindow) eventWindows.push({ lows: [low] });
+                });
+                
+                // Calculate safety reductions for each hour
+                const safetyHourlyReductions = {}; // hour -> total reduction
+                let safetyEventSummary = null;
+                
+                if (resistantLows.length > 0) {
+                    console.log(`  Found ${resistantLows.length} resistant lows in ${eventWindows.length} event window(s)`);
+                    
+                    eventWindows.forEach((window, windowIdx) => {
+                        const peakNegativeIOB = Math.min(...window.lows.map(l => l.iob));
+                        const peakLow = window.lows.find(l => l.iob === peakNegativeIOB);
+                        const peakTime = peakLow.iobTime;
                         
-                        recommendations.push({
-                            detector: 'Basal Optimization - Safety Scrubber',
-                            type: 'Basal Reduction',
-                            reason: `Resistant low(s) despite negative IOB - basal too high`,
-                            scheduleTime: scheduleTime,
-                            currentValue: oldValue,
-                            newValue: parseFloat(newValue.toFixed(3)),
-                            adjustment: '-5%',
-                            calculation: `${oldValue.toFixed(3)} x 0.95 = ${newValue.toFixed(3)}`,
-                            details: `${adjustment.reductions.length} resistant low(s): ${adjustment.reductions.map(r => 
-                                `${r.lowBG} mg/dL at ${r.lowTime} (IOB: ${r.iob.toFixed(2)}U)`
-                            ).join(', ')}`,
-                            confidence: { level: 'High', score: 95 },
-                            priority: 'HIGH',
-                            safetyNote: 'System removed insulin but low still occurred - definite basal excess'
+                        // Find when IOB first went negative
+                        const windowLowTimes = window.lows.map(l => new Date(l.reading.dateString));
+                        const earliestLowTime = new Date(Math.min(...windowLowTimes));
+                        
+                        const iobBeforeLow = iobData.filter(iob => iob.time <= earliestLowTime).sort((a, b) => b.time - a.time);
+                        let firstNegativeIOBTime = peakTime;
+                        for (const iob of iobBeforeLow) {
+                            if (iob.totalIOB >= 0) break;
+                            firstNegativeIOBTime = iob.time;
+                        }
+                        
+                        // Calculate contributing window: 4 hours before first negative → peak time
+                        const windowStartTime = new Date(firstNegativeIOBTime.getTime() - 4 * 60 * 60 * 1000);
+                        const windowEndTime = peakTime;
+                        
+                        // Build hours array
+                        const startHour = windowStartTime.getHours();
+                        const endHour = windowEndTime.getHours();
+                        const hoursArray = [];
+                        let currentHour = startHour;
+                        for (let i = 0; i < 24; i++) {
+                            hoursArray.push(`${currentHour.toString().padStart(2, '0')}:00`);
+                            if (currentHour === endHour) break;
+                            currentHour = (currentHour + 1) % 24;
+                        }
+                        
+                        const totalHours = hoursArray.length;
+                        const reductionPerHour = Math.abs(peakNegativeIOB) / totalHours;
+                        const roundedReduction = Math.min(roundToPumpIncrement(reductionPerHour), 0.10);
+                        
+                        console.log(`    Window ${windowIdx + 1}: peak IOB ${peakNegativeIOB.toFixed(3)}U → ${roundedReduction.toFixed(2)} U/hr × ${totalHours} hrs`);
+                        
+                        hoursArray.forEach(hourStr => {
+                            safetyHourlyReductions[hourStr] = (safetyHourlyReductions[hourStr] || 0) + roundedReduction;
                         });
+                        
+                        if (!safetyEventSummary) {
+                            safetyEventSummary = { totalLows: 0, peakNegativeIOB: 0, affectedHours: new Set() };
+                        }
+                        safetyEventSummary.totalLows += window.lows.length;
+                        safetyEventSummary.peakNegativeIOB = Math.min(safetyEventSummary.peakNegativeIOB, peakNegativeIOB);
+                        hoursArray.forEach(h => safetyEventSummary.affectedHours.add(h));
+                    });
+                } else {
+                    console.log(`  No resistant lows found`);
+                }
+                
+                // ============================================================
+                // STEP 2: Apply safety reductions to create intermediate schedule
+                // ============================================================
+                console.log('\n  Step 2: Applying Safety Reductions');
+                
+                const safetyAdjustedSchedule = basalSchedule.map((entry, idx) => ({
+                    ...entry,
+                    value: entry.value,
+                    time: entry.time || `${idx.toString().padStart(2, '0')}:00`
+                }));
+                
+                let totalSafetyReduction = 0;
+                Object.entries(safetyHourlyReductions).forEach(([hourStr, reduction]) => {
+                    const idx = safetyAdjustedSchedule.findIndex(e => e.time === hourStr);
+                    if (idx >= 0) {
+                        const oldValue = safetyAdjustedSchedule[idx].value;
+                        const newValue = Math.max(PUMP_INCREMENT, roundToPumpIncrement(oldValue - reduction));
+                        safetyAdjustedSchedule[idx].value = newValue;
+                        totalSafetyReduction += (oldValue - newValue);
+                        console.log(`    ${hourStr}: ${oldValue.toFixed(3)} → ${newValue.toFixed(3)}`);
                     }
                 });
                 
-                console.log(`  Stage 1 complete: ${Object.keys(basalAdjustments).length} safety reductions applied`);
+                const originalTotal = basalSchedule.reduce((sum, e) => sum + e.value, 0);
+                const safetyAdjustedTotal = safetyAdjustedSchedule.reduce((sum, e) => sum + e.value, 0);
+                console.log(`  Safety adjustment: ${originalTotal.toFixed(2)}U → ${safetyAdjustedTotal.toFixed(2)}U (-${totalSafetyReduction.toFixed(2)}U/day)`);
                 
-                // STAGE 2: Enhanced Circadian Scaler with Hourly Distribution
-                console.log('\n  Stage 2: Enhanced Circadian Scaler (35% TDD Target)');
+                // ============================================================
+                // STEP 3: Apply 35% TDD optimization
+                // ============================================================
+                console.log('\n  Step 3: Applying 35% TDD Optimization');
                 
                 const tddResult = calculateTDD();
                 
-                // Skip basal optimization if TDD cannot be calculated
                 if (!tddResult || !tddResult.tdd) {
-                    console.log(`  ! Stage 2 skipped: TDD data unavailable`);
-                    console.log(`  Note: Basal optimization requires iAPS TDD from deviceStatus or sufficient treatment history`);
-                    console.log(`\nDetector 4 complete: ${recommendations.length} basal recommendations`);
+                    console.log(`  TDD unavailable - skipping TDD optimization`);
+                    
+                    // If we have safety reductions only, create recommendation for those
+                    if (Object.keys(safetyHourlyReductions).length > 0) {
+                        const hourlyDisplayData = [];
+                        for (let i = 0; i < 24; i++) {
+                            const hourStr = `${i.toString().padStart(2, '0')}:00`;
+                            const original = basalSchedule[i].value;
+                            const final = safetyAdjustedSchedule[i].value;
+                            hourlyDisplayData.push({
+                                hour: hourStr,
+                                oldValue: original.toFixed(3),
+                                newValue: final.toFixed(3),
+                                change: (final - original).toFixed(3),
+                                hasChange: Math.abs(final - original) > 0.001,
+                                isSafetyChange: safetyHourlyReductions[hourStr] !== undefined
+                            });
+                        }
+                        
+                        recommendations.push({
+                            detector: 'Unified Basal Optimization',
+                            type: 'Basal Optimization',
+                            reason: `Safety reductions for ${safetyEventSummary.totalLows} resistant low(s)`,
+                            scheduleTime: 'ALL',
+                            currentValue: parseFloat(originalTotal.toFixed(2)),
+                            newValue: parseFloat(safetyAdjustedTotal.toFixed(2)),
+                            adjustment: `-${totalSafetyReduction.toFixed(2)} U/day`,
+                            calculation: `Original: ${originalTotal.toFixed(2)}U → Final: ${safetyAdjustedTotal.toFixed(2)}U`,
+                            details: `**Safety Reductions**\n${safetyEventSummary.totalLows} resistant low(s) with peak IOB ${safetyEventSummary.peakNegativeIOB.toFixed(2)}U\nHours: ${Array.from(safetyEventSummary.affectedHours).sort().join(', ')}\n\n**TDD optimization skipped** (data unavailable)`,
+                            hourlyDisplayData: hourlyDisplayData,
+                            confidence: { level: 'High', score: 90 },
+                            priority: 'HIGH',
+                            hourlySchedule: safetyAdjustedSchedule,
+                            safetyNote: `System withheld ${Math.abs(safetyEventSummary.peakNegativeIOB).toFixed(2)}U but lows still occurred`
+                        });
+                    }
+                    
+                    console.log(`\nDetector 4 complete: ${recommendations.length} recommendation(s)`);
                     return recommendations;
                 }
                 
                 const tdd = tddResult.tdd;
                 const tddSource = tddResult.source;
                 const tddWarning = tddResult.warning;
-                
                 const targetTotalBasal = tdd * 0.35;
                 
-                // Apply safety limits (max 10% change from current total)
-                let currentTotalBasal = modifiedBasalSchedule.reduce((sum, e) => sum + e.value, 0);
-                const maxChange = currentTotalBasal * 0.10;
+                // 10% max change from safety-adjusted baseline
+                const maxChange = safetyAdjustedTotal * 0.10;
                 const cappedTargetBasal = Math.max(
-                    currentTotalBasal - maxChange,
-                    Math.min(currentTotalBasal + maxChange, targetTotalBasal)
+                    safetyAdjustedTotal - maxChange,
+                    Math.min(safetyAdjustedTotal + maxChange, targetTotalBasal)
                 );
                 
-                console.log(`  Current total basal: ${currentTotalBasal.toFixed(2)}U`);
-                console.log(`  Target total basal (35% of TDD): ${targetTotalBasal.toFixed(2)}U`);
-                if (cappedTargetBasal !== targetTotalBasal) {
-                    console.log(`  Capped to 10% change: ${cappedTargetBasal.toFixed(2)}U`);
+                console.log(`  TDD: ${tdd.toFixed(2)}U (${tddSource})`);
+                console.log(`  Target: ${targetTotalBasal.toFixed(2)}U (35% TDD)`);
+                console.log(`  Capped: ${cappedTargetBasal.toFixed(2)}U`);
+                
+                // Distribute TDD adjustment, protecting safety hours from increases
+                const safetyHoursSet = new Set(Object.keys(safetyHourlyReductions));
+                const finalSchedule = distributeBasalAdjustment(safetyAdjustedSchedule, cappedTargetBasal, safetyHoursSet);
+                const finalTotal = finalSchedule.reduce((sum, e) => sum + e.value, 0);
+                
+                // ============================================================
+                // STEP 4: Create unified recommendation (Original → Final)
+                // ============================================================
+                console.log('\n  Step 4: Creating Unified Recommendation');
+                
+                const hourlyDisplayData = [];
+                const safetyHours = new Set(Object.keys(safetyHourlyReductions));
+                
+                for (let i = 0; i < 24; i++) {
+                    const hourStr = `${i.toString().padStart(2, '0')}:00`;
+                    const original = basalSchedule[i].value;
+                    const final = finalSchedule[i].value;
+                    hourlyDisplayData.push({
+                        hour: hourStr,
+                        oldValue: original.toFixed(3),
+                        newValue: final.toFixed(3),
+                        change: (final - original).toFixed(3),
+                        hasChange: Math.abs(final - original) > 0.001,
+                        isSafetyChange: safetyHours.has(hourStr)
+                    });
                 }
-                if (tddWarning) {
-                    console.log(`  ${tddWarning}`);
+                
+                const totalChange = finalTotal - originalTotal;
+                const changedHours = hourlyDisplayData.filter(h => h.hasChange).length;
+                
+                if (Math.abs(totalChange) < 0.05 && changedHours === 0) {
+                    console.log(`  No changes needed`);
+                    console.log(`\nDetector 4 complete: 0 recommendation(s)`);
+                    return recommendations;
                 }
                 
-                // Get the distributed hourly schedule
-                const distributedSchedule = distributeBasalAdjustment(modifiedBasalSchedule, cappedTargetBasal);
+                // Build details
+                let detailsText = '';
+                if (safetyEventSummary && safetyEventSummary.totalLows > 0) {
+                    detailsText += `**Safety Reductions** (HIGH PRIORITY)\n`;
+                    detailsText += `${safetyEventSummary.totalLows} resistant low(s), peak IOB: ${safetyEventSummary.peakNegativeIOB.toFixed(2)}U\n`;
+                    detailsText += `Hours: ${Array.from(safetyEventSummary.affectedHours).sort().join(', ')}\n`;
+                    detailsText += `Reduction: -${totalSafetyReduction.toFixed(2)}U/day\n\n`;
+                }
                 
-                // Analyze the pattern change
-                const oldPattern = analyzeBasalPattern(modifiedBasalSchedule);
-                const newPattern = analyzeBasalPattern(distributedSchedule);
+                detailsText += `**TDD Optimization**\n`;
+                detailsText += `TDD: ${tdd.toFixed(2)}U (${tddSource})\n`;
+                detailsText += `Target: ${targetTotalBasal.toFixed(2)}U (35% of TDD)\n`;
+                detailsText += `\n**Final Result**\n`;
+                detailsText += `Original: ${originalTotal.toFixed(2)}U → Final: ${finalTotal.toFixed(2)}U\n`;
+                detailsText += `Net: ${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)}U/day`;
                 
-                // Create detailed hourly recommendations
-                const hourlyChanges = [];
-                distributedSchedule.forEach((newEntry, idx) => {
-                    const oldEntry = modifiedBasalSchedule[idx];
-                    const change = newEntry.value - oldEntry.value;
-                    if (Math.abs(change) > 0.001) {
-                        hourlyChanges.push({
-                            hour: newEntry.time,
-                            oldValue: oldEntry.value,
-                            newValue: newEntry.value,
-                            change: change
-                        });
-                    }
+                const hasSafetyReductions = safetyEventSummary && safetyEventSummary.totalLows > 0;
+                const percentChange = ((totalChange) / originalTotal * 100).toFixed(1);
+                
+                let reasonText = hasSafetyReductions 
+                    ? `Safety reduction for ${safetyEventSummary.totalLows} resistant low(s) + TDD optimization`
+                    : `Basal ${totalChange > 0 ? 'increase' : 'decrease'} toward 35% TDD target`;
+                
+                let safetyNote = null;
+                if (hasSafetyReductions) {
+                    safetyNote = `System withheld ${Math.abs(safetyEventSummary.peakNegativeIOB).toFixed(2)}U but lows still occurred. Safety hours highlighted.`;
+                }
+                if (tddWarning) safetyNote = safetyNote ? `${safetyNote}\n${tddWarning}` : tddWarning;
+                
+                recommendations.push({
+                    detector: 'Unified Basal Optimization',
+                    type: 'Basal Optimization',
+                    reason: reasonText,
+                    scheduleTime: 'ALL',
+                    currentValue: parseFloat(originalTotal.toFixed(2)),
+                    newValue: parseFloat(finalTotal.toFixed(2)),
+                    adjustment: `${totalChange >= 0 ? '+' : ''}${percentChange}% (${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)} U/day)`,
+                    calculation: `Original: ${originalTotal.toFixed(2)}U → Safety: ${safetyAdjustedTotal.toFixed(2)}U → Final: ${finalTotal.toFixed(2)}U`,
+                    details: detailsText,
+                    hourlyDisplayData: hourlyDisplayData,
+                    confidence: { level: hasSafetyReductions ? 'High' : (tddWarning ? 'Medium' : 'High'), score: hasSafetyReductions ? 95 : (tddWarning ? 70 : 85) },
+                    priority: hasSafetyReductions ? 'HIGH' : 'MEDIUM',
+                    hourlySchedule: finalSchedule,
+                    patternAnalysis: { before: analyzeBasalPattern(basalSchedule), after: analyzeBasalPattern(finalSchedule) },
+                    ...(safetyNote && { safetyNote })
                 });
                 
-                // Create comprehensive recommendation
-                if (Math.abs(cappedTargetBasal - currentTotalBasal) > 0.05) {
-                    const percentChange = ((cappedTargetBasal - currentTotalBasal) / currentTotalBasal * 100).toFixed(1);
-                    const direction = cappedTargetBasal > currentTotalBasal ? 'increase' : 'decrease';
-                    
-                    // Build hourly schedule display data (structured for highlighting)
-                    const hourlyDisplayData = [];
-                    for (let i = 0; i < 24; i++) {
-                        const old = modifiedBasalSchedule[i].value;
-                        const neu = distributedSchedule[i].value;
-                        const change = neu - old;
-                        hourlyDisplayData.push({
-                            hour: `${i.toString().padStart(2, '0')}:00`,
-                            oldValue: old.toFixed(3),
-                            newValue: neu.toFixed(3),
-                            change: change.toFixed(3),
-                            hasChange: Math.abs(change) > 0.001
-                        });
-                    }
-                    
-                    recommendations.push({
-                        detector: 'Basal Optimization - Enhanced Circadian Scaler',
-                        type: 'Basal Hourly Distribution',
-                        reason: `Total basal ${direction} to reach 35% TDD target with intelligent hourly distribution`,
-                        scheduleTime: 'ALL',
-                        currentValue: parseFloat(currentTotalBasal.toFixed(2)),
-                        newValue: parseFloat(cappedTargetBasal.toFixed(2)),
-                        adjustment: `${percentChange > 0 ? '+' : ''}${percentChange}%`,
-                        calculation: `Pattern: ${oldPattern.type} -> ${newPattern.type}`,
-                        details: `TDD: ${tdd.toFixed(2)}U (${tddSource}) -> Target: ${targetTotalBasal.toFixed(2)}U (35% of TDD)\nCurrent Total: ${currentTotalBasal.toFixed(2)}U -> New Total: ${cappedTargetBasal.toFixed(2)}U\n${hourlyChanges.length} hours adjusted`,
-                        hourlyDisplayData: hourlyDisplayData,
-                        confidence: { level: tddWarning ? 'Medium' : 'High', score: tddWarning ? 70 : 85 },
-                        priority: 'MEDIUM',
-                        hourlySchedule: distributedSchedule,
-                        patternAnalysis: {
-                            before: oldPattern,
-                            after: newPattern
-                        },
-                        ...(tddWarning && { safetyNote: tddWarning })
-                    });
-                    
-                    console.log(`  Stage 2 complete: ${percentChange}% ${direction} with ${newPattern.type} pattern`);
-                } else {
-                    console.log(`  Stage 2 complete: No adjustment needed (already close to target)`);
-                }
-                
-                
-                console.log(`\nDetector 4 complete: ${recommendations.length} basal recommendations`);
+                console.log(`  Created: ${originalTotal.toFixed(2)}U → ${finalTotal.toFixed(2)}U`);
+                console.log(`\nDetector 4 complete: ${recommendations.length} recommendation(s)`);
                 return recommendations;
             };
+
 
             /**
              * DETECTOR 5: Regular Lows (Catch-all)
@@ -2191,7 +2277,7 @@
                 
                 // Detector 4: Two-Stage Basal Optimization (Priority 4)
                 const detector4Results = detectBasalOptimization(
-                    nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow
+                    nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents
                 );
                 allRecommendations.push(...detector4Results);
                 
@@ -2393,19 +2479,21 @@
 
             // ===== MAIN ANALYSIS FUNCTION =====
             
-            const runAnalysis = async () => {
+            const runAnalysis = async (dataToAnalyze = null) => {
                 setAnalyzing(true);
                 setError(null);
                 
                 try {
-                    console.log('Starting v24 Multi-Detector Analysis...', nightscoutData);
+                    // Use provided data or fall back to state
+                    const data = dataToAnalyze || nightscoutData;
+                    console.log('Starting v24 Multi-Detector Analysis...', data);
                     
-                    if (!nightscoutData || !nightscoutData.glucose) {
+                    if (!data || !data.glucose) {
                         throw new Error('No glucose data available');
                     }
                     
                     // Get analysis window boundaries
-                    const analysisStartTime = nightscoutData.exportInfo?.analysisStartTime;
+                    const analysisStartTime = data.exportInfo?.analysisStartTime;
                     let analysisStartDateTime;
                     if (analysisStartTime) {
                         analysisStartDateTime = new Date(analysisStartTime);
@@ -2420,8 +2508,8 @@
                     let isfSchedule = [];
                     let basalSchedule = [];
                     
-                    if (nightscoutData.profile && nightscoutData.profile.length > 0) {
-                        const profile = nightscoutData.profile[0];
+                    if (data.profile && data.profile.length > 0) {
+                        const profile = data.profile[0];
                         if (profile.store && profile.store.default) {
                             crSchedule = profile.store.default.carbratio || [];
                             isfSchedule = profile.store.default.sens || [];
@@ -2435,7 +2523,7 @@
                     
                     // Run all detectors
                     const allRecommendations = runAllDetectors(
-                        nightscoutData, 
+                        data, 
                         crSchedule, 
                         isfSchedule, 
                         basalSchedule, 
@@ -2505,6 +2593,12 @@
                         console.log('Loaded Nightscout data:', data);
                         setNightscoutData(data);
                         setError(null);
+                        
+                        // Automatically run analysis after successful file load
+                        // Pass data directly to avoid state timing issues
+                        setTimeout(() => {
+                            runAnalysis(data);
+                        }, 100);
                     } catch (err) {
                         setError('Invalid JSON file: ' + err.message);
                     }
@@ -2579,7 +2673,7 @@
                         }),
                         fetchNightscoutData(baseUrl, '/api/v1/profile.json', {}).catch(() => []),
                         fetchNightscoutData(baseUrl, '/api/v1/devicestatus.json', { 
-                            count: 100,  // Get recent deviceStatus entries
+                            count: 1000,  // Increased to ensure full 30-hour coverage (~705 entries needed at typical 23.5/hour rate)
                             'find[created_at][$gte]': dateString 
                         }).catch(() => [])
                     ]);
@@ -2688,7 +2782,13 @@
                     
                     console.log('Nightscout data prepared:', exportData);
                     setNightscoutData(exportData);
-                    setFetchStatus('Data loaded successfully!');
+                    setFetchStatus('Data loaded successfully! Starting analysis...');
+                    
+                    // Automatically run analysis after successful fetch
+                    // Pass data directly to avoid state timing issues
+                    setTimeout(() => {
+                        runAnalysis(exportData);
+                    }, 100);
                     
                 } catch (err) {
                     console.error('Fetch error:', err);
@@ -2830,11 +2930,11 @@
                                     iAPS Parameter Optimizer
                                 </h1>
                                 <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm font-semibold">
-                                    v24 Multi-Detector + 1b
+                                    v24 Unified Basal
                                 </span>
                             </div>
                             <p className="text-gray-600">
-                                Advanced multi-detector system for CR and ISF optimization
+                                Multi-detector system with IOB-calculated multi-hour basal reduction
                             </p>
                         </div>
 
@@ -2934,14 +3034,29 @@
                         )}
 
                         {/* Analysis Button */}
-                        {nightscoutData && (
-                            <div className="bg-white rounded-lg shadow-lg p-6 mb-6">
+                        {nightscoutData && !analysisResults && (
+                            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6 text-center">
+                                <p className="text-sm text-blue-800 mb-2">
+                                    ⚡ Analysis runs automatically after loading data
+                                </p>
+                                {analyzing && (
+                                    <div className="flex items-center justify-center gap-2">
+                                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-600"></div>
+                                        <span className="text-blue-600 font-medium">Analyzing...</span>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                        
+                        {/* Manual Re-run Button (only show after results) */}
+                        {nightscoutData && analysisResults && (
+                            <div className="bg-white rounded-lg shadow p-4 mb-6">
                                 <button
                                     onClick={runAnalysis}
                                     disabled={analyzing}
-                                    className="w-full bg-indigo-600 text-white px-6 py-3 rounded-lg font-semibold text-lg hover:bg-indigo-700 disabled:bg-gray-400"
+                                    className="w-full bg-gray-600 text-white px-4 py-2 rounded-lg font-medium text-sm hover:bg-gray-700 disabled:bg-gray-400"
                                 >
-                                    {analyzing ? 'Analyzing...' : 'Run Multi-Detector Analysis'}
+                                    {analyzing ? 'Re-analyzing...' : '🔄 Re-run Analysis'}
                                 </button>
                             </div>
                         )}
