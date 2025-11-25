@@ -73,6 +73,18 @@
 
             // ===== SECTION 1: HELPER FUNCTIONS (Keep from v23) =====
             
+            // Format time for human-readable display
+            // Converts "2025-11-24T17:31:42" to "5:31 PM"
+            const formatTimeForDisplay = (timeStr) => {
+                if (!timeStr) return '';
+                const dt = new Date(timeStr);
+                return dt.toLocaleTimeString('en-US', { 
+                    hour: 'numeric', 
+                    minute: '2-digit',
+                    hour12: true 
+                });
+            };
+            
             // Find which CR schedule entry applies to a given time
             const getCRForTime = (timeStr, crSchedule) => {
                 const dt = new Date(timeStr);
@@ -284,38 +296,64 @@
                     const nextMinutes = nextH * 60 + nextM;
                     const minutesUntilBoundary = nextMinutes - mealMinutes;
                     
-                    // If within 2 hours of boundary
-                    if (minutesUntilBoundary > 0 && minutesUntilBoundary < 120) {
-                        // Check if current CR is significantly stronger (lower value = more insulin per carb)
-                        const crDifference = ((nextCREntry.value - crEntry.value) / crEntry.value) * 100;
+                    // CONSTRAINT 1: Only recommend if meal is <120 min before boundary
+                    // (Close enough to be affected by timing)
+                    if (minutesUntilBoundary <= 0 || minutesUntilBoundary >= 120) {
+                        return; // Too far from boundary or past it
+                    }
+                    
+                    // Check if current CR is significantly stronger (lower value = more insulin per carb)
+                    const crDifference = ((nextCREntry.value - crEntry.value) / crEntry.value) * 100;
+                    
+                    if (crDifference > 20) { // Next CR is >20% weaker
+                        console.log(`  Potential boundary issue: ${meal.localDateTime}`);
+                        console.log(`    Using ${crEntry.time} CR (${crEntry.value}) but ${nextCREntry.time} CR (${nextCREntry.value}) is ${crDifference.toFixed(1)}% weaker`);
+                        console.log(`    ${minutesUntilBoundary} min before boundary`);
                         
-                        if (crDifference > 20) { // Next CR is >20% weaker
-                            console.log(`  Potential boundary issue: ${meal.localDateTime}`);
-                            console.log(`    Using ${crEntry.time} CR (${crEntry.value}) but ${nextCREntry.time} CR (${nextCREntry.value}) is ${crDifference.toFixed(1)}% weaker`);
-                            console.log(`    ${minutesUntilBoundary} min before boundary`);
+                        // Check if there was a low within 4 hours after this meal
+                        const fourHoursAfter = new Date(mealTime.getTime() + 4 * 60 * 60 * 1000);
+                        const hadSubsequentLow = lowProblems.some(low => {
+                            const lowTime = new Date(low.time);
+                            return lowTime > mealTime && lowTime <= fourHoursAfter;
+                        });
+                        
+                        if (hadSubsequentLow) {
+                            // CONSTRAINT 2: Check if moving boundary would maintain ≥2 hour gap
+                            // Calculate suggested new boundary time (round to 30-min intervals)
+                            const suggestedHour = mealTime.getHours();
+                            const suggestedMin = mealTime.getMinutes() < 30 ? 0 : 30;
+                            const suggestedBoundaryMinutes = suggestedHour * 60 + suggestedMin;
                             
-                            // Check if there was a low within 4 hours after this meal
-                            const fourHoursAfter = new Date(mealTime.getTime() + 4 * 60 * 60 * 1000);
-                            const hadSubsequentLow = lowProblems.some(low => {
-                                const lowTime = new Date(low.time);
-                                return lowTime > mealTime && lowTime <= fourHoursAfter;
-                            });
+                            // Find the previous schedule entry
+                            const [currentH, currentM] = crEntry.time.split(':').map(Number);
+                            const currentMinutes = currentH * 60 + currentM;
                             
-                            if (hadSubsequentLow) {
-                                console.log(`    -> Subsequent low detected - boundary adjustment recommended`);
-                                
-                                issues.push({
-                                    meal: meal,
-                                    mealTime: meal.localDateTime,
-                                    currentSchedule: crEntry.time,
-                                    currentCR: crEntry.value,
-                                    nextSchedule: nextCREntry.time,
-                                    nextCR: nextCREntry.value,
-                                    minutesBeforeBoundary: minutesUntilBoundary,
-                                    crDifference: crDifference,
-                                    hadSubsequentLow: true
-                                });
+                            // Calculate gap between suggested boundary and current schedule
+                            const gapMinutes = suggestedBoundaryMinutes - currentMinutes;
+                            
+                            console.log(`    Suggested boundary: ${suggestedHour.toString().padStart(2, '0')}:${suggestedMin.toString().padStart(2, '0')}`);
+                            console.log(`    Gap with ${crEntry.time}: ${gapMinutes} minutes`);
+                            
+                            if (gapMinutes < 120) {
+                                console.log(`    -> Skipping: Would create ${gapMinutes}-min gap (need ≥120 min)`);
+                                return; // Gap too small - schedules would be too close
                             }
+                            
+                            console.log(`    -> Subsequent low detected - boundary adjustment recommended`);
+                            
+                            issues.push({
+                                meal: meal,
+                                mealTime: meal.localDateTime,
+                                currentSchedule: crEntry.time,
+                                currentCR: crEntry.value,
+                                nextSchedule: nextCREntry.time,
+                                nextCR: nextCREntry.value,
+                                minutesBeforeBoundary: minutesUntilBoundary,
+                                crDifference: crDifference,
+                                hadSubsequentLow: true,
+                                suggestedBoundary: `${suggestedHour.toString().padStart(2, '0')}:${suggestedMin.toString().padStart(2, '0')}`,
+                                gapMinutes: gapMinutes
+                            });
                         }
                     }
                 });
@@ -323,23 +361,19 @@
                 // Generate recommendations for schedule boundary adjustments
                 const recommendations = [];
                 issues.forEach(issue => {
-                    // Suggest moving the boundary earlier to cover the problematic meal
-                    // Calculate suggested new boundary time (round to 30-min intervals)
-                    const mealTime = new Date(issue.meal.created_at);
-                    const suggestedHour = mealTime.getHours();
-                    const suggestedMin = mealTime.getMinutes() < 30 ? 0 : 30;
-                    const suggestedBoundary = `${suggestedHour.toString().padStart(2, '0')}:${suggestedMin.toString().padStart(2, '0')}`;
+                    // Use the pre-validated suggested boundary
+                    const suggestedBoundary = issue.suggestedBoundary;
                     
                     recommendations.push({
                         detector: 'Schedule Boundary Optimization',
                         type: 'Schedule Boundary Adjustment',
-                        reason: `Meal using strong breakfast CR (${issue.currentCR} g/U) caused subsequent low. Moving boundary earlier would use weaker lunch CR (${issue.nextCR} g/U).`,
+                        reason: `Meal using strong ${issue.currentSchedule} CR (${issue.currentCR} g/U) caused subsequent low. Moving boundary earlier would use weaker ${issue.nextSchedule} CR (${issue.nextCR} g/U).`,
                         scheduleTime: issue.nextSchedule,
                         currentValue: issue.nextCR,
                         newValue: issue.nextCR, // Value stays same, timing changes
-                        adjustment: `Move boundary: ${issue.nextSchedule} -> ${suggestedBoundary}`,
-                        calculation: `Meal at ${issue.mealTime} is ${issue.minutesBeforeBoundary} min before ${issue.nextSchedule} boundary. Used ${issue.currentCR} g/U (${issue.crDifference.toFixed(0)}% stronger) instead of ${issue.nextCR} g/U.`,
-                        details: `Meal at ${issue.mealTime} (${issue.meal.carbs}g) used ${issue.currentSchedule} CR (${issue.currentCR} g/U) but occurred ${issue.minutesBeforeBoundary} minutes before ${issue.nextSchedule} boundary. This schedule is ${issue.crDifference.toFixed(0)}% stronger than the ${issue.nextSchedule} CR (${issue.nextCR} g/U), causing subsequent low. Recommend moving ${issue.nextSchedule} boundary to ${suggestedBoundary} to use appropriate CR for mid-morning/afternoon snacks.`,
+                        adjustment: `Move boundary: ${issue.nextSchedule} → ${suggestedBoundary}`,
+                        calculation: `Meal at ${formatTimeForDisplay(issue.meal.created_at)} is ${issue.minutesBeforeBoundary} min before ${issue.nextSchedule} boundary. Used ${issue.currentCR} g/U (${issue.crDifference.toFixed(0)}% stronger) instead of ${issue.nextCR} g/U. Moving maintains ${issue.gapMinutes}-min gap with ${issue.currentSchedule}.`,
+                        details: `Meal at ${formatTimeForDisplay(issue.meal.created_at)} (${issue.meal.carbs}g) used ${issue.currentSchedule} CR (${issue.currentCR} g/U) but occurred ${issue.minutesBeforeBoundary} minutes before ${issue.nextSchedule} boundary. This schedule is ${issue.crDifference.toFixed(0)}% stronger than the ${issue.nextSchedule} CR (${issue.nextCR} g/U), causing subsequent low. Recommend moving ${issue.nextSchedule} boundary to ${suggestedBoundary} (maintains ${Math.floor(issue.gapMinutes / 60)}h ${issue.gapMinutes % 60}min gap with ${issue.currentSchedule} schedule).`,
                         confidence: { level: 'High', score: 85 },
                         priority: 'MEDIUM',
                         events: [issue.meal],
@@ -451,7 +485,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${relevantMeal.localDateTime} (${relevantMeal.carbs}g) -> Low ${low.bg} mg/dL at ${low.localTime}. BG stayed < 180 between meal and low.`,
+                        details: `Meal at ${formatTimeForDisplay(relevantMeal.localDateTime)} (${relevantMeal.carbs}g)\n→ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}\n\nBG stayed < 180 between meal and low.`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'HIGH',
                         events: [relevantMeal, low],
@@ -645,7 +679,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${bestMatch.meal.localDateTime} (${bestMatch.meal.carbs}g) -> Brief high ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min) -> Low ${low.bg} mg/dL at ${low.localTime} (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later). Peak-to-crash pattern indicates excessive insulin.`,
+                        details: `Meal at ${formatTimeForDisplay(bestMatch.meal.created_at)} (${bestMatch.meal.carbs}g)\n→ Brief high ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min)\n→ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)} (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later)\n\nPeak-to-crash pattern indicates excessive insulin.`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'HIGH',
                         events: [bestMatch.meal, bestMatch.firstHigh, bestMatch.lastHigh, low],
@@ -782,12 +816,12 @@
                     
                     let reason = 'Corrections too aggressive for high (ISF too strong)';
                     let confidence = { level: 'Medium', score: 70 };
-                    let details = `High ${lastHighReading.sgv} mg/dL at ${lastHighReading.localDateTime} -> ${recentCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) -> Low ${low.bg} mg/dL at ${low.localTime}`;
+                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n→ ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n→ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`;
                     
                     if (hasStacking) {
                         reason += ' - possible insulin stacking with meal';
                         confidence = { level: 'Medium', score: 60 };
-                        details += `. Note: ${mealsBetweenCorrectionAndLow.length} meal(s) between corrections and low may have contributed.`;
+                        details += `\n\nNote: ${mealsBetweenCorrectionAndLow.length} meal(s) between corrections and low may have contributed.`;
                     }
                     
                     recommendations.push({
@@ -952,6 +986,34 @@
                     // Skip if had a low (not safe to strengthen THIS segment)
                     if (hasLow) {
                         console.log(`    -> Skipping: Low occurred in this segment`);
+                        return;
+                    }
+                    
+                    // Check for treatment rebound pattern (unannounced carb treatment)
+                    // Pattern: Low followed by rapid rise (>2 mg/dL/min) to >130
+                    let hadTreatmentRebound = false;
+                    for (let i = 0; i < readings.length - 1; i++) {
+                        const reading = readings[i];
+                        if (reading.sgv >= 70) continue; // Not a low
+                        
+                        // Look for rapid rise in next 30 minutes (next ~6 readings at 5-min intervals)
+                        const nextReadings = readings.slice(i + 1, Math.min(i + 7, readings.length));
+                        if (nextReadings.length === 0) continue;
+                        
+                        const peakAfterLow = Math.max(...nextReadings.map(r => r.sgv));
+                        const minutesElapsed = nextReadings.length * 5; // Approximate
+                        const riseRate = (peakAfterLow - reading.sgv) / minutesElapsed; // mg/dL per minute
+                        
+                        // Fast rise (>2 mg/dL/min) to >130 suggests carb treatment
+                        if (riseRate > 2 && peakAfterLow > 130) {
+                            hadTreatmentRebound = true;
+                            console.log(`    -> Treatment rebound detected: Low ${reading.sgv} -> Peak ${peakAfterLow} (${riseRate.toFixed(1)} mg/dL/min)`);
+                            break;
+                        }
+                    }
+                    
+                    if (hadTreatmentRebound) {
+                        console.log(`    -> Skipping: High BG likely from treating low, not weak ISF`);
                         return;
                     }
                     
@@ -1233,7 +1295,7 @@
                                 adjustment: 'None',
                                 reason: 'High is physiological rebound from severe hypoglycemia, not weak CR',
                                 calculation: 'N/A',
-                                details: `Meal at ${relevantMeal.localDateTime} (${relevantMeal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} -> Severe low ${lowestReading.sgv} mg/dL at ${lowestReading.localDateTime} -> Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
+                                details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} → Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)} → Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
                                 confidence: { level: 'High', score: 95 },
                                 priority: 'INFORMATIONAL',
                                 events: [relevantMeal, lowestReading, ...highReadings],
@@ -1272,7 +1334,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `-${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 - adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${relevantMeal.localDateTime} (${relevantMeal.carbs}g) -> High ${peakBG} mg/dL at ${lastHighReading.localDateTime} -> ${recentCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) -> Low ${low.bg} mg/dL at ${low.localTime}`,
+                        details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g)\n→ High ${peakBG} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n→ ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n→ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'MEDIUM',
                         events: [relevantMeal, earliestHighReading, ...recentCorrections, low],
@@ -1412,7 +1474,7 @@
                                 adjustment: 'None',
                                 reason: 'High is physiological rebound from severe hypoglycemia, not weak CR',
                                 calculation: 'N/A',
-                                details: `Meal at ${meal.localDateTime} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} -> Severe low ${lowestReading.sgv} mg/dL at ${lowestReading.localDateTime} -> Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
+                                details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} → Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)} → Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
                                 confidence: { level: 'High', score: 95 },
                                 priority: 'INFORMATIONAL',
                                 events: [meal, lowestReading, ...highReadings],
@@ -1439,11 +1501,11 @@
                     let details, confidence, reason;
                     if (allCorrections.length > 0) {
                         const totalCorrectionInsulin = allCorrections.reduce((sum, c) => sum + c.insulin, 0);
-                        details = `Meal at ${meal.localDateTime} (${meal.carbs}g) -> High ${peakBG} mg/dL at ${peakReading.localDateTime} -> ${allCorrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U) given. High requiring corrections indicates insufficient upfront insulin.`;
+                        details = `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n→ High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n→ ${allCorrections.length} correction${allCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) given\n\nHigh requiring corrections indicates insufficient upfront insulin.`;
                         confidence = { level: 'High', score: 85 };
                         reason = 'Meal caused high requiring corrections (CR too weak)';
                     } else {
-                        details = `Meal at ${meal.localDateTime} (${meal.carbs}g) -> High ${peakBG} mg/dL at ${peakReading.localDateTime}. High indicates insufficient upfront insulin.`;
+                        details = `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n→ High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n\nHigh indicates insufficient upfront insulin.`;
                         confidence = { level: 'Medium', score: 70 };
                         reason = 'Meal caused high (CR too weak)';
                     }
@@ -2045,7 +2107,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Low ${low.bg} mg/dL at ${low.localTime}${relevantMeal ? `, possible meal at ${relevantMeal.localDateTime}` : ''}`,
+                        details: `Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}${relevantMeal ? `, possible meal at ${formatTimeForDisplay(relevantMeal.created_at)}` : ''}`,
                         confidence: { level: relevantMeal ? 'Medium' : 'Low', score: relevantMeal ? 60 : 40 },
                         priority: 'LOW',
                         events: [low]
@@ -2230,7 +2292,8 @@
                 return conflicts;
             };
 
-            // NEW: Group recommendations by schedule time chronologically
+            // NEW: Group recommendations by parameter type (CR, ISF, Basal)
+            // This matches the iAPS workflow where each parameter is adjusted on a separate screen
             // Helper to extract timestamp from recommendation events
             const getRecTimestamp = (rec) => {
                 if (!rec.events || rec.events.length === 0) return 0;
@@ -2243,51 +2306,79 @@
                 return 0;
             };
 
-            const groupByScheduleTime = (recommendations, conflicts) => {
-                // Create a map of schedule times to their recommendations
-                const bySchedule = {};
+            const groupByParameterType = (recommendations, conflicts) => {
+                // Determine parameter type from recommendation type
+                const getParameterType = (rec) => {
+                    if (rec.type.includes('CR')) return 'CR';
+                    if (rec.type.includes('ISF')) return 'ISF';
+                    if (rec.type.includes('Basal')) return 'Basal';
+                    if (rec.type.includes('Schedule Boundary')) return 'Schedule';
+                    if (rec.type === 'Informational') return 'Info';
+                    return 'Other';
+                };
                 
+                // Create groups by parameter type
+                const groups = {
+                    CR: { parameterType: 'CR', title: 'Carb Ratio (CR) Adjustments', recommendations: [] },
+                    ISF: { parameterType: 'ISF', title: 'Insulin Sensitivity Factor (ISF) Adjustments', recommendations: [] },
+                    Basal: { parameterType: 'Basal', title: 'Basal Rate Adjustments', recommendations: [] },
+                    Schedule: { parameterType: 'Schedule', title: 'Schedule Boundary Adjustments', recommendations: [] },
+                    Info: { parameterType: 'Info', title: 'Informational Notices', recommendations: [] },
+                    Other: { parameterType: 'Other', title: 'Other Recommendations', recommendations: [] }
+                };
+                
+                // Sort recommendations into parameter type groups
                 recommendations.forEach(rec => {
-                    const time = rec.scheduleTime;
-                    if (!bySchedule[time]) {
-                        bySchedule[time] = {
-                            scheduleTime: time,
-                            recommendations: [],
-                            hasConflict: false
-                        };
-                    }
-                    // Add timestamp for sorting
+                    const paramType = getParameterType(rec);
                     rec._timestamp = getRecTimestamp(rec);
-                    bySchedule[time].recommendations.push(rec);
+                    groups[paramType].recommendations.push(rec);
                 });
                 
-                // Mark groups that have conflicts and determine latest
-                conflicts.forEach(conflict => {
-                    if (bySchedule[conflict.scheduleTime]) {
-                        bySchedule[conflict.scheduleTime].hasConflict = true;
-                        
-                        // Sort recommendations by recency (newest first)
-                        const recs = bySchedule[conflict.scheduleTime].recommendations;
-                        recs.sort((a, b) => b._timestamp - a._timestamp);
-                        
-                        // Mark the most recent as latest, others as older
-                        if (recs.length > 0) {
-                            recs[0].isLatest = true;
-                            for (let i = 1; i < recs.length; i++) {
-                                recs[i].isOlder = true;
+                // Within each group, sort by schedule time (chronologically)
+                Object.values(groups).forEach(group => {
+                    group.recommendations.sort((a, b) => {
+                        const aMinutes = scheduleTimeToMinutes(a.scheduleTime);
+                        const bMinutes = scheduleTimeToMinutes(b.scheduleTime);
+                        return aMinutes - bMinutes;
+                    });
+                });
+                
+                // Check for conflicts within each schedule time in each group
+                Object.values(groups).forEach(group => {
+                    // Group by schedule time within this parameter type
+                    const bySchedule = {};
+                    group.recommendations.forEach(rec => {
+                        if (!bySchedule[rec.scheduleTime]) {
+                            bySchedule[rec.scheduleTime] = [];
+                        }
+                        bySchedule[rec.scheduleTime].push(rec);
+                    });
+                    
+                    // Mark conflicts within same schedule time
+                    Object.entries(bySchedule).forEach(([scheduleTime, recs]) => {
+                        if (recs.length > 1) {
+                            // Check if there's an actual conflict (opposing directions)
+                            const hasWeakening = recs.some(r => r.type.includes('Weakening'));
+                            const hasStrengthening = recs.some(r => r.type.includes('Strengthening'));
+                            
+                            if (hasWeakening && hasStrengthening) {
+                                // Sort by recency
+                                recs.sort((a, b) => b._timestamp - a._timestamp);
+                                
+                                // Mark latest/older
+                                recs[0].isLatest = true;
+                                recs[0].hasConflict = true;
+                                for (let i = 1; i < recs.length; i++) {
+                                    recs[i].isOlder = true;
+                                    recs[i].hasConflict = true;
+                                }
                             }
                         }
-                    }
+                    });
                 });
                 
-                // Convert to array and sort chronologically
-                const grouped = Object.values(bySchedule).sort((a, b) => {
-                    const aMinutes = scheduleTimeToMinutes(a.scheduleTime);
-                    const bMinutes = scheduleTimeToMinutes(b.scheduleTime);
-                    return aMinutes - bMinutes;
-                });
-                
-                return grouped;
+                // Return only groups that have recommendations
+                return Object.values(groups).filter(g => g.recommendations.length > 0);
             };
 
             const sortByPriority = (recommendations) => {
@@ -2359,7 +2450,7 @@
                     const conflicts = detectConflicts(aggregated);
                     
                     // Group by schedule time chronologically
-                    const grouped = groupByScheduleTime(aggregated, conflicts);
+                    const grouped = groupByParameterType(aggregated, conflicts);
                     
                     // Also keep sorted list for summary
                     const sorted = sortByPriority(aggregated);
@@ -2639,6 +2730,11 @@
                                     <h4 className="text-lg font-bold text-gray-800">
                                         {rec.type}
                                     </h4>
+                                    {rec.scheduleTime && rec.scheduleTime !== 'ALL' && (
+                                        <span className="text-lg font-bold text-purple-700 bg-purple-50 px-2 py-1 rounded border border-purple-200">
+                                            @ {rec.scheduleTime}
+                                        </span>
+                                    )}
                                     <span className="text-xl font-bold text-indigo-700 bg-indigo-50 px-3 py-1 rounded">
                                         {rec.currentValue} → {rec.newValue}
                                     </span>
@@ -2884,50 +2980,50 @@
                                     </div>
                                 </div>
 
-                                {/* Grouped Recommendations by Schedule Time */}
+                                {/* Grouped Recommendations by Parameter Type */}
                                 <div className="space-y-6">
-                                    <h2 className="text-2xl font-bold text-gray-800">Recommendations by Schedule Time</h2>
+                                    <h2 className="text-2xl font-bold text-gray-800">Parameter Recommendations</h2>
                                     
                                     {analysisResults.groupedRecommendations.map((group, groupIdx) => (
                                         <div key={groupIdx} className="bg-white rounded-lg shadow-lg p-6">
-                                            {/* Schedule Time Header */}
+                                            {/* Parameter Type Header */}
                                             <div className="flex items-center gap-3 mb-4 pb-3 border-b">
                                                 <h3 className="text-xl font-bold text-indigo-700">
-                                                    Schedule: {group.scheduleTime}
+                                                    {group.title}
                                                 </h3>
-                                                {group.hasConflict && (
-                                                    <span className="px-3 py-1 bg-yellow-100 text-yellow-800 border border-yellow-400 rounded-full text-sm font-bold">
-                                                        CONFLICT - Review Carefully
-                                                    </span>
-                                                )}
                                                 <span className="text-sm text-gray-500">
                                                     ({group.recommendations.length} recommendation{group.recommendations.length > 1 ? 's' : ''})
                                                 </span>
                                             </div>
                                             
-                                            {/* Conflict Warning */}
-                                            {group.hasConflict && (
-                                                <div className="bg-yellow-50 border border-yellow-300 rounded-lg p-4 mb-4">
-                                                    <p className="text-yellow-800 font-semibold mb-2">
-                                                        Conflicting Recommendations Detected
-                                                    </p>
-                                                    <p className="text-yellow-700 text-sm">
-                                                        Both weakening and strengthening are recommended for this schedule time. 
-                                                        Prioritize the <strong>LATEST</strong> recommendation (green border) as earlier 
-                                                        adjustments may have already addressed older patterns.
-                                                    </p>
-                                                </div>
-                                            )}
-                                            
-                                            {/* Recommendations in this group */}
+                                            {/* Recommendations in this parameter type */}
                                             <div className="space-y-4">
-                                                {group.recommendations.map((rec, recIdx) => (
-                                                    <RecommendationCard 
-                                                        key={recIdx} 
-                                                        rec={rec} 
-                                                        showConflictWarning={group.hasConflict}
-                                                    />
-                                                ))}
+                                                {group.recommendations.map((rec, recIdx) => {
+                                                    // Check if this specific rec has conflict
+                                                    const hasConflict = rec.hasConflict || false;
+                                                    
+                                                    return (
+                                                        <div key={recIdx}>
+                                                            {/* Show conflict warning above the rec if it has one */}
+                                                            {hasConflict && rec.isLatest && (
+                                                                <div className="bg-yellow-50 border border-yellow-300 rounded-lg p-3 mb-2">
+                                                                    <p className="text-yellow-800 font-semibold text-sm mb-1">
+                                                                        Conflicting Recommendations at {rec.scheduleTime}
+                                                                    </p>
+                                                                    <p className="text-yellow-700 text-xs">
+                                                                        Both weakening and strengthening recommended. This <strong>LATEST</strong> recommendation 
+                                                                        (green border) takes priority as earlier patterns may have been addressed.
+                                                                    </p>
+                                                                </div>
+                                                            )}
+                                                            
+                                                            <RecommendationCard 
+                                                                rec={rec} 
+                                                                showConflictWarning={hasConflict}
+                                                            />
+                                                        </div>
+                                                    );
+                                                })}
                                             </div>
                                         </div>
                                     ))}
