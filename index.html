@@ -2811,8 +2811,9 @@
             /**
              * DETECTOR 5: Regular Lows (Catch-all)
              * Priority: 5 (Lowest)
-             * Pattern: Any unclaimed lows
+             * Pattern: Any unclaimed lows WITH a meal in lookback window
              * Conclusion: General CR issue
+             * NOTE: Lows without meals are skipped - these are basal issues, not CR issues
              */
             const detectRegularLows = (lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds) => {
                 console.log('=== DETECTOR 5: Regular Lows (Catch-all) ===');
@@ -2835,7 +2836,6 @@
                     
                     const lowTime = new Date(low.time);
                     const eightHoursAgo = new Date(lowTime - 8 * 60 * 60 * 1000);
-                    const threeHoursAgo = new Date(lowTime - 3 * 60 * 60 * 1000);
                     
                     // Find the most recent meal
                     let relevantMeal = null;
@@ -2850,21 +2850,19 @@
                         }
                     }
                     
-                    // Determine CR schedule
-                    let timeForCR;
-                    if (relevantMeal) {
-                        timeForCR = relevantMeal.localDateTime;
-                    } else {
-                        // Look back 3 hours
-                        timeForCR = threeHoursAgo.toISOString();
+                    // NO MEAL FOUND = NOT A CR ISSUE
+                    // Skip this low - basal signal analysis will handle fasting lows
+                    if (!relevantMeal) {
+                        console.log(`Skipping low without meal (basal issue, not CR): ${low.localTime}`);
+                        return;
                     }
-                    const crEntry = getCRForTime(timeForCR, crSchedule);
                     
-                    // Claim the low
+                    // Use meal time for CR schedule lookup
+                    const crEntry = getCRForTime(relevantMeal.localDateTime, crSchedule);
+                    
+                    // Claim the low and meal
                     claimedEvents.lows.add(lowId);
-                    if (relevantMeal) {
-                        claimedEvents.meals.add(getEventId(relevantMeal));
-                    }
+                    claimedEvents.meals.add(getEventId(relevantMeal));
                     
                     const adjustmentPercent = low.bg < 55 ? 7.5 : 5;
                     const newCR = crEntry.value * (1 + adjustmentPercent / 100);
@@ -2872,19 +2870,19 @@
                     recommendations.push({
                         detector: 'Regular Low (Catch-all)',
                         type: 'CR Weakening',
-                        reason: 'Low without clear specific cause',
+                        reason: 'Low after meal without clear pattern',
                         scheduleTime: crEntry.time,
                         currentValue: crEntry.value,
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}${relevantMeal ? `, possible meal at ${formatTimeForDisplay(relevantMeal.created_at)}` : ''}`,
-                        confidence: { level: relevantMeal ? 'Medium' : 'Low', score: relevantMeal ? 60 : 40 },
+                        details: `Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}, possible meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g)`,
+                        confidence: { level: 'Medium', score: 60 },
                         priority: 'LOW',
-                        events: [low]
+                        events: [low, relevantMeal]
                     });
                     
-                    console.log(`OK Found regular low: ${low.localTime}`);
+                    console.log(`OK Found regular low with meal: ${low.localTime}`);
                 });
                 
                 console.log(`Detector 5 complete: ${recommendations.length} recommendations`);
