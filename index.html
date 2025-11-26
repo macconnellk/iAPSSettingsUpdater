@@ -51,6 +51,7 @@
             const [loading, setLoading] = useState(false);
             const [fetchStatus, setFetchStatus] = useState('');
             const [analysisWindow, setAnalysisWindow] = useState(1);
+            const [basalTDDPercent, setBasalTDDPercent] = useState(35);
             
             const [nsConfig, setNsConfig] = useState(() => {
                 try {
@@ -1756,8 +1757,9 @@
              * Combines IOB-based safety reductions with 35% TDD optimization into ONE recommendation
              * Flow: Original → Safety Adjusted → TDD Optimized → Final
              */
-            const detectBasalOptimization = (nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents) => {
+            const detectBasalOptimization = (nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents, basalTDDPercent = 35) => {
                 console.log('=== DETECTOR 4: Unified Basal Optimization ===');
+                console.log(`  Basal TDD Target: ${basalTDDPercent}%`);
                 const recommendations = [];
                 const PUMP_INCREMENT = 0.05; // U/hr - minimum pump adjustment
                 
@@ -2021,7 +2023,7 @@
                 const tdd = tddResult.tdd;
                 const tddSource = tddResult.source;
                 const tddWarning = tddResult.warning;
-                const targetTotalBasal = tdd * 0.35;
+                const targetTotalBasal = tdd * (basalTDDPercent / 100);
                 
                 // 10% max change from safety-adjusted baseline
                 const maxChange = safetyAdjustedTotal * 0.10;
@@ -2031,7 +2033,7 @@
                 );
                 
                 console.log(`  TDD: ${tdd.toFixed(2)}U (${tddSource})`);
-                console.log(`  Target: ${targetTotalBasal.toFixed(2)}U (35% TDD)`);
+                console.log(`  Target: ${targetTotalBasal.toFixed(2)}U (${basalTDDPercent}% TDD)`);
                 console.log(`  Capped: ${cappedTargetBasal.toFixed(2)}U`);
                 
                 // Distribute TDD adjustment, protecting safety hours from increases
@@ -2081,7 +2083,7 @@
                 
                 detailsText += `**TDD Optimization**\n`;
                 detailsText += `TDD: ${tdd.toFixed(2)}U (${tddSource})\n`;
-                detailsText += `Target: ${targetTotalBasal.toFixed(2)}U (35% of TDD)\n`;
+                detailsText += `Target: ${targetTotalBasal.toFixed(2)}U (${basalTDDPercent}% of TDD)\n`;
                 detailsText += `\n**Final Result**\n`;
                 detailsText += `Original: ${originalTotal.toFixed(2)}U → Final: ${finalTotal.toFixed(2)}U\n`;
                 detailsText += `Net: ${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)}U/day`;
@@ -2091,7 +2093,7 @@
                 
                 let reasonText = hasSafetyReductions 
                     ? `Safety reduction for ${safetyEventSummary.totalLows} resistant low(s) + TDD optimization`
-                    : `Basal ${totalChange > 0 ? 'increase' : 'decrease'} toward 35% TDD target`;
+                    : `Basal ${totalChange > 0 ? 'increase' : 'decrease'} toward ${basalTDDPercent}% TDD target`;
                 
                 let safetyNote = null;
                 if (hasSafetyReductions) {
@@ -2208,7 +2210,7 @@
 
             // ===== SECTION 3: ORCHESTRATION =====
             
-            const runAllDetectors = (nightscoutData, crSchedule, isfSchedule, basalSchedule, analysisStartDateTime, analysisWindow) => {
+            const runAllDetectors = (nightscoutData, crSchedule, isfSchedule, basalSchedule, analysisStartDateTime, analysisWindow, basalTDDPercent = 35) => {
                 console.log('\n========== RUNNING MULTI-DETECTOR ANALYSIS ==========\n');
                 
                 // Initialize event claiming system
@@ -2277,7 +2279,7 @@
                 
                 // Detector 4: Two-Stage Basal Optimization (Priority 4)
                 const detector4Results = detectBasalOptimization(
-                    nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents
+                    nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents, basalTDDPercent
                 );
                 allRecommendations.push(...detector4Results);
                 
@@ -2528,7 +2530,8 @@
                         isfSchedule, 
                         basalSchedule, 
                         analysisStartDateTime, 
-                        analysisWindow
+                        analysisWindow,
+                        basalTDDPercent
                     );
                     
                     // Aggregate recommendations
@@ -2999,6 +3002,25 @@
                                             <option value={3}>Last 3 days</option>
                                             <option value={7}>Last 7 days</option>
                                         </select>
+                                        
+                                        <div className="mt-2">
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                Basal Target: {basalTDDPercent}% of TDD
+                                            </label>
+                                            <input
+                                                type="range"
+                                                min="25"
+                                                max="45"
+                                                value={basalTDDPercent}
+                                                onChange={(e) => setBasalTDDPercent(Number(e.target.value))}
+                                                className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                            />
+                                            <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                <span>25%</span>
+                                                <span>35% (default)</span>
+                                                <span>45%</span>
+                                            </div>
+                                        </div>
                                     </div>
                                     
                                     <button
