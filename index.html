@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>iAPS Parameter Optimizer - v24 Unified Basal</title>
+    <title>iAPS Parameter Optimizer - v25 Signal Logging</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -13,7 +13,7 @@
     <div id="root"></div>
     
     <script type="text/babel">
-        const { useState } = React;
+        const { useState, useRef, useEffect } = React;
         
         // Icons
         const Activity = () => (
@@ -64,7 +64,7 @@
             const CIRCADIAN_PERIODS = [
                 { 
                     name: 'Deep Sleep', 
-                    emoji: '🌙',
+                    emoji: '[Moon]',
                     startHour: 0, 
                     endHour: 4, 
                     description: 'GH peaks, lowest cortisol',
@@ -72,7 +72,7 @@
                 },
                 { 
                     name: 'Dawn', 
-                    emoji: '🌅',
+                    emoji: '[Morning]',
                     startHour: 4, 
                     endHour: 8, 
                     description: 'Cortisol surge (dawn phenomenon)',
@@ -80,7 +80,7 @@
                 },
                 { 
                     name: 'Morning', 
-                    emoji: '☀️',
+                    emoji: '[Sun]',
                     startHour: 8, 
                     endHour: 12, 
                     description: 'Peak insulin sensitivity',
@@ -88,7 +88,7 @@
                 },
                 { 
                     name: 'Afternoon', 
-                    emoji: '🌤️',
+                    emoji: '[Cloud]',
                     startHour: 12, 
                     endHour: 17, 
                     description: 'Stable, declining sensitivity',
@@ -96,7 +96,7 @@
                 },
                 { 
                     name: 'Evening', 
-                    emoji: '🌆',
+                    emoji: '[Afternoon]',
                     startHour: 17, 
                     endHour: 21, 
                     description: 'Melatonin onset, insulin nadir',
@@ -104,7 +104,7 @@
                 },
                 { 
                     name: 'Sleep Onset', 
-                    emoji: '😴',
+                    emoji: '[Sleep]',
                     startHour: 21, 
                     endHour: 24, 
                     description: 'High melatonin, lowest insulin',
@@ -351,7 +351,7 @@
                         }
                         
                         if (Math.abs(signalAdjustment) >= PUMP_INCREMENT) {
-                            reason = `Dev ${analysis.medianDeviation.toFixed(1)} / ISF ${periodISF} × ${dampingFactor}`;
+                            reason = `Dev ${analysis.medianDeviation.toFixed(1)} / ISF ${periodISF} x ${dampingFactor}`;
                         }
                     }
                     
@@ -698,6 +698,31 @@
             const [basalSignalWindow, setBasalSignalWindow] = useState(7);
             const [basalTDDPercent, setBasalTDDPercent] = useState(35);
             
+            // Google Sheets Logging State
+            const [sheetsWebAppUrl, setSheetsWebAppUrl] = useState(() => {
+                try {
+                    return localStorage.getItem('googleSheetsWebAppUrl') || 'https://script.google.com/macros/s/AKfycbzFj05CKepvJJx9l-HYTeNkihHKm6vLxb2zJsC0z2X1KFuEeGl-nxgkwYUfzLetgm09/exec';
+                } catch (e) { return 'https://script.google.com/macros/s/AKfycbzFj05CKepvJJx9l-HYTeNkihHKm6vLxb2zJsC0z2X1KFuEeGl-nxgkwYUfzLetgm09/exec'; }
+            });
+            const [loggingNotes, setLoggingNotes] = useState('');
+            const [logStatus, setLogStatus] = useState('idle'); // idle, logging, success, error
+            const [logMessage, setLogMessage] = useState('');
+            
+            // Trend Analysis State
+            const [trendData, setTrendData] = useState(null);
+            const [trendLoading, setTrendLoading] = useState(false);
+            const [trendError, setTrendError] = useState(null);
+            const [showTrend, setShowTrend] = useState(false);
+            const [optimalTDDRecommendation, setOptimalTDDRecommendation] = useState(null);
+            
+            // Save sheets URL to localStorage when it changes
+            const updateSheetsUrl = (url) => {
+                setSheetsWebAppUrl(url);
+                try {
+                    localStorage.setItem('googleSheetsWebAppUrl', url);
+                } catch (e) {}
+            };
+            
             const [nsConfig, setNsConfig] = useState(() => {
                 try {
                     const saved = localStorage.getItem('nightscoutConfig');
@@ -715,6 +740,513 @@
                 try {
                     localStorage.setItem('nightscoutConfig', JSON.stringify(newConfig));
                 } catch (e) {}
+            };
+
+            // =========================================================================
+            // GOOGLE SHEETS LOGGING FUNCTIONS
+            // =========================================================================
+            
+            const logToGoogleSheets = async () => {
+                if (!sheetsWebAppUrl) {
+                    setLogStatus('error');
+                    setLogMessage('Please configure Google Sheets URL first');
+                    return;
+                }
+                
+                // Find the signal analysis from recommendations
+                const signalRec = analysisResults?.recommendations?.find(r => r.signalAnalysis);
+                if (!signalRec) {
+                    setLogStatus('error');
+                    setLogMessage('No signal analysis data to log');
+                    return;
+                }
+                
+                setLogStatus('logging');
+                setLogMessage('Logging to Google Sheets...');
+                
+                // Build payload
+                const getPeriodDev = (name) => {
+                    const period = signalRec.signalAnalysis.periods.find(p => p.name === name);
+                    return period?.medianDeviation !== null && period?.medianDeviation !== undefined 
+                        ? period.medianDeviation.toFixed(1) 
+                        : '';
+                };
+                
+                const payload = {
+                    timestamp: new Date().toISOString(),
+                    analysisWindow: basalSignalWindow,
+                    tdd: signalRec.signalTotals?.tdd?.toFixed(1) || '',
+                    signalPercent: signalRec.signalTotals?.signalPercent?.toFixed(1) || signalRec.signalAnalysis?.signalOnlyAnchor?.toFixed(1) || '',
+                    targetPercent: basalTDDPercent,
+                    gap: signalRec.signalTotals?.signalPercent 
+                        ? (signalRec.signalTotals.signalPercent - basalTDDPercent).toFixed(1) 
+                        : (signalRec.signalAnalysis?.signalOnlyAnchor 
+                            ? (signalRec.signalAnalysis.signalOnlyAnchor - basalTDDPercent).toFixed(1) 
+                            : ''),
+                    finalPercent: signalRec.signalTotals?.finalPercent?.toFixed(1) || '',
+                    cleanWindows: signalRec.signalAnalysis?.cleanWindows?.total || '',
+                    deepSleepDev: getPeriodDev('Deep Sleep'),
+                    dawnDev: getPeriodDev('Dawn'),
+                    morningDev: getPeriodDev('Morning'),
+                    afternoonDev: getPeriodDev('Afternoon'),
+                    eveningDev: getPeriodDev('Evening'),
+                    sleepOnsetDev: getPeriodDev('Sleep Onset'),
+                    incrementsApplied: signalRec.incrementDistribution?.incrementsNeeded || 0,
+                    direction: signalRec.incrementDistribution?.direction || 'none',
+                    notes: loggingNotes
+                };
+                
+                try {
+                    // POST with no-cors for Apps Script compatibility
+                    await fetch(sheetsWebAppUrl, {
+                        method: 'POST',
+                        mode: 'no-cors',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    
+                    // no-cors means we can't read response, show optimistic success
+                    setLogStatus('success');
+                    setLogMessage('Logged successfully!');
+                    setLoggingNotes(''); // Clear notes after logging
+                    
+                    // Reset status after 3 seconds
+                    setTimeout(() => {
+                        setLogStatus('idle');
+                        setLogMessage('');
+                    }, 3000);
+                    
+                } catch (error) {
+                    console.error('Failed to log:', error);
+                    setLogStatus('error');
+                    setLogMessage('Failed to log: ' + error.message);
+                }
+            };
+            
+            // =========================================================================
+            // TREND ANALYSIS FUNCTIONS
+            // =========================================================================
+            
+            const fetchTrendData = async () => {
+                if (!sheetsWebAppUrl) {
+                    setTrendError('Please configure Google Sheets URL first');
+                    return;
+                }
+                
+                setTrendLoading(true);
+                setTrendError(null);
+                setShowTrend(true);
+                
+                try {
+                    const response = await fetch(sheetsWebAppUrl);
+                    const result = await response.json();
+                    
+                    console.log('Trend data received:', result);
+                    
+                    if (result.success && result.entries) {
+                        console.log('Entries:', result.entries);
+                        setTrendData(result.entries);
+                        
+                        // ALWAYS call analyzeOptimalTDDPercent - it handles insufficient data
+                        // and calculates basic stats (avgGap, daySpan) even with few entries
+                        const recommendation = analyzeOptimalTDDPercent(result.entries);
+                        console.log('Recommendation:', recommendation);
+                        setOptimalTDDRecommendation(recommendation);
+                    } else {
+                        setTrendError(result.error || 'Failed to fetch trend data');
+                    }
+                } catch (error) {
+                    console.error('Failed to fetch trend:', error);
+                    setTrendError('Failed to fetch: ' + error.message);
+                } finally {
+                    setTrendLoading(false);
+                }
+            };
+            
+            const analyzeOptimalTDDPercent = (loggedData) => {
+                console.log('=== analyzeOptimalTDDPercent CALLED ===');
+                console.log('Input data length:', loggedData?.length);
+                
+                // Parse values - handle different column name formats including Google Sheets headers
+                const parseVal = (entry, ...keys) => {
+                    // Normalize a key for comparison (trim, lowercase, remove extra spaces)
+                    const normalizeKey = (k) => k.toLowerCase().trim().replace(/\s+/g, ' ');
+                    
+                    // Build all possible key variations from the requested keys ONLY
+                    const allKeys = new Set();
+                    for (const key of keys) {
+                        allKeys.add(key);
+                        allKeys.add(key.toLowerCase());
+                        allKeys.add(key.trim());
+                    }
+                    // NOTE: Do NOT add unrelated keys like 'Timestamp' here!
+                    // That causes parseFloat("2025-12-01...") = 2025 to be returned
+                    
+                    // Try to find a matching key in the entry
+                    const entryKeys = Object.keys(entry);
+                    for (const entryKey of entryKeys) {
+                        const normalizedEntryKey = normalizeKey(entryKey);
+                        for (const targetKey of allKeys) {
+                            if (normalizeKey(targetKey) === normalizedEntryKey) {
+                                const val = parseFloat(entry[entryKey]);
+                                if (!isNaN(val)) return val;
+                            }
+                        }
+                    }
+                    return null;
+                };
+                
+                const getTimestamp = (entry) => {
+                    return entry.timestamp || entry.Timestamp || entry.TIMESTAMP || null;
+                };
+                
+                // Debug: log what we're working with
+                if (loggedData.length > 0) {
+                    console.log('analyzeOptimalTDDPercent: First entry keys:', Object.keys(loggedData[0]));
+                    console.log('analyzeOptimalTDDPercent: First entry:', loggedData[0]);
+                }
+                
+                console.log('=== Checking each entry for valid signal/target ===');
+                const validEntries = loggedData.filter((entry, idx) => {
+                    // Include all possible key formats for Google Sheets compatibility
+                    // Apps Script converts "Signal %" to "signal_Percent"
+                    const signal = parseVal(entry, 'Signal %', 'signal_%', 'signal_percent', 'signalPercent', 'signal_Percent');
+                    const target = parseVal(entry, 'Target %', 'target_%', 'target_percent', 'targetPercent', 'target_Percent');
+                    console.log(`analyzeOptimalTDDPercent: Entry ${idx} - signal: ${signal}, target: ${target}, valid: ${signal !== null && target !== null}`);
+                    return signal !== null && target !== null;
+                });
+                console.log('validEntries count:', validEntries.length);
+                
+                // Calculate basic stats even with insufficient data
+                let avgGap = null;
+                let daySpan = null;
+                
+                if (validEntries.length > 0) {
+                    // Calculate gaps (signal% - target%)
+                    const gaps = validEntries.map((entry, idx) => {
+                        const signal = parseVal(entry, 'Signal %', 'signal_%', 'signal_percent', 'signalPercent', 'signal_Percent');
+                        const target = parseVal(entry, 'Target %', 'target_%', 'target_percent', 'targetPercent', 'target_Percent');
+                        const gap = signal - target;
+                        console.log(`analyzeOptimalTDDPercent: Entry ${idx} - signal: ${signal}, target: ${target}, gap: ${gap}`);
+                        return gap;
+                    });
+                    console.log('analyzeOptimalTDDPercent: All gaps:', gaps);
+                    avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+                    console.log('analyzeOptimalTDDPercent: avgGap calculated:', avgGap);
+                    
+                    // Calculate date range
+                    const timestamps = validEntries.map(e => new Date(getTimestamp(e))).filter(d => !isNaN(d));
+                    if (timestamps.length > 0) {
+                        const firstDate = new Date(Math.min(...timestamps));
+                        const lastDate = new Date(Math.max(...timestamps));
+                        daySpan = Math.max(1, Math.ceil((lastDate - firstDate) / (1000 * 60 * 60 * 24)));
+                    }
+                }
+                
+                if (validEntries.length < 14) {
+                    console.log('=== RETURNING INSUFFICIENT_DATA ===');
+                    console.log('validEntries.length:', validEntries.length);
+                    console.log('avgGap:', avgGap);
+                    console.log('daySpan:', daySpan);
+                    return {
+                        recommendation: 'INSUFFICIENT_DATA',
+                        message: `Need ${14 - validEntries.length} more valid entries`,
+                        entriesNeeded: 14 - validEntries.length,
+                        avgGap: avgGap,
+                        daySpan: daySpan,
+                        entriesAnalyzed: validEntries.length
+                    };
+                }
+                
+                // Calculate gaps (signal% - target%) - for full analysis
+                const gaps = validEntries.map(entry => {
+                    const signal = parseVal(entry, 'Signal %', 'signal_%', 'signal_percent', 'signalPercent', 'signal_Percent');
+                    const target = parseVal(entry, 'Target %', 'target_%', 'target_percent', 'targetPercent', 'target_Percent');
+                    return signal - target;
+                });
+                
+                avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+                
+                // Check recent trend (last 7 vs first 7)
+                const recentGaps = gaps.slice(-7);
+                const olderGaps = gaps.slice(0, 7);
+                const recentAvg = recentGaps.reduce((a, b) => a + b, 0) / recentGaps.length;
+                const olderAvg = olderGaps.reduce((a, b) => a + b, 0) / olderGaps.length;
+                
+                // Determine trend direction
+                let trendDirection = 'stable';
+                if (Math.abs(recentAvg) < Math.abs(olderAvg) - 0.5) {
+                    trendDirection = 'converging';
+                } else if (Math.abs(recentAvg) > Math.abs(olderAvg) + 0.5) {
+                    trendDirection = 'diverging';
+                }
+                
+                // Recalculate daySpan for full dataset (more accurate)
+                const fullTimestamps = validEntries.map(e => new Date(getTimestamp(e))).filter(d => !isNaN(d));
+                if (fullTimestamps.length > 1) {
+                    const firstDate = new Date(Math.min(...fullTimestamps));
+                    const lastDate = new Date(Math.max(...fullTimestamps));
+                    daySpan = Math.max(1, Math.ceil((lastDate - firstDate) / (1000 * 60 * 60 * 24)));
+                }
+                
+                // Determine recommendation
+                const currentTarget = basalTDDPercent;
+                
+                if (Math.abs(avgGap) < 0.5) {
+                    return {
+                        recommendation: 'OPTIMAL',
+                        message: `Your ${currentTarget}% target is well-calibrated. Signals consistently align within ±0.5%.`,
+                        suggestedTarget: currentTarget,
+                        avgGap: avgGap,
+                        trendDirection: trendDirection,
+                        entriesAnalyzed: validEntries.length,
+                        daySpan: daySpan,
+                        confidence: 'HIGH'
+                    };
+                }
+                
+                if (avgGap > 1.0) {
+                    // Signals consistently suggest MORE basal needed
+                    const suggested = Math.min(45, Math.round(currentTarget + avgGap));
+                    return {
+                        recommendation: 'INCREASE',
+                        message: `Signals consistently run +${avgGap.toFixed(1)}% above your ${currentTarget}% target. This suggests your basal needs are higher than the current anchor.`,
+                        suggestedTarget: suggested,
+                        avgGap: avgGap,
+                        trendDirection: trendDirection,
+                        entriesAnalyzed: validEntries.length,
+                        daySpan: daySpan,
+                        confidence: trendDirection === 'converging' ? 'HIGH' : (trendDirection === 'stable' ? 'MEDIUM' : 'LOW')
+                    };
+                }
+                
+                if (avgGap < -1.0) {
+                    // Signals consistently suggest LESS basal needed
+                    const suggested = Math.max(25, Math.round(currentTarget + avgGap));
+                    return {
+                        recommendation: 'DECREASE',
+                        message: `Signals consistently run ${avgGap.toFixed(1)}% below your ${currentTarget}% target. This suggests your basal needs are lower than the current anchor.`,
+                        suggestedTarget: suggested,
+                        avgGap: avgGap,
+                        trendDirection: trendDirection,
+                        entriesAnalyzed: validEntries.length,
+                        daySpan: daySpan,
+                        confidence: trendDirection === 'converging' ? 'HIGH' : (trendDirection === 'stable' ? 'MEDIUM' : 'LOW')
+                    };
+                }
+                
+                return {
+                    recommendation: 'MONITOR',
+                    message: `Gap of ${avgGap >= 0 ? '+' : ''}${avgGap.toFixed(1)}% is within acceptable range but worth monitoring.`,
+                    suggestedTarget: currentTarget,
+                    avgGap: avgGap,
+                    trendDirection: trendDirection,
+                    entriesAnalyzed: validEntries.length,
+                    daySpan: daySpan,
+                    confidence: 'MEDIUM'
+                };
+            };
+            
+            // =========================================================================
+            // LIGHTWEIGHT CANVAS CHART COMPONENT
+            // =========================================================================
+            const TrendChart = ({ data, targetPercent }) => {
+                const canvasRef = useRef(null);
+                
+                useEffect(() => {
+                    if (!canvasRef.current || !data || data.length === 0) return;
+                    
+                    const canvas = canvasRef.current;
+                    const ctx = canvas.getContext('2d');
+                    const width = canvas.width;
+                    const height = canvas.height;
+                    
+                    // Clear canvas
+                    ctx.clearRect(0, 0, width, height);
+                    
+                    // Padding
+                    const padding = { top: 20, right: 20, bottom: 40, left: 50 };
+                    const chartWidth = width - padding.left - padding.right;
+                    const chartHeight = height - padding.top - padding.bottom;
+                    
+                    // Parse data - handle multiple column name formats from different sources
+                    const parseValue = (entry, ...keys) => {
+                        // Normalize a key for comparison
+                        const normalizeKey = (k) => k.toLowerCase().trim().replace(/\s+/g, ' ');
+                        
+                        // Build all possible key variations
+                        const allKeys = new Set();
+                        for (const key of keys) {
+                            allKeys.add(key);
+                            allKeys.add(key.toLowerCase());
+                            allKeys.add(key.replace(/_/g, ' '));
+                        }
+                        // Also add the exact Google Sheets column names
+                        allKeys.add('Signal %');
+                        allKeys.add('Target %');
+                        allKeys.add('Final %');
+                        allKeys.add('Gap');
+                        
+                        // Try to find a matching key in the entry
+                        const entryKeys = Object.keys(entry);
+                        for (const entryKey of entryKeys) {
+                            const normalizedEntryKey = normalizeKey(entryKey);
+                            for (const targetKey of allKeys) {
+                                if (normalizeKey(targetKey) === normalizedEntryKey) {
+                                    const val = parseFloat(entry[entryKey]);
+                                    if (!isNaN(val)) return val;
+                                }
+                            }
+                        }
+                        return null;
+                    };
+                    
+                    // Debug: log first entry keys
+                    if (data.length > 0) {
+                        console.log('Chart: First entry keys:', Object.keys(data[0]));
+                        console.log('Chart: First entry:', data[0]);
+                    }
+                    
+                    const points = data.map((entry, idx) => {
+                        const signalVal = parseValue(entry, 'Signal %', 'signal_%', 'signal_percent', 'signalPercent', 'Signal%', 'signal_Percent');
+                        const targetVal = parseValue(entry, 'Target %', 'target_%', 'target_percent', 'targetPercent', 'Target%', 'target_Percent') || targetPercent;
+                        console.log(`Chart: Entry ${idx} - signal: ${signalVal}, target: ${targetVal}`);
+                        return {
+                            x: idx,
+                            signalPercent: signalVal,
+                            targetPercent: targetVal,
+                            timestamp: entry.timestamp || entry.Timestamp
+                        };
+                    }).filter(p => p.signalPercent !== null);
+                    
+                    console.log('Chart: Points after filter:', points.length, points);
+                    
+                    if (points.length === 0) {
+                        // Draw "No data" message
+                        ctx.fillStyle = '#6b7280';
+                        ctx.font = '14px sans-serif';
+                        ctx.textAlign = 'center';
+                        ctx.fillText('No valid signal data found', width / 2, height / 2);
+                        return;
+                    }
+                    
+                    // Calculate Y-axis range
+                    const allValues = points.flatMap(p => [p.signalPercent, p.targetPercent]);
+                    const minY = Math.floor(Math.min(...allValues) - 2);
+                    const maxY = Math.ceil(Math.max(...allValues) + 2);
+                    const yRange = maxY - minY;
+                    
+                    // Scale functions - center single point
+                    const xScale = (idx) => {
+                        if (points.length === 1) {
+                            return padding.left + chartWidth / 2; // Center single point
+                        }
+                        return padding.left + (idx / (points.length - 1)) * chartWidth;
+                    };
+                    const yScale = (val) => padding.top + chartHeight - ((val - minY) / yRange) * chartHeight;
+                    
+                    // Draw grid lines
+                    ctx.strokeStyle = '#e5e7eb';
+                    ctx.lineWidth = 1;
+                    for (let y = minY; y <= maxY; y += 2) {
+                        const yPos = yScale(y);
+                        ctx.beginPath();
+                        ctx.moveTo(padding.left, yPos);
+                        ctx.lineTo(width - padding.right, yPos);
+                        ctx.stroke();
+                        
+                        ctx.fillStyle = '#6b7280';
+                        ctx.font = '11px sans-serif';
+                        ctx.textAlign = 'right';
+                        ctx.fillText(`${y}%`, padding.left - 5, yPos + 4);
+                    }
+                    
+                    // Draw target line (dashed)
+                    ctx.strokeStyle = '#9ca3af';
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([5, 5]);
+                    ctx.beginPath();
+                    ctx.moveTo(padding.left, yScale(targetPercent));
+                    ctx.lineTo(width - padding.right, yScale(targetPercent));
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    
+                    // Draw signal line
+                    ctx.strokeStyle = '#4f46e5';
+                    ctx.lineWidth = 2.5;
+                    ctx.beginPath();
+                    points.forEach((point, idx) => {
+                        const x = xScale(idx);
+                        const y = yScale(point.signalPercent);
+                        if (idx === 0) ctx.moveTo(x, y);
+                        else ctx.lineTo(x, y);
+                    });
+                    ctx.stroke();
+                    
+                    // Draw data points (larger for fewer entries)
+                    const pointRadius = points.length <= 3 ? 6 : 4;
+                    ctx.fillStyle = '#4f46e5';
+                    points.forEach((point, idx) => {
+                        const x = xScale(idx);
+                        const y = yScale(point.signalPercent);
+                        ctx.beginPath();
+                        ctx.arc(x, y, pointRadius, 0, Math.PI * 2);
+                        ctx.fill();
+                        
+                        // Add value label for few entries
+                        if (points.length <= 5) {
+                            ctx.fillStyle = '#4f46e5';
+                            ctx.font = 'bold 11px sans-serif';
+                            ctx.textAlign = 'center';
+                            ctx.fillText(`${point.signalPercent.toFixed(1)}%`, x, y - pointRadius - 5);
+                            ctx.fillStyle = '#4f46e5'; // Reset for next point
+                        }
+                    });
+                    
+                    // X-axis date labels
+                    ctx.fillStyle = '#6b7280';
+                    ctx.font = '10px sans-serif';
+                    ctx.textAlign = 'center';
+                    const formatDate = (ts) => {
+                        if (!ts) return '';
+                        const d = new Date(ts);
+                        return `${d.getMonth() + 1}/${d.getDate()}`;
+                    };
+                    if (points.length > 0) {
+                        ctx.fillText(formatDate(points[0].timestamp), xScale(0), height - 10);
+                        if (points.length > 1) {
+                            ctx.fillText(formatDate(points[points.length - 1].timestamp), xScale(points.length - 1), height - 10);
+                        }
+                        if (points.length > 2) {
+                            ctx.fillText(formatDate(points[Math.floor(points.length / 2)].timestamp), xScale(Math.floor(points.length / 2)), height - 10);
+                        }
+                    }
+                    
+                    // Legend
+                    ctx.font = '11px sans-serif';
+                    ctx.textAlign = 'left';
+                    ctx.fillStyle = '#4f46e5';
+                    ctx.fillRect(padding.left, height - 25, 15, 3);
+                    ctx.fillText('Signal %', padding.left + 20, height - 21);
+                    ctx.fillStyle = '#9ca3af';
+                    ctx.setLineDash([3, 3]);
+                    ctx.beginPath();
+                    ctx.moveTo(padding.left + 100, height - 23);
+                    ctx.lineTo(padding.left + 115, height - 23);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.fillText('Target %', padding.left + 120, height - 21);
+                    
+                }, [data, targetPercent]);
+                
+                return (
+                    <canvas 
+                        ref={canvasRef} 
+                        width={600} 
+                        height={250} 
+                        className="w-full max-w-2xl border border-gray-200 rounded bg-white"
+                    />
+                );
             };
 
             // ===== SECTION 1: HELPER FUNCTIONS (Keep from v23) =====
@@ -964,7 +1496,7 @@
                         });
                         
                         if (hadSubsequentLow) {
-                            // CONSTRAINT 2: Check if moving boundary would maintain ≥2 hour gap
+                            // CONSTRAINT 2: Check if moving boundary would maintain â‰¥2 hour gap
                             // Calculate suggested new boundary time (round to 30-min intervals)
                             const suggestedHour = mealTime.getHours();
                             const suggestedMin = mealTime.getMinutes() < 30 ? 0 : 30;
@@ -981,7 +1513,7 @@
                             console.log(`    Gap with ${crEntry.time}: ${gapMinutes} minutes`);
                             
                             if (gapMinutes < 120) {
-                                console.log(`    -> Skipping: Would create ${gapMinutes}-min gap (need ≥120 min)`);
+                                console.log(`    -> Skipping: Would create ${gapMinutes}-min gap (need â‰¥120 min)`);
                                 return; // Gap too small - schedules would be too close
                             }
                             
@@ -1017,7 +1549,7 @@
                         scheduleTime: issue.nextSchedule,
                         currentValue: issue.nextCR,
                         newValue: issue.nextCR, // Value stays same, timing changes
-                        adjustment: `Move boundary: ${issue.nextSchedule} → ${suggestedBoundary}`,
+                        adjustment: `Move boundary: ${issue.nextSchedule}  ->  ${suggestedBoundary}`,
                         calculation: `Meal at ${formatTimeForDisplay(issue.meal.created_at)} is ${issue.minutesBeforeBoundary} min before ${issue.nextSchedule} boundary. Used ${issue.currentCR} g/U (${issue.crDifference.toFixed(0)}% stronger) instead of ${issue.nextCR} g/U. Moving maintains ${issue.gapMinutes}-min gap with ${issue.currentSchedule}.`,
                         details: `Meal at ${formatTimeForDisplay(issue.meal.created_at)} (${issue.meal.carbs}g) used ${issue.currentSchedule} CR (${issue.currentCR} g/U) but occurred ${issue.minutesBeforeBoundary} minutes before ${issue.nextSchedule} boundary. This schedule is ${issue.crDifference.toFixed(0)}% stronger than the ${issue.nextSchedule} CR (${issue.nextCR} g/U), causing subsequent low. Recommend moving ${issue.nextSchedule} boundary to ${suggestedBoundary} (maintains ${Math.floor(issue.gapMinutes / 60)}h ${issue.gapMinutes % 60}min gap with ${issue.currentSchedule} schedule).`,
                         confidence: { level: 'High', score: 85 },
@@ -1131,7 +1663,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${formatTimeForDisplay(relevantMeal.localDateTime)} (${relevantMeal.carbs}g)\n→ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}\n\nBG stayed < 180 between meal and low.`,
+                        details: `Meal at ${formatTimeForDisplay(relevantMeal.localDateTime)} (${relevantMeal.carbs}g)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}\n\nBG stayed < 180 between meal and low.`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'HIGH',
                         events: [relevantMeal, low],
@@ -1325,7 +1857,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${formatTimeForDisplay(bestMatch.meal.created_at)} (${bestMatch.meal.carbs}g)\n→ Brief high ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min)\n→ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)} (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later)\n\nPeak-to-crash pattern indicates excessive insulin.`,
+                        details: `Meal at ${formatTimeForDisplay(bestMatch.meal.created_at)} (${bestMatch.meal.carbs}g)\n ->  Brief high ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)} (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later)\n\nPeak-to-crash pattern indicates excessive insulin.`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'HIGH',
                         events: [bestMatch.meal, bestMatch.firstHigh, bestMatch.lastHigh, low],
@@ -1462,7 +1994,7 @@
                     
                     let reason = 'Corrections too aggressive for high (ISF too strong)';
                     let confidence = { level: 'Medium', score: 70 };
-                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n→ ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n→ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`;
+                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n ->  ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`;
                     
                     if (hasStacking) {
                         reason += ' - possible insulin stacking with meal';
@@ -1941,7 +2473,7 @@
                                 adjustment: 'None',
                                 reason: 'High is physiological rebound from severe hypoglycemia, not weak CR',
                                 calculation: 'N/A',
-                                details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} → Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)} → Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
+                                details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'}  ->  Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)}  ->  Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
                                 confidence: { level: 'High', score: 95 },
                                 priority: 'INFORMATIONAL',
                                 events: [relevantMeal, lowestReading, ...highReadings],
@@ -1980,7 +2512,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `-${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 - adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g)\n→ High ${peakBG} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n→ ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n→ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`,
+                        details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n ->  ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'MEDIUM',
                         events: [relevantMeal, earliestHighReading, ...recentCorrections, low],
@@ -2120,7 +2652,7 @@
                                 adjustment: 'None',
                                 reason: 'High is physiological rebound from severe hypoglycemia, not weak CR',
                                 calculation: 'N/A',
-                                details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} → Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)} → Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
+                                details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'}  ->  Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)}  ->  Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
                                 confidence: { level: 'High', score: 95 },
                                 priority: 'INFORMATIONAL',
                                 events: [meal, lowestReading, ...highReadings],
@@ -2147,11 +2679,11 @@
                     let details, confidence, reason;
                     if (allCorrections.length > 0) {
                         const totalCorrectionInsulin = allCorrections.reduce((sum, c) => sum + c.insulin, 0);
-                        details = `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n→ High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n→ ${allCorrections.length} correction${allCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) given\n\nHigh requiring corrections indicates insufficient upfront insulin.`;
+                        details = `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n ->  ${allCorrections.length} correction${allCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) given\n\nHigh requiring corrections indicates insufficient upfront insulin.`;
                         confidence = { level: 'High', score: 85 };
                         reason = 'Meal caused high requiring corrections (CR too weak)';
                     } else {
-                        details = `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n→ High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n\nHigh indicates insufficient upfront insulin.`;
+                        details = `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n\nHigh indicates insufficient upfront insulin.`;
                         confidence = { level: 'Medium', score: 70 };
                         reason = 'Meal caused high (CR too weak)';
                     }
@@ -2400,7 +2932,7 @@
             /**
              * DETECTOR 4: Unified Basal Optimization
              * Combines IOB-based safety reductions with 35% TDD optimization into ONE recommendation
-             * Flow: Original → Safety Adjusted → TDD Optimized → Final
+             * Flow: Original  ->  Safety Adjusted  ->  TDD Optimized  ->  Final
              */
             const detectBasalOptimization = (nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents, basalTDDPercent = 35, basalSignalWindow = 7) => {
                 console.log('=== DETECTOR 4: Unified Basal Optimization ===');
@@ -2459,7 +2991,7 @@
                     
                     if (iapsTwoWeekTDD) return { tdd: iapsTwoWeekTDD, source: 'iAPS 2-week average', warning: null };
                     if (iapsTDD) return { tdd: iapsTDD, source: 'iAPS current', warning: 'Using iAPS current TDD (2-week average not found)' };
-                    if (calculatedTDD > 0) return { tdd: calculatedTDD, source: `calculated ${analysisWindowDays}-day average`, warning: '⚠️ iAPS TDD not found. Using calculated average.' };
+                    if (calculatedTDD > 0) return { tdd: calculatedTDD, source: `calculated ${analysisWindowDays}-day average`, warning: 'âš ï¸ iAPS TDD not found. Using calculated average.' };
                     return null;
                 };
                 
@@ -2477,7 +3009,7 @@
                             }
                         });
                     }
-                    console.log(`  ✅ Parsed ${iobData.length} IOB data points`);
+                    console.log(`  âœ… Parsed ${iobData.length} IOB data points`);
                     return iobData;
                 };
                 
@@ -2553,7 +3085,7 @@
                             firstNegativeIOBTime = iob.time;
                         }
                         
-                        // Calculate contributing window: 4 hours before first negative → peak time
+                        // Calculate contributing window: 4 hours before first negative  ->  peak time
                         const windowStartTime = new Date(firstNegativeIOBTime.getTime() - 4 * 60 * 60 * 1000);
                         const windowEndTime = peakTime;
                         
@@ -2572,7 +3104,7 @@
                         const reductionPerHour = Math.abs(peakNegativeIOB) / totalHours;
                         const roundedReduction = Math.min(roundToPumpIncrement(reductionPerHour), 0.10);
                         
-                        console.log(`    Window ${windowIdx + 1}: peak IOB ${peakNegativeIOB.toFixed(3)}U → ${roundedReduction.toFixed(2)} U/hr × ${totalHours} hrs`);
+                        console.log(`    Window ${windowIdx + 1}: peak IOB ${peakNegativeIOB.toFixed(3)}U  ->  ${roundedReduction.toFixed(2)} U/hr  x  ${totalHours} hrs`);
                         
                         hoursArray.forEach(hourStr => {
                             safetyHourlyReductions[hourStr] = (safetyHourlyReductions[hourStr] || 0) + roundedReduction;
@@ -2608,13 +3140,13 @@
                         const newValue = Math.max(PUMP_INCREMENT, roundToPumpIncrement(oldValue - reduction));
                         safetyAdjustedSchedule[idx].value = newValue;
                         totalSafetyReduction += (oldValue - newValue);
-                        console.log(`    ${hourStr}: ${oldValue.toFixed(3)} → ${newValue.toFixed(3)}`);
+                        console.log(`    ${hourStr}: ${oldValue.toFixed(3)}  ->  ${newValue.toFixed(3)}`);
                     }
                 });
                 
                 const originalTotal = basalSchedule.reduce((sum, e) => sum + e.value, 0);
                 const safetyAdjustedTotal = safetyAdjustedSchedule.reduce((sum, e) => sum + e.value, 0);
-                console.log(`  Safety adjustment: ${originalTotal.toFixed(2)}U → ${safetyAdjustedTotal.toFixed(2)}U (-${totalSafetyReduction.toFixed(2)}U/day)`);
+                console.log(`  Safety adjustment: ${originalTotal.toFixed(2)}U  ->  ${safetyAdjustedTotal.toFixed(2)}U (-${totalSafetyReduction.toFixed(2)}U/day)`);
                 
                 // ============================================================
                 // STEP 3: Apply 35% TDD optimization
@@ -2651,7 +3183,7 @@
                             currentValue: parseFloat(originalTotal.toFixed(2)),
                             newValue: parseFloat(safetyAdjustedTotal.toFixed(2)),
                             adjustment: `-${totalSafetyReduction.toFixed(2)} U/day`,
-                            calculation: `Original: ${originalTotal.toFixed(2)}U → Final: ${safetyAdjustedTotal.toFixed(2)}U`,
+                            calculation: `Original: ${originalTotal.toFixed(2)}U  ->  Final: ${safetyAdjustedTotal.toFixed(2)}U`,
                             details: `**Safety Reductions**\n${safetyEventSummary.totalLows} resistant low(s) with peak IOB ${safetyEventSummary.peakNegativeIOB.toFixed(2)}U\nHours: ${Array.from(safetyEventSummary.affectedHours).sort().join(', ')}\n\n**TDD optimization skipped** (data unavailable)`,
                             hourlyDisplayData: hourlyDisplayData,
                             confidence: { level: 'High', score: 90 },
@@ -2714,7 +3246,7 @@
                 const finalTotal = signalResult.totals.final;
                 
                 // ============================================================
-                // STEP 4: Create unified recommendation (Original → Final)
+                // STEP 4: Create unified recommendation (Original  ->  Final)
                 // ============================================================
                 console.log('\n  Step 4: Creating Unified Recommendation');
                 
@@ -2756,7 +3288,7 @@
                     const dir = signalResult.incrementDistribution.direction;
                     const count = Math.abs(signalResult.incrementDistribution.incrementsNeeded);
                     detailsText += `**Increment Distribution**\n`;
-                    detailsText += `${count} × 0.05U ${dir}s applied to ${dir === 'decrease' ? 'negative' : 'positive'}-signal periods first\n`;
+                    detailsText += `${count} x 0.05U ${dir}s applied to ${dir === 'decrease' ? 'negative' : 'positive'}-signal periods first\n`;
                     if (signalResult.incrementDistribution.appliedHours.length > 0) {
                         detailsText += `Hours: ${signalResult.incrementDistribution.appliedHours.map(a => `${a.hour}:00`).join(', ')}\n`;
                     }
@@ -2766,7 +3298,7 @@
                 detailsText += `**Target & Final**\n`;
                 detailsText += `TDD: ${tdd.toFixed(2)}U (${tddSource})\n`;
                 detailsText += `Target: ${cappedTargetBasal.toFixed(2)}U (${actualTargetPercent.toFixed(1)}% of TDD)\n`;
-                detailsText += `Original: ${originalTotal.toFixed(2)}U → Final: ${finalTotal.toFixed(2)}U\n`;
+                detailsText += `Original: ${originalTotal.toFixed(2)}U  ->  Final: ${finalTotal.toFixed(2)}U\n`;
                 detailsText += `Net: ${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)}U/day`;
                 
                 const hasSafetyReductions = safetyEventSummary && safetyEventSummary.totalLows > 0;
@@ -2790,7 +3322,7 @@
                     currentValue: parseFloat(originalTotal.toFixed(2)),
                     newValue: parseFloat(finalTotal.toFixed(2)),
                     adjustment: `${totalChange >= 0 ? '+' : ''}${percentChange}% (${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)} U/day)`,
-                    calculation: `Original: ${originalTotal.toFixed(2)}U → Safety: ${safetyAdjustedTotal.toFixed(2)}U → Signal: ${signalResult.totals.signalBased.toFixed(2)}U → Final: ${finalTotal.toFixed(2)}U`,
+                    calculation: `Original: ${originalTotal.toFixed(2)}U  ->  Safety: ${safetyAdjustedTotal.toFixed(2)}U  ->  Signal: ${signalResult.totals.signalBased.toFixed(2)}U  ->  Final: ${finalTotal.toFixed(2)}U`,
                     details: detailsText,
                     hourlyDisplayData: hourlyDisplayData,
                     confidence: { level: hasSafetyReductions ? 'High' : (tddWarning ? 'Medium' : 'High'), score: hasSafetyReductions ? 95 : (tddWarning ? 70 : 85) },
@@ -2798,11 +3330,12 @@
                     hourlySchedule: finalSchedule,
                     signalAnalysis: signalResult.signalAnalysis,
                     incrementDistribution: signalResult.incrementDistribution,
+                    signalTotals: signalResult.totals,
                     patternAnalysis: { before: analyzeBasalPattern(basalSchedule), after: analyzeBasalPattern(finalSchedule) },
                     ...(safetyNote && { safetyNote })
                 });
                 
-                console.log(`  Created: ${originalTotal.toFixed(2)}U → ${finalTotal.toFixed(2)}U`);
+                console.log(`  Created: ${originalTotal.toFixed(2)}U  ->  ${finalTotal.toFixed(2)}U`);
                 console.log(`\nDetector 4 complete: ${recommendations.length} recommendation(s)`);
                 return recommendations;
             };
@@ -3524,7 +4057,7 @@
                                         </span>
                                     )}
                                     <span className="text-xl font-bold text-indigo-700 bg-indigo-50 px-3 py-1 rounded">
-                                        {rec.currentValue} → {rec.newValue}
+                                        {rec.currentValue}  ->  {rec.newValue}
                                     </span>
                                     <span className="text-lg font-bold text-indigo-600">
                                         ({rec.adjustment})
@@ -3618,7 +4151,7 @@
                                     iAPS Parameter Optimizer
                                 </h1>
                                 <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm font-semibold">
-                                    v24 Unified Basal
+                                    v25 Signal Logging
                                 </span>
                             </div>
                             <p className="text-gray-600">
@@ -3742,6 +4275,50 @@
                                     )}
                                 </div>
                             </div>
+                            
+                            {/* Google Sheets Logging Settings */}
+                            <div className="mt-4 border-t pt-4">
+                                <h3 className="font-semibold mb-3 flex items-center gap-2">
+                                    <span>📊</span> Google Sheets Logging (Optional)
+                                </h3>
+                                <div className="space-y-3">
+                                    <div>
+                                        <label className="block text-xs font-medium text-gray-600 mb-1">
+                                            Web App URL
+                                        </label>
+                                        <input
+                                            type="text"
+                                            placeholder="https://script.google.com/macros/s/..."
+                                            value={sheetsWebAppUrl}
+                                            onChange={(e) => updateSheetsUrl(e.target.value)}
+                                            className="w-full px-3 py-2 border rounded-lg text-sm font-mono"
+                                        />
+                                    </div>
+                                    <p className="text-xs text-gray-500">
+                                        Create a Google Sheet with our Apps Script to log signal analysis over time.
+                                        <a 
+                                            href="https://github.com/your-repo/GOOGLE_SHEETS_SETUP.md" 
+                                            target="_blank" 
+                                            rel="noopener noreferrer"
+                                            className="text-blue-600 hover:underline ml-1"
+                                        >
+                                            View Setup Instructions →
+                                        </a>
+                                    </p>
+                                    {sheetsWebAppUrl && (
+                                        <div className="flex items-center gap-2 text-sm">
+                                            <span className="text-green-600">✓ URL configured</span>
+                                            <button
+                                                onClick={fetchTrendData}
+                                                disabled={trendLoading}
+                                                className="text-blue-600 hover:underline text-sm"
+                                            >
+                                                {trendLoading ? 'Loading...' : 'Test connection →'}
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
                         </div>
 
                         {/* Data Status */}
@@ -3765,7 +4342,7 @@
                         {nightscoutData && !analysisResults && (
                             <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-6 text-center">
                                 <p className="text-sm text-blue-800 mb-2">
-                                    ⚡ Analysis runs automatically after loading data
+                                    âš¡ Analysis runs automatically after loading data
                                 </p>
                                 {analyzing && (
                                     <div className="flex items-center justify-center gap-2">
@@ -3784,7 +4361,7 @@
                                     disabled={analyzing}
                                     className="w-full bg-gray-600 text-white px-4 py-2 rounded-lg font-medium text-sm hover:bg-gray-700 disabled:bg-gray-400"
                                 >
-                                    {analyzing ? 'Re-analyzing...' : '🔄 Re-run Analysis'}
+                                    {analyzing ? 'Re-analyzing...' : '[Refresh] Re-run Analysis'}
                                 </button>
                             </div>
                         )}
@@ -3901,7 +4478,7 @@
                                 {/* Signal Analysis by Period */}
                                 {analysisResults.recommendations.some(r => r.signalAnalysis) && (
                                     <div className="bg-white rounded-lg shadow-lg p-6 mt-6">
-                                        <h3 className="text-lg font-semibold mb-3">🔬 Signal Analysis by Circadian Period</h3>
+                                        <h3 className="text-lg font-semibold mb-3">[Lab] Signal Analysis by Circadian Period</h3>
                                         {(() => {
                                             const signalRec = analysisResults.recommendations.find(r => r.signalAnalysis);
                                             if (!signalRec) return null;
@@ -3932,7 +4509,7 @@
                                                                     (period.medianDeviation || 0) > 5 ? 'text-red-600 font-bold' :
                                                                     (period.medianDeviation || 0) < -5 ? 'text-green-600 font-bold' : 'text-gray-600'
                                                                 }`}>
-                                                                    {period.medianDeviation !== null ? `${period.medianDeviation >= 0 ? '+' : ''}${period.medianDeviation.toFixed(1)}` : '—'} mg/dL
+                                                                    {period.medianDeviation !== null ? `${period.medianDeviation >= 0 ? '+' : ''}${period.medianDeviation.toFixed(1)}` : 'â€”'} mg/dL
                                                                 </div>
                                                                 {period.signal && period.signal !== 'NEUTRAL' && (
                                                                     <div className={`text-xs mt-1 font-semibold ${
@@ -3951,7 +4528,7 @@
                                                     {signalRec.incrementDistribution && signalRec.incrementDistribution.appliedHours.length > 0 && (
                                                         <div className="mt-4 p-3 bg-purple-50 border border-purple-200 rounded">
                                                             <p className="text-sm font-semibold text-purple-800">
-                                                                Increment Distribution: {Math.abs(signalRec.incrementDistribution.incrementsNeeded)} × 0.05U {signalRec.incrementDistribution.direction}s
+                                                                Increment Distribution: {Math.abs(signalRec.incrementDistribution.incrementsNeeded)} x 0.05U {signalRec.incrementDistribution.direction}s
                                                             </p>
                                                             <p className="text-xs text-purple-700 mt-1">
                                                                 Applied to hours: {signalRec.incrementDistribution.appliedHours.map(a => `${a.hour}:00`).join(', ')}
@@ -3964,6 +4541,206 @@
                                                 </div>
                                             );
                                         })()}
+                                        
+                                        {/* Log This Analysis Panel */}
+                                        {sheetsWebAppUrl && (
+                                            <div className="mt-4 p-4 bg-indigo-50 border border-indigo-200 rounded-lg">
+                                                <h4 className="font-semibold text-indigo-800 mb-2 flex items-center gap-2">
+                                                    <span>📝</span> Log This Analysis
+                                                </h4>
+                                                <div className="flex flex-col md:flex-row gap-2">
+                                                    <input
+                                                        type="text"
+                                                        placeholder="Notes (optional): e.g., 'After changing ISF'"
+                                                        value={loggingNotes}
+                                                        onChange={(e) => setLoggingNotes(e.target.value)}
+                                                        className="flex-1 px-3 py-2 border rounded text-sm"
+                                                    />
+                                                    <button
+                                                        onClick={logToGoogleSheets}
+                                                        disabled={logStatus === 'logging'}
+                                                        className={`px-4 py-2 rounded font-semibold text-sm whitespace-nowrap ${
+                                                            logStatus === 'success' ? 'bg-green-600 text-white' :
+                                                            logStatus === 'error' ? 'bg-red-600 text-white' :
+                                                            logStatus === 'logging' ? 'bg-gray-400 text-white' :
+                                                            'bg-indigo-600 text-white hover:bg-indigo-700'
+                                                        }`}
+                                                    >
+                                                        {logStatus === 'logging' ? '⏳ Logging...' :
+                                                         logStatus === 'success' ? '✓ Logged!' :
+                                                         logStatus === 'error' ? '✗ Failed' :
+                                                         '📊 Log to Sheets'}
+                                                    </button>
+                                                </div>
+                                                {logMessage && (
+                                                    <p className={`text-xs mt-2 ${
+                                                        logStatus === 'success' ? 'text-green-700' :
+                                                        logStatus === 'error' ? 'text-red-700' :
+                                                        'text-gray-600'
+                                                    }`}>
+                                                        {logMessage}
+                                                    </p>
+                                                )}
+                                            </div>
+                                        )}
+                                        
+                                        {/* View Trend Button */}
+                                        {sheetsWebAppUrl && !showTrend && (
+                                            <div className="mt-4 text-center">
+                                                <button
+                                                    onClick={fetchTrendData}
+                                                    disabled={trendLoading}
+                                                    className="px-6 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg font-medium text-sm border"
+                                                >
+                                                    {trendLoading ? '⏳ Loading Trend Data...' : '📈 View Signal Trend'}
+                                                </button>
+                                            </div>
+                                        )}
+                                        
+                                        {/* Trend Visualization */}
+                                        {showTrend && (
+                                            <div className="mt-4 p-4 bg-white border border-gray-200 rounded-lg">
+                                                <div className="flex justify-between items-center mb-3">
+                                                    <h4 className="font-semibold text-gray-800 flex items-center gap-2">
+                                                        <span>📈</span> Signal Trend Analysis
+                                                        {trendData && (
+                                                            <span className="text-sm font-normal text-gray-500">
+                                                                ({trendData.length} entries)
+                                                            </span>
+                                                        )}
+                                                    </h4>
+                                                    <button
+                                                        onClick={() => setShowTrend(false)}
+                                                        className="text-gray-400 hover:text-gray-600 text-xl"
+                                                    >
+                                                         x 
+                                                    </button>
+                                                </div>
+                                                
+                                                {trendLoading && (
+                                                    <div className="text-center py-8 text-gray-500">
+                                                        <div className="animate-spin inline-block w-6 h-6 border-2 border-gray-300 border-t-indigo-600 rounded-full mb-2"></div>
+                                                        <p>Loading trend data...</p>
+                                                    </div>
+                                                )}
+                                                
+                                                {trendError && (
+                                                    <div className="bg-red-50 border border-red-200 rounded p-3 text-red-700 text-sm">
+                                                        {trendError}
+                                                    </div>
+                                                )}
+                                                
+                                                {trendData && trendData.length === 0 && (
+                                                    <div className="text-center py-8 text-gray-500">
+                                                        <p>No logged entries yet. Log your first analysis above!</p>
+                                                    </div>
+                                                )}
+                                                
+                                                {trendData && trendData.length > 0 && (
+                                                    <div>
+                                                        {/* Chart */}
+                                                        <div className="mb-4">
+                                                            <TrendChart data={trendData} targetPercent={basalTDDPercent} />
+                                                        </div>
+                                                        
+                                                        {/* Summary Stats */}
+                                                        <div className="grid grid-cols-3 gap-3 mb-4">
+                                                            <div className="bg-gray-50 p-3 rounded text-center">
+                                                                <div className="text-2xl font-bold text-indigo-600">{trendData.length}</div>
+                                                                <div className="text-xs text-gray-500">Entries Logged</div>
+                                                            </div>
+                                                            <div className="bg-gray-50 p-3 rounded text-center">
+                                                                <div className="text-2xl font-bold text-indigo-600">
+                                                                    {optimalTDDRecommendation?.daySpan || '—'}
+                                                                </div>
+                                                                <div className="text-xs text-gray-500">Days Tracked</div>
+                                                            </div>
+                                                            <div className="bg-gray-50 p-3 rounded text-center">
+                                                                <div className={`text-2xl font-bold ${
+                                                                    (optimalTDDRecommendation?.avgGap || 0) > 0 ? 'text-red-600' :
+                                                                    (optimalTDDRecommendation?.avgGap || 0) < 0 ? 'text-green-600' :
+                                                                    'text-gray-600'
+                                                                }`}>
+                                                                    {optimalTDDRecommendation?.avgGap !== undefined 
+                                                                        ? `${optimalTDDRecommendation.avgGap >= 0 ? '+' : ''}${optimalTDDRecommendation.avgGap.toFixed(1)}%`
+                                                                        : '—'}
+                                                                </div>
+                                                                <div className="text-xs text-gray-500">Avg Gap from Target</div>
+                                                            </div>
+                                                        </div>
+                                                        
+                                                        {/* Optimal TDD% Recommendation */}
+                                                        {optimalTDDRecommendation && (
+                                                            <div className={`p-4 rounded-lg border ${
+                                                                optimalTDDRecommendation.recommendation === 'OPTIMAL' ? 'bg-green-50 border-green-200' :
+                                                                optimalTDDRecommendation.recommendation === 'INCREASE' ? 'bg-amber-50 border-amber-200' :
+                                                                optimalTDDRecommendation.recommendation === 'DECREASE' ? 'bg-blue-50 border-blue-200' :
+                                                                optimalTDDRecommendation.recommendation === 'INSUFFICIENT_DATA' ? 'bg-gray-50 border-gray-200' :
+                                                                'bg-yellow-50 border-yellow-200'
+                                                            }`}>
+                                                                <h5 className="font-semibold mb-2 flex items-center gap-2">
+                                                                    <span>🎯</span> Optimal Basal Target Recommendation
+                                                                    {optimalTDDRecommendation.confidence && optimalTDDRecommendation.confidence !== 'INSUFFICIENT_DATA' && (
+                                                                        <span className={`text-xs px-2 py-0.5 rounded ${
+                                                                            optimalTDDRecommendation.confidence === 'HIGH' ? 'bg-green-200 text-green-800' :
+                                                                            optimalTDDRecommendation.confidence === 'MEDIUM' ? 'bg-yellow-200 text-yellow-800' :
+                                                                            'bg-orange-200 text-orange-800'
+                                                                        }`}>
+                                                                            {optimalTDDRecommendation.confidence} confidence
+                                                                        </span>
+                                                                    )}
+                                                                </h5>
+                                                                
+                                                                <p className="text-sm text-gray-700 mb-3">
+                                                                    {optimalTDDRecommendation.message}
+                                                                </p>
+                                                                
+                                                                {optimalTDDRecommendation.recommendation !== 'INSUFFICIENT_DATA' && 
+                                                                 optimalTDDRecommendation.recommendation !== 'OPTIMAL' &&
+                                                                 optimalTDDRecommendation.recommendation !== 'MONITOR' && (
+                                                                    <div className="flex items-center gap-3">
+                                                                        <div className="bg-white px-4 py-2 rounded border font-mono">
+                                                                            Recommended: <strong>{optimalTDDRecommendation.suggestedTarget}%</strong> of TDD
+                                                                        </div>
+                                                                        <button
+                                                                            onClick={() => setBasalTDDPercent(optimalTDDRecommendation.suggestedTarget)}
+                                                                            className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 text-sm font-semibold"
+                                                                        >
+                                                                            Apply {optimalTDDRecommendation.suggestedTarget}% Target
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => setShowTrend(false)}
+                                                                            className="px-4 py-2 bg-gray-200 text-gray-700 rounded hover:bg-gray-300 text-sm"
+                                                                        >
+                                                                            Keep {basalTDDPercent}%
+                                                                        </button>
+                                                                    </div>
+                                                                )}
+                                                                
+                                                                {optimalTDDRecommendation.trendDirection && (
+                                                                    <p className="text-xs text-gray-500 mt-2">
+                                                                        Trend: {optimalTDDRecommendation.trendDirection === 'converging' ? '↘ Converging toward target' :
+                                                                               optimalTDDRecommendation.trendDirection === 'diverging' ? '↗ Diverging from target' :
+                                                                               '→ Stable pattern'}
+                                                                    </p>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                        
+                                                        {/* Refresh Button */}
+                                                        <div className="mt-3 text-center">
+                                                            <button
+                                                                onClick={fetchTrendData}
+                                                                disabled={trendLoading}
+                                                                className="text-sm text-gray-500 hover:text-gray-700"
+                                                            >
+                                                                🔄 Refresh trend data
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
                                     </div>
                                 )}
                             </>
