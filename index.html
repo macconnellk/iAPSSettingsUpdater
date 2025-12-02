@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>iAPS Parameter Optimizer - v25 Signal Logging</title>
+    <title>iAPS Parameter Optimizer - v26 Signal Logging</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -388,7 +388,7 @@
              * @param {Set} protectedHours - Set of hour strings (e.g., "00:00") that cannot receive increases
              * @returns {Object} Distribution results
              */
-            function distributeIncrements(hourlySchedule, recommendations, targetTotal, protectedHours = new Set()) {
+            function distributeIncrements(hourlySchedule, recommendations, targetTotal, protectedHours = new Set(), ratioCap = 2.0) {
                 const schedule = [...hourlySchedule]; // Copy
                 const currentTotal = schedule.reduce((sum, r) => sum + r, 0);
                 const difference = targetTotal - currentTotal;
@@ -407,11 +407,27 @@
                 const isDecrease = incrementsNeeded < 0;
                 const isIncrease = !isDecrease;
                 
+                // Helper to get current min/max/ratio
+                const getMinMax = (sched) => {
+                    const min = Math.min(...sched);
+                    const max = Math.max(...sched);
+                    return { min, max, ratio: max / min };
+                };
+                
+                // Helper to check if an adjustment would violate ratio cap
+                const wouldViolateRatioCap = (sched, hourIdx, newValue) => {
+                    const testSchedule = sched.map((v, i) => i === hourIdx ? newValue : v);
+                    const { ratio } = getMinMax(testSchedule);
+                    return ratio > ratioCap;
+                };
+                
                 // Log protection status
                 if (protectedHours.size > 0 && isIncrease) {
                     console.log(`    Signal Distribution: Protecting ${protectedHours.size} safety hours from increases`);
                     console.log(`    Protected hours: ${Array.from(protectedHours).sort().join(', ')}`);
                 }
+                
+                console.log(`    Signal Distribution: Ratio cap ${ratioCap}:1 active`);
                 
                 // Build period info with signal direction
                 const periodInfo = recommendations.map(rec => ({
@@ -477,10 +493,19 @@
                 let remaining = Math.abs(incrementsNeeded);
                 const delta = isDecrease ? -PUMP_INCREMENT : PUMP_INCREMENT;
                 const appliedHours = [];
+                let ratioCapLimited = false;
                 
                 for (const hour of spreadOrder) {
                     if (remaining <= 0) break;
                     const newRate = schedule[hour] + delta;
+                    
+                    // Check ratio cap constraint
+                    if (wouldViolateRatioCap(schedule, hour, roundToIncrement(newRate))) {
+                        console.log(`    Ratio cap: Skipping hour ${hour} (would violate ${ratioCap}:1 ratio)`);
+                        ratioCapLimited = true;
+                        continue;
+                    }
+                    
                     if (newRate >= PUMP_INCREMENT) {
                         schedule[hour] = roundToIncrement(newRate);
                         remaining--;
@@ -494,6 +519,11 @@
                     }
                 }
                 
+                // Log if ratio cap limited adjustments
+                if (ratioCapLimited && remaining > 0) {
+                    console.log(`    ⚠️ Ratio cap limited signal distribution: ${remaining} increments not applied to maintain ${ratioCap}:1 max ratio`);
+                }
+                
                 return {
                     schedule,
                     incrementsNeeded,
@@ -501,7 +531,8 @@
                     direction: isDecrease ? 'decrease' : 'increase',
                     matchingPeriods: matching.map(p => p.period.name),
                     nonMatchingPeriods: nonMatching.map(p => p.period.name),
-                    finalTotal: schedule.reduce((sum, r) => sum + r, 0)
+                    finalTotal: schedule.reduce((sum, r) => sum + r, 0),
+                    ratioCapLimited
                 };
             }
             
@@ -534,7 +565,8 @@
                     dampingFactor = 0.4,
                     minSampleSize = 10,
                     analysisWindowDays = 7,
-                    protectedHours = new Set()
+                    protectedHours = new Set(),
+                    ratioCap = 2.0
                 } = options;
                 
                 // Extract schedules from profile
@@ -585,8 +617,8 @@
                 const signalOnlyTotal = signalHourlySchedule.reduce((sum, r) => sum + r, 0);
                 const signalOnlyAnchor = (signalOnlyTotal / tdd) * 100;
                 
-                // Step 5: Distribute increments to hit target (with safety hour protection)
-                const distribution = distributeIncrements(signalHourlySchedule, recommendations, targetTotal, protectedHours);
+                // Step 5: Distribute increments to hit target (with safety hour protection and ratio cap)
+                const distribution = distributeIncrements(signalHourlySchedule, recommendations, targetTotal, protectedHours, ratioCap);
                 
                 const finalTotal = distribution.finalTotal;
                 const finalAnchor = (finalTotal / tdd) * 100;
@@ -697,6 +729,7 @@
             const [analysisWindow, setAnalysisWindow] = useState(1);
             const [basalSignalWindow, setBasalSignalWindow] = useState(7);
             const [basalTDDPercent, setBasalTDDPercent] = useState(35);
+            const [basalRatioCap, setBasalRatioCap] = useState(2.0); // Max ratio between highest/lowest basal rates
             
             // Google Sheets Logging State
             const [sheetsWebAppUrl, setSheetsWebAppUrl] = useState(() => {
@@ -1406,6 +1439,20 @@
                 });
             };
             
+            // Format time with date for display (e.g., "7:31 AM on 12/1")
+            const formatDateTimeForDisplay = (timeStr) => {
+                if (!timeStr) return '';
+                const dt = new Date(timeStr);
+                const time = dt.toLocaleTimeString('en-US', { 
+                    hour: 'numeric', 
+                    minute: '2-digit',
+                    hour12: true 
+                });
+                const month = dt.getMonth() + 1;
+                const day = dt.getDate();
+                return `${time} on ${month}/${day}`;
+            };
+            
             // Find which CR schedule entry applies to a given time
             const getCRForTime = (timeStr, crSchedule) => {
                 const dt = new Date(timeStr);
@@ -1806,7 +1853,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${formatTimeForDisplay(relevantMeal.localDateTime)} (${relevantMeal.carbs}g)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}\n\nBG stayed < 180 between meal and low.`,
+                        details: `Meal at ${formatDateTimeForDisplay(relevantMeal.localDateTime)} (${relevantMeal.carbs}g)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}\n\nBG stayed < 180 between meal and low.`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'HIGH',
                         events: [relevantMeal, low],
@@ -2000,7 +2047,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${formatTimeForDisplay(bestMatch.meal.created_at)} (${bestMatch.meal.carbs}g)\n ->  Brief high ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)} (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later)\n\nPeak-to-crash pattern indicates excessive insulin.`,
+                        details: `Meal at ${formatDateTimeForDisplay(bestMatch.meal.created_at)} (${bestMatch.meal.carbs}g)\n ->  Brief high ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)} (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later)\n\nPeak-to-crash pattern indicates excessive insulin.`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'HIGH',
                         events: [bestMatch.meal, bestMatch.firstHigh, bestMatch.lastHigh, low],
@@ -2137,7 +2184,7 @@
                     
                     let reason = 'Corrections too aggressive for high (ISF too strong)';
                     let confidence = { level: 'Medium', score: 70 };
-                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n ->  ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`;
+                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatDateTimeForDisplay(lastHighReading.dateString)}\n ->  ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`;
                     
                     if (hasStacking) {
                         reason += ' - possible insulin stacking with meal';
@@ -2445,7 +2492,7 @@
              * Pattern: Meal -> High >180 -> Corrections (with or without subsequent low)
              * Conclusion: CR too weak (not enough upfront insulin)
              */
-            const detectPostMealHighsWithCorrections = (lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds) => {
+            const detectPostMealHighsWithCorrections = (lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds, analysisStartDateTime) => {
                 console.log('=== DETECTOR 3: Post-Meal Highs with Corrections ===');
                 const recommendations = [];
                 
@@ -2616,7 +2663,7 @@
                                 adjustment: 'None',
                                 reason: 'High is physiological rebound from severe hypoglycemia, not weak CR',
                                 calculation: 'N/A',
-                                details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'}  ->  Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)}  ->  Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
+                                details: `Meal at ${formatDateTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'}  ->  Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)}  ->  Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
                                 confidence: { level: 'High', score: 95 },
                                 priority: 'INFORMATIONAL',
                                 events: [relevantMeal, lowestReading, ...highReadings],
@@ -2655,7 +2702,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `-${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 - adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n ->  ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`,
+                        details: `Meal at ${formatDateTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)}\n ->  ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U)\n ->  Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}`,
                         confidence: { level: 'High', score: 90 },
                         priority: 'MEDIUM',
                         events: [relevantMeal, earliestHighReading, ...recentCorrections, low],
@@ -2670,9 +2717,16 @@
                 
                 // PASS 2: NEW - Meal -> High -> Corrections (NO low required)
                 // Look through all unclaimed meals that caused highs requiring corrections
-                const meals = nightscoutData.treatments.filter(t => 
-                    t.localDateTime && t.carbs && t.carbs > 0 && !claimedEvents.meals.has(getEventId(t))
-                );
+                const meals = nightscoutData.treatments.filter(t => {
+                    if (!t.localDateTime || !t.carbs || t.carbs <= 0) return false;
+                    if (claimedEvents.meals.has(getEventId(t))) return false;
+                    
+                    // Filter to analysis window (fixes bug where old meals were analyzed)
+                    const mealTime = new Date(t.created_at);
+                    if (analysisStartDateTime && mealTime < analysisStartDateTime) return false;
+                    
+                    return true;
+                });
                 
                 meals.forEach(meal => {
                     console.log(`\nPass 2: Checking meal ${meal.localDateTime} (${meal.carbs}g)`);
@@ -2795,7 +2849,7 @@
                                 adjustment: 'None',
                                 reason: 'High is physiological rebound from severe hypoglycemia, not weak CR',
                                 calculation: 'N/A',
-                                details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'}  ->  Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)}  ->  Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
+                                details: `Meal at ${formatDateTimeForDisplay(meal.created_at)} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'}  ->  Severe low ${lowestReading.sgv} mg/dL at ${formatTimeForDisplay(lowestReading.dateString)}  ->  Rebound spike to ${peakBG} mg/dL.\n\nPattern indicates need for:\n1. Better meal timing (avoid eating during lows)\n2. Adequate low treatment (~15g fast carbs)\n3. Monitor for rebounds after severe lows\n\nThis high is NOT due to weak CR - it's a physiological response to severe hypoglycemia.`,
                                 confidence: { level: 'High', score: 95 },
                                 priority: 'INFORMATIONAL',
                                 events: [meal, lowestReading, ...highReadings],
@@ -2822,11 +2876,11 @@
                     let details, confidence, reason;
                     if (allCorrections.length > 0) {
                         const totalCorrectionInsulin = allCorrections.reduce((sum, c) => sum + c.insulin, 0);
-                        details = `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n ->  ${allCorrections.length} correction${allCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) given\n\nHigh requiring corrections indicates insufficient upfront insulin.`;
+                        details = `Meal at ${formatDateTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n ->  ${allCorrections.length} correction${allCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) given\n\nHigh requiring corrections indicates insufficient upfront insulin.`;
                         confidence = { level: 'High', score: 85 };
                         reason = 'Meal caused high requiring corrections (CR too weak)';
                     } else {
-                        details = `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n\nHigh indicates insufficient upfront insulin.`;
+                        details = `Meal at ${formatDateTimeForDisplay(meal.created_at)} (${meal.carbs}g)\n ->  High ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}\n\nHigh indicates insufficient upfront insulin.`;
                         confidence = { level: 'Medium', score: 70 };
                         reason = 'Meal caused high (CR too weak)';
                     }
@@ -2895,7 +2949,8 @@
             // Distribute basal adjustment across 24 hours using discrete increments
             // Strategy: First exhaust highest-rate hours, then distribute remainder across 4-hour blocks
             // protectedHours: Set of hour strings (e.g., "00:00") that should NOT receive increases (safety hours)
-            const distributeBasalAdjustment = (currentSchedule, targetTotalDaily, protectedHours = new Set()) => {
+            // ratioCap: Maximum allowed ratio between highest and lowest rates (e.g., 2.0 means max can't exceed 2x min)
+            const distributeBasalAdjustment = (currentSchedule, targetTotalDaily, protectedHours = new Set(), ratioCap = 2.0) => {
                 const PUMP_INCREMENT = 0.05;
                 const currentTotal = currentSchedule.reduce((sum, entry) => sum + entry.value, 0);
                 const difference = targetTotalDaily - currentTotal;
@@ -2905,11 +2960,28 @@
                 
                 const isIncrease = incrementsNeeded > 0;
                 
+                // Helper to get current min/max/ratio
+                const getMinMax = (sched) => {
+                    const values = sched.map(e => e.value);
+                    const min = Math.min(...values);
+                    const max = Math.max(...values);
+                    return { min, max, ratio: max / min };
+                };
+                
+                // Helper to check if an adjustment would violate ratio cap
+                const wouldViolateRatioCap = (schedule, hourIdx, newValue) => {
+                    const testSchedule = schedule.map((e, i) => i === hourIdx ? { ...e, value: newValue } : e);
+                    const { ratio } = getMinMax(testSchedule);
+                    return ratio > ratioCap;
+                };
+                
                 // Log protection status
                 if (protectedHours.size > 0 && isIncrease) {
                     console.log(`    TDD Distribution: Protecting ${protectedHours.size} safety hours from increases`);
                     console.log(`    Protected hours: ${Array.from(protectedHours).sort().join(', ')}`);
                 }
+                
+                console.log(`    TDD Distribution: Ratio cap ${ratioCap}:1 active`);
                 
                 if (incrementsNeeded === 0) {
                     return currentSchedule.map((entry, idx) => ({
@@ -2970,11 +3042,19 @@
                 });
                 
                 // Apply increments to outliers first (one per outlier hour)
+                let ratioCapLimited = false;
                 for (const outlier of outlierHours) {
                     if (incrementsRemaining <= 0) break;
                     
                     const entry = result[outlier.hour];
                     const newValue = entry.value + incrementValue;
+                    
+                    // Check ratio cap constraint
+                    if (wouldViolateRatioCap(result, outlier.hour, roundToPumpIncrement(newValue))) {
+                        console.log(`    Ratio cap: Skipping ${outlier.time} (would violate ${ratioCap}:1 ratio)`);
+                        ratioCapLimited = true;
+                        continue;
+                    }
                     
                     if (newValue >= PUMP_INCREMENT) {
                         entry.value = roundToPumpIncrement(newValue);
@@ -3052,6 +3132,15 @@
                         const targetHour = result[availableHourIndices[0]];
                         const newValue = targetHour.value + incrementValue;
                         
+                        // Check ratio cap constraint
+                        if (wouldViolateRatioCap(result, targetHour.hour, roundToPumpIncrement(newValue))) {
+                            console.log(`    Ratio cap: Skipping ${targetHour.time} in Phase 2 (would violate ${ratioCap}:1 ratio)`);
+                            ratioCapLimited = true;
+                            adjustedHours.add(targetHour.hour); // Mark as processed so we try next hour
+                            blockIdx++;
+                            continue;
+                        }
+                        
                         if (newValue >= PUMP_INCREMENT) {
                             result[targetHour.hour].value = roundToPumpIncrement(newValue);
                             adjustedHours.add(targetHour.hour);
@@ -3060,8 +3149,13 @@
                         
                         blockIdx++;
                         // Safety: prevent infinite loop
-                        if (blockIdx > absIncrements + 24) break;
+                        if (blockIdx > absIncrements + 48) break;
                     }
+                }
+                
+                // Log if ratio cap limited adjustments
+                if (ratioCapLimited && incrementsRemaining > 0) {
+                    console.log(`    ⚠️ Ratio cap limited distribution: ${incrementsRemaining} increments not applied to maintain ${ratioCap}:1 max ratio`);
                 }
                 
                 // Clean up and return
@@ -3071,17 +3165,193 @@
                 });
             };
 
+            /**
+             * Normalize basal schedule to conform to ratio cap
+             * Performs TDD-neutral redistribution: decrease high hours, increase low hours
+             * Returns: { normalized: boolean, schedule: [], iterations: number, notice: string|null }
+             */
+            const normalizeBasalRatio = (basalSchedule, ratioCap = 2.0) => {
+                const PUMP_INCREMENT = 0.05;
+                const MAX_ITERATIONS = 100; // Safety limit
+                
+                // Helper to round to pump increment
+                const roundToIncrement = (value) => Math.round(value / PUMP_INCREMENT) * PUMP_INCREMENT;
+                
+                // Create working copy with hour indices
+                let schedule = basalSchedule.map((entry, idx) => ({
+                    ...entry,
+                    value: entry.value,
+                    time: entry.time || `${idx.toString().padStart(2, '0')}:00`,
+                    hour: idx
+                }));
+                
+                const getMinMax = (sched) => {
+                    const values = sched.map(e => e.value);
+                    return {
+                        min: Math.min(...values),
+                        max: Math.max(...values),
+                        ratio: Math.max(...values) / Math.min(...values)
+                    };
+                };
+                
+                const initial = getMinMax(schedule);
+                console.log(`  Ratio Check: min=${initial.min.toFixed(2)}, max=${initial.max.toFixed(2)}, ratio=${initial.ratio.toFixed(2)}:1, cap=${ratioCap}:1`);
+                
+                // Already compliant
+                if (initial.ratio <= ratioCap) {
+                    console.log(`  -> Ratio ${initial.ratio.toFixed(2)}:1 is within ${ratioCap}:1 cap`);
+                    return {
+                        normalized: false,
+                        schedule: schedule.map(({ hour, ...rest }) => rest),
+                        iterations: 0,
+                        notice: null,
+                        initialRatio: initial.ratio,
+                        finalRatio: initial.ratio
+                    };
+                }
+                
+                console.log(`  -> Ratio ${initial.ratio.toFixed(2)}:1 EXCEEDS ${ratioCap}:1 cap - normalizing...`);
+                
+                let iterations = 0;
+                let current = getMinMax(schedule);
+                
+                while (current.ratio > ratioCap && iterations < MAX_ITERATIONS) {
+                    // Find hours at max and min values
+                    const maxHours = schedule.filter(e => Math.abs(e.value - current.max) < 0.001);
+                    const minHours = schedule.filter(e => Math.abs(e.value - current.min) < 0.001);
+                    
+                    if (maxHours.length === 0 || minHours.length === 0) break;
+                    
+                    // Decrease one max hour, increase one min hour (TDD-neutral)
+                    const targetMax = maxHours[0];
+                    const targetMin = minHours[0];
+                    
+                    // Check if this would help (don't make moves that don't improve ratio)
+                    const newMaxVal = roundToIncrement(targetMax.value - PUMP_INCREMENT);
+                    const newMinVal = roundToIncrement(targetMin.value + PUMP_INCREMENT);
+                    
+                    // Ensure we don't go below pump increment
+                    if (newMaxVal < PUMP_INCREMENT) break;
+                    
+                    // Apply the change
+                    schedule[targetMax.hour].value = newMaxVal;
+                    schedule[targetMin.hour].value = newMinVal;
+                    
+                    iterations++;
+                    current = getMinMax(schedule);
+                    
+                    console.log(`    Iteration ${iterations}: ${targetMax.time} ${targetMax.value.toFixed(2)}->${newMaxVal.toFixed(2)}, ${targetMin.time} ${targetMin.value.toFixed(2)}->${newMinVal.toFixed(2)} -> ratio ${current.ratio.toFixed(2)}:1`);
+                }
+                
+                const final = getMinMax(schedule);
+                console.log(`  -> Normalization complete: ${iterations} iterations, ratio ${initial.ratio.toFixed(2)}:1 -> ${final.ratio.toFixed(2)}:1`);
+                
+                // Build informative notice
+                const notice = `Basal ratio was ${initial.ratio.toFixed(1)}:1 (${initial.max.toFixed(2)} max / ${initial.min.toFixed(2)} min), ` +
+                    `which exceeds the ${ratioCap}:1 guideline. ` +
+                    `Normalized to ${final.ratio.toFixed(1)}:1 via TDD-neutral redistribution ` +
+                    `(${iterations} adjustments). ` +
+                    `Extreme ratios can mask CR/ISF issues - normalizing basal first ensures reliable meal-time analysis.`;
+                
+                return {
+                    normalized: true,
+                    schedule: schedule.map(({ hour, ...rest }) => rest),
+                    iterations: iterations,
+                    notice: notice,
+                    initialRatio: initial.ratio,
+                    finalRatio: final.ratio,
+                    hoursDecreased: schedule.filter((e, i) => e.value < basalSchedule[i].value).map(e => e.time),
+                    hoursIncreased: schedule.filter((e, i) => e.value > basalSchedule[i].value).map(e => e.time)
+                };
+            };
+
 
             /**
              * DETECTOR 4: Unified Basal Optimization
              * Combines IOB-based safety reductions with 35% TDD optimization into ONE recommendation
-             * Flow: Original  ->  Safety Adjusted  ->  TDD Optimized  ->  Final
+             * Flow: Ratio Normalization -> Original -> Safety Adjusted -> TDD Optimized -> Final
              */
-            const detectBasalOptimization = (nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents, basalTDDPercent = 35, basalSignalWindow = 7) => {
+            const detectBasalOptimization = (nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents, basalTDDPercent = 35, basalSignalWindow = 7, basalRatioCap = 2.0) => {
                 console.log('=== DETECTOR 4: Unified Basal Optimization ===');
                 console.log(`  Basal TDD Target: ${basalTDDPercent}%`);
+                console.log(`  Basal Ratio Cap: ${basalRatioCap}:1`);
                 const recommendations = [];
                 const PUMP_INCREMENT = 0.05; // U/hr - minimum pump adjustment
+                
+                // ============================================================
+                // STEP 0: Check and Normalize Basal Ratio (if needed)
+                // ============================================================
+                console.log('\n  Step 0: Basal Ratio Check');
+                const ratioResult = normalizeBasalRatio(basalSchedule, basalRatioCap);
+                
+                // Use normalized schedule for subsequent analysis if normalization occurred
+                const workingSchedule = ratioResult.normalized ? ratioResult.schedule : basalSchedule;
+                
+                // Generate ratio normalization recommendation if needed
+                if (ratioResult.normalized) {
+                    // Build hourly display data showing changes
+                    const hourlyDisplayData = [];
+                    for (let h = 0; h < 24; h++) {
+                        const hourStr = `${h.toString().padStart(2, '0')}:00`;
+                        const oldVal = basalSchedule[h]?.value || 0;
+                        const newVal = ratioResult.schedule[h]?.value || oldVal;
+                        const hasChange = Math.abs(oldVal - newVal) > 0.001;
+                        
+                        hourlyDisplayData.push({
+                            hour: hourStr,
+                            oldValue: oldVal.toFixed(2),
+                            newValue: newVal.toFixed(2),
+                            hasChange: hasChange
+                        });
+                    }
+                    
+                    const originalTDD = basalSchedule.reduce((sum, e) => sum + e.value, 0);
+                    const normalizedTDD = ratioResult.schedule.reduce((sum, e) => sum + e.value, 0);
+                    
+                    recommendations.push({
+                        detector: 'Basal Ratio Normalization',
+                        type: 'Basal Ratio Normalization',
+                        reason: `Basal ratio ${ratioResult.initialRatio.toFixed(1)}:1 exceeds ${basalRatioCap}:1 guideline`,
+                        scheduleTime: 'ALL',
+                        currentValue: ratioResult.initialRatio.toFixed(1) + ':1',
+                        newValue: ratioResult.finalRatio.toFixed(1) + ':1',
+                        adjustment: 'TDD-neutral redistribution',
+                        calculation: `${ratioResult.iterations} paired adjustments (decrease high hours, increase low hours)`,
+                        details: `${ratioResult.notice}\n\nHours decreased: ${ratioResult.hoursDecreased.join(', ') || 'none'}\nHours increased: ${ratioResult.hoursIncreased.join(', ') || 'none'}\n\nTotal daily basal: ${originalTDD.toFixed(2)} U → ${normalizedTDD.toFixed(2)} U (unchanged)`,
+                        confidence: { level: 'High', score: 95 },
+                        priority: 'HIGH',
+                        events: [],
+                        safetyNote: 'Normalize basal ratio before adjusting CR/ISF. Extreme ratios can mask other parameter issues.',
+                        hourlyDisplayData: hourlyDisplayData,
+                        isRatioNormalization: true
+                    });
+                    
+                    // EARLY RETURN: When normalization is needed, return only that recommendation
+                    // User should apply normalization first, then run analysis again for TDD optimization
+                    console.log(`  -> Returning early with ratio normalization recommendation only`);
+                    console.log(`     Fix ratio first, then re-run for TDD optimization`);
+                    
+                    const ratioInfo = {
+                        initialRatio: ratioResult.initialRatio,
+                        finalRatio: ratioResult.finalRatio,
+                        wasNormalized: true,
+                        exceedsThreshold: true,
+                        ratioCap: basalRatioCap
+                    };
+                    
+                    console.log(`\nDetector 4 complete: ${recommendations.length} recommendation(s) (ratio normalization only)`);
+                    return { recommendations, ratioInfo };
+                }
+                
+                // Store ratio info for CR/ISF confidence penalty (will be returned with recommendations)
+                // Only reaches here if ratio was already compliant
+                const ratioInfo = {
+                    initialRatio: ratioResult.initialRatio,
+                    finalRatio: ratioResult.finalRatio,
+                    wasNormalized: false,
+                    exceedsThreshold: ratioResult.initialRatio > basalRatioCap, // Exceeds cap at all
+                    ratioCap: basalRatioCap
+                };
                 
                 // Helper to round to pump increment
                 const roundToPumpIncrement = (value) => {
@@ -3134,7 +3404,7 @@
                     
                     if (iapsTwoWeekTDD) return { tdd: iapsTwoWeekTDD, source: 'iAPS 2-week average', warning: null };
                     if (iapsTDD) return { tdd: iapsTDD, source: 'iAPS current', warning: 'Using iAPS current TDD (2-week average not found)' };
-                    if (calculatedTDD > 0) return { tdd: calculatedTDD, source: `calculated ${analysisWindowDays}-day average`, warning: 'âš ï¸ iAPS TDD not found. Using calculated average.' };
+                    if (calculatedTDD > 0) return { tdd: calculatedTDD, source: `calculated ${analysisWindowDays}-day average`, warning: 'âš ï¸ iAPS TDD not found. Using calculated average.' };
                     return null;
                 };
                 
@@ -3337,7 +3607,7 @@
                     }
                     
                     console.log(`\nDetector 4 complete: ${recommendations.length} recommendation(s)`);
-                    return recommendations;
+                    return { recommendations, ratioInfo };
                 }
                 
                 const tdd = tddResult.tdd;
@@ -3372,7 +3642,8 @@
                     dampingFactor: 0.4,
                     minSampleSize: 10,
                     analysisWindowDays: basalSignalWindow,  // Use basal-specific window
-                    protectedHours: safetyHoursSet
+                    protectedHours: safetyHoursSet,
+                    ratioCap: basalRatioCap
                 });
                 
                 console.log('  Signal Analysis Results:');
@@ -3480,7 +3751,7 @@
                 
                 console.log(`  Created: ${originalTotal.toFixed(2)}U  ->  ${finalTotal.toFixed(2)}U`);
                 console.log(`\nDetector 4 complete: ${recommendations.length} recommendation(s)`);
-                return recommendations;
+                return { recommendations, ratioInfo };
             };
 
 
@@ -3552,7 +3823,7 @@
                         newValue: parseFloat(newCR.toFixed(1)),
                         adjustment: `+${adjustmentPercent}%`,
                         calculation: `${crEntry.value} x ${(1 + adjustmentPercent / 100).toFixed(2)} = ${newCR.toFixed(1)}`,
-                        details: `Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}, possible meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g)`,
+                        details: `Low ${low.bg} mg/dL at ${formatDateTimeForDisplay(low.time)}, possible meal at ${formatDateTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g)`,
                         confidence: { level: 'Medium', score: 60 },
                         priority: 'LOW',
                         events: [low, relevantMeal]
@@ -3567,7 +3838,7 @@
 
             // ===== SECTION 3: ORCHESTRATION =====
             
-            const runAllDetectors = (nightscoutData, crSchedule, isfSchedule, basalSchedule, analysisStartDateTime, analysisWindow, basalTDDPercent = 35, basalSignalWindow = 7) => {
+            const runAllDetectors = (nightscoutData, crSchedule, isfSchedule, basalSchedule, analysisStartDateTime, analysisWindow, basalTDDPercent = 35, basalSignalWindow = 7, basalRatioCap = 2.0) => {
                 console.log('\n========== RUNNING MULTI-DETECTOR ANALYSIS ==========\n');
                 
                 // Initialize event claiming system
@@ -3630,15 +3901,18 @@
                 
                 // Detector 3: Post-Meal Highs with Corrections (Priority 3 - CR weakness)
                 const detector3Results = detectPostMealHighsWithCorrections(
-                    lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds
+                    lowProblems, nightscoutData, crSchedule, claimedEvents, processedLowIds, analysisStartDateTime
                 );
                 allRecommendations.push(...detector3Results);
                 
                 // Detector 4: Two-Stage Basal Optimization (Priority 4)
-                const detector4Results = detectBasalOptimization(
-                    nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents, basalTDDPercent, basalSignalWindow
+                const detector4Result = detectBasalOptimization(
+                    nightscoutData, basalSchedule, analysisStartDateTime, analysisWindow, claimedEvents, basalTDDPercent, basalSignalWindow, basalRatioCap
                 );
-                allRecommendations.push(...detector4Results);
+                allRecommendations.push(...detector4Result.recommendations);
+                
+                // Store ratio info for confidence penalty
+                const ratioInfo = detector4Result.ratioInfo;
                 
                 // Detector 5: Regular Lows (Priority 5 - Catch-all)
                 const detector5Results = detectRegularLows(
@@ -3652,6 +3926,35 @@
                 );
                 allRecommendations.push(...scheduleBoundaryResults);
                 
+                // ============================================================
+                // APPLY CONFIDENCE PENALTY for CR/ISF when basal ratio is extreme
+                // ============================================================
+                if (ratioInfo && ratioInfo.exceedsThreshold) {
+                    const penaltyPercent = 20;
+                    console.log(`\n  Applying ${penaltyPercent}% confidence penalty to CR/ISF recommendations (basal ratio ${ratioInfo.initialRatio.toFixed(1)}:1 > ${(ratioInfo.ratioCap * 1.25).toFixed(1)}:1 threshold)`);
+                    
+                    allRecommendations.forEach(rec => {
+                        // Only penalize CR and ISF recommendations, not basal or informational
+                        if (rec.type && (rec.type.includes('CR') || rec.type.includes('ISF'))) {
+                            const originalScore = rec.confidence.score;
+                            const penalizedScore = Math.max(10, originalScore - penaltyPercent);
+                            rec.confidence.score = penalizedScore;
+                            rec.confidence.penalized = true;
+                            rec.confidence.originalScore = originalScore;
+                            rec.confidence.penaltyReason = `Basal ratio ${ratioInfo.initialRatio.toFixed(1)}:1 exceeds threshold`;
+                            
+                            // Downgrade confidence level if score drops below thresholds
+                            if (penalizedScore < 40 && rec.confidence.level === 'Medium') {
+                                rec.confidence.level = 'Low';
+                            } else if (penalizedScore < 70 && rec.confidence.level === 'High') {
+                                rec.confidence.level = 'Medium';
+                            }
+                            
+                            console.log(`    ${rec.type} at ${rec.scheduleTime}: ${originalScore}% -> ${penalizedScore}%`);
+                        }
+                    });
+                }
+                
                 console.log('\n========== DETECTION COMPLETE ==========');
                 console.log(`Total recommendations: ${allRecommendations.length}`);
                 console.log(`Claimed lows: ${claimedEvents.lows.size}/${lowProblems.length}`);
@@ -3659,7 +3962,7 @@
                 console.log(`Claimed corrections: ${claimedEvents.corrections.size}`);
                 console.log(`Claimed highs: ${claimedEvents.highs.size}\n`);
                 
-                return allRecommendations;
+                return { recommendations: allRecommendations, ratioInfo };
             };
 
             const aggregateRecommendations = (recommendations) => {
@@ -3881,7 +4184,7 @@
                     console.log('Basal Schedule:', basalSchedule);
                     
                     // Run all detectors
-                    const allRecommendations = runAllDetectors(
+                    const detectorResult = runAllDetectors(
                         data, 
                         crSchedule, 
                         isfSchedule, 
@@ -3889,8 +4192,12 @@
                         analysisStartDateTime, 
                         analysisWindow,
                         basalTDDPercent,
-                        basalSignalWindow
+                        basalSignalWindow,
+                        basalRatioCap
                     );
+                    
+                    const allRecommendations = detectorResult.recommendations;
+                    const ratioInfo = detectorResult.ratioInfo;
                     
                     // Aggregate recommendations
                     const aggregated = aggregateRecommendations(allRecommendations);
@@ -3909,6 +4216,7 @@
                         recommendations: sorted,
                         groupedRecommendations: grouped,
                         conflicts: conflicts,
+                        ratioInfo: ratioInfo,
                         summary: {
                             totalRecommendations: sorted.length,
                             byType: {
@@ -3916,6 +4224,7 @@
                                 crStrengthening: sorted.filter(r => r.type === 'CR Strengthening').length,
                                 isfWeakening: sorted.filter(r => r.type === 'ISF Weakening').length,
                                 isfStrengthening: sorted.filter(r => r.type === 'ISF Strengthening').length,
+                                basalRatioNormalization: sorted.filter(r => r.type === 'Basal Ratio Normalization').length,
                                 informational: sorted.filter(r => r.type === 'Informational').length
                             },
                             byPriority: {
@@ -4213,6 +4522,11 @@
                                 </div>
                                 <div className="flex items-center gap-2 mb-1">
                                     <ConfidenceBadge score={rec.confidence.score} />
+                                    {rec.confidence.penalized && (
+                                        <span className="px-2 py-1 rounded text-xs font-medium bg-amber-100 text-amber-800 border border-amber-300" title={rec.confidence.penaltyReason}>
+                                            ⚠️ -{rec.confidence.originalScore - rec.confidence.score}% (basal ratio)
+                                        </span>
+                                    )}
                                     <span className={`px-2 py-1 rounded text-xs font-bold ${
                                         rec.priority === 'HIGH' ? 'bg-red-100 text-red-800 border border-red-300' :
                                         rec.priority === 'MEDIUM' ? 'bg-yellow-100 text-yellow-800 border border-yellow-300' :
@@ -4294,7 +4608,7 @@
                                     iAPS Parameter Optimizer
                                 </h1>
                                 <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm font-semibold">
-                                    v25 Signal Logging
+                                    v26 Signal Logging
                                 </span>
                             </div>
                             <p className="text-gray-600">
@@ -4401,6 +4715,26 @@
                                                 <span>25%</span>
                                                 <span>35% (default)</span>
                                                 <span>45%</span>
+                                            </div>
+                                        </div>
+                                        
+                                        <div className="mt-2">
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                Basal Ratio Cap: {basalRatioCap.toFixed(1)}:1 (max/min)
+                                            </label>
+                                            <input
+                                                type="range"
+                                                min="1.5"
+                                                max="3.0"
+                                                step="0.1"
+                                                value={basalRatioCap}
+                                                onChange={(e) => setBasalRatioCap(Number(e.target.value))}
+                                                className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                                            />
+                                            <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                                <span>1.5:1</span>
+                                                <span>2.0:1 (default)</span>
+                                                <span>3.0:1</span>
                                             </div>
                                         </div>
                                     </div>
@@ -4569,6 +4903,30 @@
                                         </p>
                                     </div>
                                 </div>
+
+                                {/* Warning Banner for Extreme Basal Ratio (Option A) */}
+                                {analysisResults.ratioInfo && analysisResults.ratioInfo.exceedsThreshold && (
+                                    <div className="bg-amber-50 border-2 border-amber-400 rounded-lg p-4 mb-6">
+                                        <div className="flex items-start gap-3">
+                                            <span className="text-2xl">⚠️</span>
+                                            <div>
+                                                <h3 className="font-bold text-amber-800 text-lg mb-1">
+                                                    Basal Ratio Warning
+                                                </h3>
+                                                <p className="text-amber-700 mb-2">
+                                                    Your basal schedule has a <strong>{analysisResults.ratioInfo.initialRatio.toFixed(1)}:1</strong> ratio 
+                                                    between highest and lowest rates, which exceeds the {analysisResults.ratioInfo.ratioCap.toFixed(1)}:1 cap.
+                                                </p>
+                                                <p className="text-amber-700 text-sm">
+                                                    <strong>CR/ISF recommendations below may be compensating for basal issues.</strong> Apply 
+                                                    the Basal Ratio Normalization recommendation first to establish a reliable baseline, 
+                                                    then re-run analysis for TDD optimization. A 20% confidence penalty has been applied to CR/ISF 
+                                                    recommendations to reflect this uncertainty.
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
 
                                 {/* Grouped Recommendations by Parameter Type */}
                                 <div className="space-y-6">
