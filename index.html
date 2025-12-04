@@ -1094,14 +1094,72 @@
                 const dateStr = now.toLocaleDateString('en-US', { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
+                const timeStr = now.toLocaleTimeString('en-US', {
+                    hour: 'numeric', minute: '2-digit', hour12: true
+                });
                 
-                let output = `## iAPS Parameter Optimizer Analysis\n`;
-                output += `**Date:** ${dateStr}\n`;
-                output += `**Analysis Window:** ${analysisWindow} day(s) for CR/ISF, ${basalSignalWindow} days for Basal\n`;
-                output += `**Basal TDD Target:** ${basalTDDPercent}%\n\n`;
+                // Calculate analysis window dates
+                const analysisEndDate = now;
+                const analysisStartDate = new Date(now - analysisWindow * 24 * 60 * 60 * 1000);
+                const formatDateShort = (dt) => `${dt.getMonth() + 1}/${dt.getDate()}/${dt.getFullYear()}`;
+                const analysisWindowStr = `${formatDateShort(analysisStartDate)} ${timeStr} - ${formatDateShort(analysisEndDate)} ${timeStr}`;
+                
+                // Get 2-week TDD from deviceStatus if available
+                let twoWeekTDD = null;
+                if (nightscoutData?.deviceStatus?.length > 0) {
+                    for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
+                        const status = nightscoutData.deviceStatus[i];
+                        if (status.openaps?.enacted?.reason) {
+                            const match = status.openaps.enacted.reason.match(/2week TDD (\d+\.?\d*)/);
+                            if (match) {
+                                twoWeekTDD = parseFloat(match[1]);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Get basal ratio info
+                const basalRatio = analysisResults.ratioInfo?.initialRatio || null;
+                const ratioCap = analysisResults.ratioInfo?.ratioCap || basalRatioCap;
+                
+                // Count lows (estimate from recommendations)
+                const lowCount = analysisResults.recommendations.filter(r => 
+                    r.type === 'CR Weakening' || r.type === 'ISF Weakening'
+                ).length;
+                
+                // Calculate basal total
+                const basalTotal = analysisResults.basalSchedule.reduce((sum, e) => sum + e.value, 0);
+                
+                // =========================================================================
+                // BUILD OUTPUT
+                // =========================================================================
+                
+                let output = `## iAPS Parameter Optimizer Analysis\n\n`;
+                
+                // Enhanced prompt for history comparison
+                output += `> **INSTRUCTIONS FOR CLAUDE:** I share these nightly analyses with you. Please:\n`;
+                output += `> 1. **Start with a "Changes Since Last Night" summary** - What's new, resolved, or changed?\n`;
+                output += `> 2. **Identify RECURRING vs NEW issues** - Flag patterns appearing 3+ nights as HIGH CONFIDENCE\n`;
+                output += `> 3. **Check if prior recommendations were applied** - Compare current values to past suggestions\n`;
+                output += `> 4. **Note parameter trends** - Are values consistently moving in one direction?\n`;
+                output += `> 5. **Prioritize your recommendations** based on safety and pattern persistence\n\n`;
+                
+                output += `---\n## Analysis Metadata\n\n`;
+                output += `| Field | Value |\n`;
+                output += `|-------|-------|\n`;
+                output += `| **Analysis Date/Time** | ${dateStr} at ${timeStr} |\n`;
+                output += `| **CR/ISF Analysis Window** | ${analysisWindowStr} (${analysisWindow} day${analysisWindow > 1 ? 's' : ''}) |\n`;
+                output += `| **Basal Signal Window** | ${basalSignalWindow} days |\n`;
+                output += `| **2-Week TDD** | ${twoWeekTDD ? twoWeekTDD.toFixed(2) + ' U' : 'Not available'} |\n`;
+                output += `| **Basal TDD Target** | ${basalTDDPercent}% |\n`;
+                output += `| **Basal Ratio** | ${basalRatio ? basalRatio.toFixed(1) + ':1' : 'N/A'} (cap: ${ratioCap}:1) |\n`;
+                output += `| **Total Daily Basal** | ${basalTotal.toFixed(2)} U |\n`;
+                output += `| **CR/ISF Issues Detected** | ${lowCount} low-related |\n`;
+                output += `\n`;
                 
                 // Summary
-                output += `---\n## Summary\n`;
+                output += `---\n## Summary\n\n`;
                 output += `- **Total Recommendations:** ${analysisResults.summary.totalRecommendations}\n`;
                 output += `- **High Priority (Safety):** ${analysisResults.summary.byPriority.high}\n`;
                 output += `- **Medium Priority:** ${analysisResults.summary.byPriority.medium}\n`;
@@ -1110,6 +1168,11 @@
                     output += `- **Informational:** ${analysisResults.summary.byPriority.informational}\n`;
                 }
                 output += `\n`;
+                
+                // Ratio Warning (if applicable)
+                if (analysisResults.ratioInfo?.exceedsThreshold) {
+                    output += `> ⚠️ **BASAL RATIO WARNING:** Current ratio ${basalRatio?.toFixed(1)}:1 exceeds ${ratioCap}:1 cap. CR/ISF recommendations have -20% confidence penalty applied. Apply Basal Ratio Normalization first.\n\n`;
+                }
                 
                 // Current Schedules
                 output += `---\n## Current Schedules\n\n`;
@@ -1127,7 +1190,6 @@
                 output += `\n`;
                 
                 output += `### Basal Schedule (U/hr)\n`;
-                const basalTotal = analysisResults.basalSchedule.reduce((sum, e) => sum + e.value, 0);
                 analysisResults.basalSchedule.forEach(entry => {
                     output += `- ${entry.time}: ${entry.value}\n`;
                 });
@@ -1163,9 +1225,14 @@
                         output += `\n`;
                         output += `- **Change:** ${rec.currentValue} -> ${rec.newValue} (${rec.adjustment})\n`;
                         output += `- **Priority:** ${rec.priority}\n`;
-                        output += `- **Certainty:** ${rec.confidence.score}%\n`;
+                        output += `- **Confidence:** ${rec.confidence.score}%`;
+                        if (rec.confidence.penalized) {
+                            output += ` (penalized from ${rec.confidence.originalScore}% due to basal ratio)`;
+                        }
+                        output += `\n`;
                         output += `- **Detector:** ${rec.detector}\n`;
                         output += `- **Reason:** ${rec.reason}\n`;
+                        output += `- **Details:** ${rec.details}\n`;
                         if (rec.safetyNote) {
                             output += `- **Safety Note:** ${rec.safetyNote}\n`;
                         }
@@ -1186,14 +1253,7 @@
                     output += `\n`;
                 }
                 
-                // Request for Claude
-                output += `---\n## Request\n\n`;
-                output += `Please review these iAPS parameter recommendations and provide:\n`;
-                output += `1. Any concerns about the suggested changes\n`;
-                output += `2. Patterns I might be missing\n`;
-                output += `3. Priority order for implementing changes\n`;
-                output += `4. Any additional optimizations to consider\n`;
-                output += `5. Safety considerations I should be aware of\n`;
+                output += `---\n*Analysis generated by iAPS Parameter Optimizer v26*\n`;
                 
                 return output;
             };
@@ -2448,8 +2508,15 @@
                     
                     const newISF = isfEntry.value * (1 - adjustmentPercent / 100);
                     
+                    // Format date range for display
+                    const analysisEndDateTime = new Date();
+                    const formatDateShort = (dt) => `${dt.getMonth() + 1}/${dt.getDate()}`;
+                    const dateRangeStr = formatDateShort(analysisStartDateTime) === formatDateShort(analysisEndDateTime) 
+                        ? formatDateShort(analysisStartDateTime)
+                        : `${formatDateShort(analysisStartDateTime)} - ${formatDateShort(analysisEndDateTime)}`;
+                    
                     // Build details with target callout if >95
-                    let details = `${segment.name} (${segment.label}): BG averaged ${avgBG.toFixed(0)} mg/dL, staying above ${iapsTarget} target ${aboveTargetPercent.toFixed(0)}% of the time despite ${corrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U total).`;
+                    let details = `${segment.name} (${segment.label}) on ${dateRangeStr}: BG averaged ${avgBG.toFixed(0)} mg/dL, staying above ${iapsTarget} target ${aboveTargetPercent.toFixed(0)}% of the time despite ${corrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U total).`;
                     
                     let targetNote = null;
                     if (iapsTarget > 95) {
