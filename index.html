@@ -1135,15 +1135,8 @@
                 // BUILD OUTPUT
                 // =========================================================================
                 
-                let output = `## iAPS Parameter Optimizer Analysis\n\n`;
-                
-                // Enhanced prompt for history comparison
-                output += `> **INSTRUCTIONS FOR CLAUDE:** I share these nightly analyses with you. Please:\n`;
-                output += `> 1. **Start with a "Changes Since Last Night" summary** - What's new, resolved, or changed?\n`;
-                output += `> 2. **Identify RECURRING vs NEW issues** - Flag patterns appearing 3+ nights as HIGH CONFIDENCE\n`;
-                output += `> 3. **Check if prior recommendations were applied** - Compare current values to past suggestions\n`;
-                output += `> 4. **Note parameter trends** - Are values consistently moving in one direction?\n`;
-                output += `> 5. **Prioritize your recommendations** based on safety and pattern persistence\n\n`;
+                let output = `## iAPS Parameter Optimizer - Nightly Analysis\n\n`;
+                output += `*Paste into your iAPS Optimizer Claude Project for review*\n\n`;
                 
                 output += `---\n## Analysis Metadata\n\n`;
                 output += `| Field | Value |\n`;
@@ -1153,7 +1146,7 @@
                 output += `| **Basal Signal Window** | ${basalSignalWindow} days |\n`;
                 output += `| **2-Week TDD** | ${twoWeekTDD ? twoWeekTDD.toFixed(2) + ' U' : 'Not available'} |\n`;
                 output += `| **Basal TDD Target** | ${basalTDDPercent}% |\n`;
-                output += `| **Basal Ratio** | ${basalRatio ? basalRatio.toFixed(1) + ':1' : 'N/A'} (cap: ${ratioCap}:1) |\n`;
+                output += `| **Basal Ratio** | ${basalRatio ? basalRatio.toFixed(1) + ':1' : 'N/A'} (cap: ${ratioCap.toFixed(1)}:1) |\n`;
                 output += `| **Total Daily Basal** | ${basalTotal.toFixed(2)} U |\n`;
                 output += `| **CR/ISF Issues Detected** | ${lowCount} low-related |\n`;
                 output += `\n`;
