@@ -3946,7 +3946,7 @@
                 if (ratioWasConstrained) {
                     // Rebuild hourlyDisplayData with constrained values
                     hourlyDisplayData = finalSchedule.map((entry, idx) => {
-                        const originalRate = getScheduleValueForHour(basalSchedule, idx);
+                        const originalRate = BasalSignalModule.getScheduleValueForHour(basalSchedule, idx);
                         const hour = parseInt(entry.time.split(':')[0]);
                         return {
                             hour: entry.time,
