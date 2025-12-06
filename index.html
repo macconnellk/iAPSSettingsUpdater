@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>iAPS Parameter Optimizer - v26 Signal Logging</title>
+    <title>Daily Insulin Settings Review v1</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -728,8 +728,89 @@
             const [fetchStatus, setFetchStatus] = useState('');
             const [analysisWindow, setAnalysisWindow] = useState(1);
             const [basalSignalWindow, setBasalSignalWindow] = useState(7);
-            const [basalTDDPercent, setBasalTDDPercent] = useState(35);
+            const [basalTDDPercent, setBasalTDDPercent] = useState(38); // Default fallback
             const [basalRatioCap, setBasalRatioCap] = useState(2.0); // Max ratio between highest/lowest basal rates
+            const [profileOverrideActive, setProfileOverrideActive] = useState(false); // Suppress recommendations during profile overrides
+            const [focusMode, setFocusMode] = useState(true); // Single parameter type per cycle - default ON
+            const [basalTargetSource, setBasalTargetSource] = useState('default'); // 'default', 'loading', 'sheet', 'error'
+            const [basalTargetAvg, setBasalTargetAvg] = useState(null); // The calculated 7-day average
+            
+            // Default Google Sheets Web App URL
+            const DEFAULT_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbzFj05CKepvJJx9l-HYTeNkihHKm6vLxb2zJsC0z2X1KFuEeGl-nxgkwYUfzLetgm09/exec';
+            
+            // Fetch 7-day average from Google Apps Script on mount
+            React.useEffect(() => {
+                const fetchBasalTargetFromSheet = async () => {
+                    // Get the stored Apps Script URL or use default
+                    let webAppUrl;
+                    try {
+                        webAppUrl = localStorage.getItem('googleSheetsWebAppUrl') || DEFAULT_SHEETS_URL;
+                    } catch (e) {
+                        webAppUrl = DEFAULT_SHEETS_URL;
+                    }
+                    
+                    setBasalTargetSource('loading');
+                    try {
+                        console.log('Fetching basal target from:', webAppUrl);
+                        const response = await fetch(webAppUrl);
+                        if (!response.ok) throw new Error('Failed to fetch');
+                        
+                        const result = await response.json();
+                        
+                        if (!result.success || !result.entries || result.entries.length === 0) {
+                            console.warn('No entries in sheet');
+                            throw new Error('No data');
+                        }
+                        
+                        console.log(`Fetched ${result.entries.length} entries from Apps Script`);
+                        
+                        // Get last 7 entries with valid Signal % values (excluding override entries)
+                        // The header "Signal %" becomes "signal_Percent" in the Apps Script
+                        const recentEntries = result.entries.slice(-14); // Look back further to find 7 non-override
+                        const validValues = [];
+                        
+                        recentEntries.forEach(entry => {
+                            // Skip entries marked as override
+                            const isOverride = entry.is_override === true || entry.is_override === 'true' || 
+                                              entry.isOverride === true || entry.isOverride === 'true';
+                            if (isOverride) {
+                                console.log('Skipping override entry');
+                                return;
+                            }
+                            
+                            // Try different possible key names for Signal %
+                            const value = parseFloat(entry.signal_Percent || entry.signalPercent || entry['signal_%'] || entry.signal_percent);
+                            if (!isNaN(value) && value >= 20 && value <= 50 && validValues.length < 7) {
+                                validValues.push(value);
+                            }
+                        });
+                        
+                        console.log(`Found ${validValues.length} valid Signal % values:`, validValues);
+                        
+                        if (validValues.length < 1) {
+                            console.warn('No valid Signal % values found');
+                            throw new Error('Insufficient valid data');
+                        }
+                        
+                        const average = validValues.reduce((sum, v) => sum + v, 0) / validValues.length;
+                        const roundedAvg = Math.round(average * 10) / 10; // Round to 1 decimal
+                        const clampedAvg = Math.max(25, Math.min(45, Math.round(roundedAvg))); // Clamp to slider range
+                        
+                        console.log(`7-day average Final %: ${roundedAvg}% (${validValues.length} values), clamped to ${clampedAvg}%`);
+                        
+                        setBasalTDDPercent(clampedAvg);
+                        setBasalTargetAvg(roundedAvg);
+                        setBasalTargetSource('sheet');
+                        
+                    } catch (error) {
+                        console.error('Error fetching basal target from Apps Script:', error);
+                        setBasalTargetSource('error');
+                        // Keep default of 38%
+                    }
+                };
+                
+                fetchBasalTargetFromSheet();
+            }, []);
             
             // Google Sheets Logging State
             const [sheetsWebAppUrl, setSheetsWebAppUrl] = useState(() => {
@@ -750,6 +831,9 @@
             
             // Claude Review State
             const [copyStatus, setCopyStatus] = useState('idle'); // idle, copied
+            
+            // Auto-log state
+            const [autoLogEnabled, setAutoLogEnabled] = useState(true); // Auto-log is ON by default
             
             // Save sheets URL to localStorage when it changes
             const updateSheetsUrl = (url) => {
@@ -782,25 +866,31 @@
             // GOOGLE SHEETS LOGGING FUNCTIONS
             // =========================================================================
             
-            const logToGoogleSheets = async () => {
+            const logToGoogleSheets = async (autoLog = false) => {
                 if (!sheetsWebAppUrl) {
-                    setLogStatus('error');
-                    setLogMessage('Please configure Google Sheets URL first');
+                    if (!autoLog) {
+                        setLogStatus('error');
+                        setLogMessage('Please configure Google Sheets URL first');
+                    }
                     return;
                 }
                 
                 // Find the signal analysis from recommendations
                 const signalRec = analysisResults?.recommendations?.find(r => r.signalAnalysis);
                 if (!signalRec) {
-                    setLogStatus('error');
-                    setLogMessage('No signal analysis data to log');
+                    if (!autoLog) {
+                        setLogStatus('error');
+                        setLogMessage('No signal analysis data to log');
+                    }
                     return;
                 }
                 
                 setLogStatus('logging');
-                setLogMessage('Logging to Google Sheets...');
+                if (!autoLog) {
+                    setLogMessage('Logging to Google Sheets...');
+                }
                 
-                // Build payload
+                // Build payload with date for deduplication
                 const getPeriodDev = (name) => {
                     const period = signalRec.signalAnalysis.periods.find(p => p.name === name);
                     return period?.medianDeviation !== null && period?.medianDeviation !== undefined 
@@ -809,6 +899,7 @@
                 };
                 
                 const payload = {
+                    date: new Date().toLocaleDateString('en-CA'), // YYYY-MM-DD in local time for deduplication
                     timestamp: new Date().toISOString(),
                     analysisWindow: basalSignalWindow,
                     tdd: signalRec.signalTotals?.tdd?.toFixed(1) || '',
@@ -829,7 +920,8 @@
                     sleepOnsetDev: getPeriodDev('Sleep Onset'),
                     incrementsApplied: signalRec.incrementDistribution?.incrementsNeeded || 0,
                     direction: signalRec.incrementDistribution?.direction || 'none',
-                    notes: loggingNotes
+                    isOverride: profileOverrideActive, // Flag for excluding from averages
+                    notes: autoLog ? 'Auto-logged' : loggingNotes
                 };
                 
                 try {
@@ -843,8 +935,10 @@
                     
                     // no-cors means we can't read response, show optimistic success
                     setLogStatus('success');
-                    setLogMessage('Logged successfully!');
-                    setLoggingNotes(''); // Clear notes after logging
+                    setLogMessage(autoLog ? 'Auto-logged for ' + payload.date : 'Logged successfully!');
+                    if (!autoLog) {
+                        setLoggingNotes(''); // Clear notes after manual logging
+                    }
                     
                     // Reset status after 3 seconds
                     setTimeout(() => {
@@ -858,6 +952,32 @@
                     setLogMessage('Failed to log: ' + error.message);
                 }
             };
+            
+            // Auto-log when analysis results change (if signal data exists and not in override)
+            React.useEffect(() => {
+                if (!autoLogEnabled || !analysisResults) return;
+                
+                // Skip auto-logging during profile override (abnormal patterns)
+                if (profileOverrideActive) {
+                    console.log('Auto-log skipped: Profile override active');
+                    return;
+                }
+                
+                // Check if there's signal analysis data to log
+                const signalRec = analysisResults?.recommendations?.find(r => r.signalAnalysis);
+                if (!signalRec) {
+                    console.log('Auto-log skipped: No signal analysis data');
+                    return;
+                }
+                
+                // Small delay to ensure state is stable
+                const timer = setTimeout(() => {
+                    console.log('Auto-logging signal data...');
+                    logToGoogleSheets(true); // true = auto-log mode
+                }, 500);
+                
+                return () => clearTimeout(timer);
+            }, [analysisResults, autoLogEnabled, profileOverrideActive]);
             
             // =========================================================================
             // TREND ANALYSIS FUNCTIONS
@@ -1135,8 +1255,8 @@
                 // BUILD OUTPUT
                 // =========================================================================
                 
-                let output = `## iAPS Parameter Optimizer - Nightly Analysis\n\n`;
-                output += `*Paste into your iAPS Optimizer Claude Project for review*\n\n`;
+                let output = `## Daily Insulin Settings Review - Nightly Analysis\n\n`;
+                output += `*Paste into your Daily Insulin Settings Review Claude Project for review*\n\n`;
                 
                 output += `---\n## Analysis Metadata\n\n`;
                 output += `| Field | Value |\n`;
@@ -1162,9 +1282,51 @@
                 }
                 output += `\n`;
                 
+                // Profile Override Warning (if applicable)
+                if (profileOverrideActive) {
+                    output += `> 🔄 **PROFILE OVERRIDE ACTIVE:** Recommendations are shown for reference only. Do not apply permanent changes during temporary states.\n\n`;
+                }
+                
                 // Ratio Warning (if applicable)
                 if (analysisResults.ratioInfo?.exceedsThreshold) {
-                    output += `> ⚠️ **BASAL RATIO WARNING:** Current ratio ${basalRatio?.toFixed(1)}:1 exceeds ${ratioCap}:1 cap. CR/ISF recommendations have -20% confidence penalty applied. Apply Basal Ratio Normalization first.\n\n`;
+                    const hasSafetyPrimary = analysisResults.focusMode && analysisResults.focusInfo?.primaryTiers?.includes(1);
+                    if (hasSafetyPrimary) {
+                        output += `> ⚠️ **BASAL RATIO WARNING:** Current ratio ${basalRatio?.toFixed(1)}:1 exceeds ${ratioCap.toFixed(1)}:1 cap. CR/ISF recommendations have -20% confidence penalty applied. After addressing tonight's safety items, apply Basal Ratio Normalization to establish a reliable baseline.\n\n`;
+                    } else {
+                        output += `> ⚠️ **BASAL RATIO WARNING:** Current ratio ${basalRatio?.toFixed(1)}:1 exceeds ${ratioCap.toFixed(1)}:1 cap. CR/ISF recommendations have -20% confidence penalty applied. Apply Basal Ratio Normalization first.\n\n`;
+                    }
+                }
+                
+                // Compound Effect Warning (if applicable)
+                if (analysisResults.compoundEffect?.needsWarning && !profileOverrideActive) {
+                    const icon = analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk ? '🚨' : '⚡';
+                    const riskLabel = analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk ? ' (LOW RISK)' : '';
+                    output += `> ${icon} **COMPOUND EFFECT WARNING${riskLabel}:** ${analysisResults.compoundEffect.warningMessage.subtitle}\n`;
+                    analysisResults.compoundEffect.warningMessage.ranges.forEach(range => {
+                        output += `> - ${range}\n`;
+                    });
+                    output += `> ${analysisResults.compoundEffect.warningMessage.advice}\n\n`;
+                }
+                
+                // Focus Mode info (if applicable)
+                if (analysisResults.focusMode && analysisResults.focusInfo) {
+                    const safetyTag = analysisResults.focusInfo.primaryTiers?.includes(1) ? ' [SAFETY]' : '';
+                    output += `> 🎯 **FOCUS MODE${safetyTag}:** Tonight's focus is **${analysisResults.focusInfo.primaryLabel}** (${analysisResults.focusInfo.primaryCount} recommendation${analysisResults.focusInfo.primaryCount > 1 ? 's' : ''}).\n`;
+                    if (analysisResults.focusInfo.referenceCount > 0) {
+                        output += `> ${analysisResults.focusInfo.referenceCount} other recommendation${analysisResults.focusInfo.referenceCount > 1 ? 's' : ''} (${analysisResults.focusInfo.referenceTypes.join(', ')}) shown for reference — wait 3-5 days after applying primary changes.\n`;
+                    }
+                    output += `\n`;
+                }
+                
+                // Signal-Recommendation Conflicts (if any)
+                if (analysisResults.signalConflicts && analysisResults.signalConflicts.hasConflicts) {
+                    output += `> ⚠️ **SIGNAL-RECOMMENDATION CONFLICTS:**\n`;
+                    analysisResults.signalConflicts.conflicts.forEach(conflict => {
+                        const severityIcon = conflict.conflictSeverity === 'high' ? '🔴' : 
+                                            conflict.conflictSeverity === 'medium' ? '🟡' : '🟢';
+                        output += `> - ${severityIcon} ${conflict.message}\n`;
+                    });
+                    output += `> Consider if the signal trend is temporary or if the recommendation addresses a different issue.\n\n`;
                 }
                 
                 // Current Schedules
@@ -1211,7 +1373,10 @@
                     output += `### ${group.title}\n\n`;
                     
                     group.recommendations.forEach((rec, idx) => {
-                        output += `**${idx + 1}. ${rec.type}**`;
+                        // Add focus mode label
+                        const focusLabel = rec.isPrimaryFocus ? ' 🎯 PRIMARY' : (rec.isReferenceFocus ? ' 📋 REFERENCE' : '');
+                        const conflictLabel = rec.hasSignalConflict ? ' ⚠️ SIGNAL CONFLICT' : '';
+                        output += `**${idx + 1}. ${rec.type}**${focusLabel}${conflictLabel}`;
                         if (rec.scheduleTime && rec.scheduleTime !== 'ALL') {
                             output += ` @ ${rec.scheduleTime}`;
                         }
@@ -1223,6 +1388,11 @@
                             output += ` (penalized from ${rec.confidence.originalScore}% due to basal ratio)`;
                         }
                         output += `\n`;
+                        if (rec.hasSignalConflict) {
+                            const severityIcon = rec.signalConflict.conflictSeverity === 'high' ? '🔴' : 
+                                                rec.signalConflict.conflictSeverity === 'medium' ? '🟡' : '🟢';
+                            output += `- **Signal Conflict:** ${severityIcon} ${rec.signalConflict.message}\n`;
+                        }
                         output += `- **Detector:** ${rec.detector}\n`;
                         output += `- **Reason:** ${rec.reason}\n`;
                         output += `- **Details:** ${rec.details}\n`;
@@ -1246,7 +1416,7 @@
                     output += `\n`;
                 }
                 
-                output += `---\n*Analysis generated by iAPS Parameter Optimizer v26*\n`;
+                output += `---\n*Analysis generated by Daily Insulin Settings Review v1*\n`;
                 
                 return output;
             };
@@ -3716,8 +3886,54 @@
                     console.log(`    Applied to: ${signalResult.incrementDistribution.appliedHours.map(a => `${a.hour}:00 (${a.period})`).join(', ')}`);
                 }
                 
-                const finalSchedule = signalResult.finalSchedule;
-                const finalTotal = signalResult.totals.final;
+                let finalSchedule = signalResult.finalSchedule;
+                let finalTotal = signalResult.totals.final;
+                
+                // ============================================================
+                // STEP 3b: Check ratio of optimized schedule and normalize if needed
+                // ============================================================
+                console.log('\n  Step 3b: Post-Optimization Ratio Check');
+                
+                const optimizedValues = finalSchedule.map(e => e.value);
+                const optimizedMin = Math.min(...optimizedValues);
+                const optimizedMax = Math.max(...optimizedValues);
+                const optimizedRatio = optimizedMax / optimizedMin;
+                
+                let ratioWasConstrained = false;
+                let ratioConstraintInfo = null;
+                
+                console.log(`    Optimized schedule: min=${optimizedMin.toFixed(2)}, max=${optimizedMax.toFixed(2)}, ratio=${optimizedRatio.toFixed(2)}:1`);
+                
+                if (optimizedRatio > basalRatioCap) {
+                    console.log(`    -> Ratio ${optimizedRatio.toFixed(2)}:1 EXCEEDS cap ${basalRatioCap}:1 - applying constraint...`);
+                    
+                    // Use the existing normalizeBasalRatio function
+                    const ratioNormResult = normalizeBasalRatio(finalSchedule, basalRatioCap);
+                    
+                    if (ratioNormResult.normalized) {
+                        // Update finalSchedule with normalized version
+                        finalSchedule = ratioNormResult.schedule.map((entry, idx) => ({
+                            time: `${idx.toString().padStart(2, '0')}:00`,
+                            value: entry.value
+                        }));
+                        
+                        // Recalculate total (should be same due to TDD-neutral, but verify)
+                        finalTotal = finalSchedule.reduce((sum, e) => sum + e.value, 0);
+                        
+                        ratioWasConstrained = true;
+                        ratioConstraintInfo = {
+                            originalRatio: optimizedRatio,
+                            constrainedRatio: ratioNormResult.finalRatio,
+                            adjustments: ratioNormResult.iterations,
+                            hoursDecreased: ratioNormResult.hoursDecreased,
+                            hoursIncreased: ratioNormResult.hoursIncreased
+                        };
+                        
+                        console.log(`    -> Ratio constrained: ${optimizedRatio.toFixed(2)}:1 -> ${ratioNormResult.finalRatio.toFixed(2)}:1 (${ratioNormResult.iterations} adjustments)`);
+                    }
+                } else {
+                    console.log(`    -> Ratio ${optimizedRatio.toFixed(2)}:1 is within cap ${basalRatioCap}:1 ✓`);
+                }
                 
                 // ============================================================
                 // STEP 4: Create unified recommendation (Original  ->  Final)
@@ -3725,10 +3941,30 @@
                 console.log('\n  Step 4: Creating Unified Recommendation');
                 
                 // Use signal module's pre-built hourlyDisplayData, add safety flag
-                const hourlyDisplayData = signalResult.hourlyDisplayData.map(h => ({
-                    ...h,
-                    isSafetyChange: safetyHourlyReductions[h.hour] !== undefined
-                }));
+                // If ratio was constrained, rebuild with the constrained values
+                let hourlyDisplayData;
+                if (ratioWasConstrained) {
+                    // Rebuild hourlyDisplayData with constrained values
+                    hourlyDisplayData = finalSchedule.map((entry, idx) => {
+                        const originalRate = getScheduleValueForHour(basalSchedule, idx);
+                        const hour = parseInt(entry.time.split(':')[0]);
+                        return {
+                            hour: entry.time,
+                            oldValue: originalRate.toFixed(3),
+                            newValue: entry.value.toFixed(3),
+                            change: (entry.value - originalRate).toFixed(3),
+                            hasChange: Math.abs(entry.value - originalRate) > 0.001,
+                            isSafetyChange: safetyHourlyReductions[hour] !== undefined,
+                            isRatioConstrained: ratioConstraintInfo.hoursDecreased?.includes(entry.time) || 
+                                               ratioConstraintInfo.hoursIncreased?.includes(entry.time)
+                        };
+                    });
+                } else {
+                    hourlyDisplayData = signalResult.hourlyDisplayData.map((h, idx) => ({
+                        ...h,
+                        isSafetyChange: safetyHourlyReductions[h.hour] !== undefined
+                    }));
+                }
                 
                 const totalChange = finalTotal - originalTotal;
                 const changedHours = hourlyDisplayData.filter(h => h.hasChange).length;
@@ -3765,6 +4001,20 @@
                     detailsText += `${count} x 0.05U ${dir}s applied to ${dir === 'decrease' ? 'negative' : 'positive'}-signal periods first\n`;
                     if (signalResult.incrementDistribution.appliedHours.length > 0) {
                         detailsText += `Hours: ${signalResult.incrementDistribution.appliedHours.map(a => `${a.hour}:00`).join(', ')}\n`;
+                    }
+                    detailsText += '\n';
+                }
+                
+                // Ratio constraint info (if applied)
+                if (ratioWasConstrained && ratioConstraintInfo) {
+                    detailsText += `**Ratio Constraint Applied**\n`;
+                    detailsText += `Signal-optimal schedule had ${ratioConstraintInfo.originalRatio.toFixed(1)}:1 ratio (exceeds ${basalRatioCap.toFixed(1)}:1 cap)\n`;
+                    detailsText += `Redistributed TDD-neutrally to ${ratioConstraintInfo.constrainedRatio.toFixed(1)}:1 (${ratioConstraintInfo.adjustments} adjustments)\n`;
+                    if (ratioConstraintInfo.hoursDecreased?.length > 0) {
+                        detailsText += `Decreased: ${ratioConstraintInfo.hoursDecreased.join(', ')}\n`;
+                    }
+                    if (ratioConstraintInfo.hoursIncreased?.length > 0) {
+                        detailsText += `Increased: ${ratioConstraintInfo.hoursIncreased.join(', ')}\n`;
                     }
                     detailsText += '\n';
                 }
@@ -3806,6 +4056,8 @@
                     incrementDistribution: signalResult.incrementDistribution,
                     signalTotals: signalResult.totals,
                     patternAnalysis: { before: analyzeBasalPattern(basalSchedule), after: analyzeBasalPattern(finalSchedule) },
+                    ratioConstrained: ratioWasConstrained,
+                    ...(ratioConstraintInfo && { ratioConstraintInfo }),
                     ...(safetyNote && { safetyNote })
                 });
                 
@@ -3894,6 +4146,267 @@
                 
                 console.log(`Detector 5 complete: ${recommendations.length} recommendations`);
                 return recommendations;
+            };
+
+            // ===== COMPOUND EFFECT CALCULATION =====
+            
+            /**
+             * Calculate the compound effect of applying multiple recommendations
+             * at overlapping times. Helps users understand total insulin impact.
+             */
+            const calculateCompoundEffect = (recommendations, crSchedule, isfSchedule, basalSchedule) => {
+                // Track hourly insulin change percentages
+                const hourlyEffects = {};
+                for (let h = 0; h < 24; h++) {
+                    hourlyEffects[h] = {
+                        crChange: 0,      // Negative = more insulin (stronger CR)
+                        isfChange: 0,     // Negative = more insulin (stronger ISF)
+                        basalChange: 0,   // Positive = more insulin
+                        sources: []
+                    };
+                }
+                
+                // Helper to get hours affected by a schedule time
+                const getAffectedHours = (scheduleTime, schedule) => {
+                    if (scheduleTime === 'ALL' || !scheduleTime) {
+                        return Array.from({length: 24}, (_, i) => i);
+                    }
+                    
+                    const hour = parseInt(scheduleTime.split(':')[0]);
+                    const sortedTimes = schedule.map(e => parseInt(e.time.split(':')[0])).sort((a, b) => a - b);
+                    const idx = sortedTimes.indexOf(hour);
+                    const nextHour = idx < sortedTimes.length - 1 ? sortedTimes[idx + 1] : 24;
+                    
+                    const hours = [];
+                    for (let h = hour; h < nextHour; h++) {
+                        hours.push(h % 24);
+                    }
+                    return hours;
+                };
+                
+                // Process each recommendation
+                recommendations.forEach(rec => {
+                    if (!rec.adjustment) return;
+                    
+                    // Parse adjustment percentage
+                    const match = rec.adjustment.match(/([+-]?\d+\.?\d*)%/);
+                    if (!match) return;
+                    const pctChange = parseFloat(match[1]);
+                    
+                    let schedule, effectKey;
+                    if (rec.type.includes('CR')) {
+                        schedule = crSchedule;
+                        effectKey = 'crChange';
+                    } else if (rec.type.includes('ISF')) {
+                        schedule = isfSchedule;
+                        effectKey = 'isfChange';
+                    } else if (rec.type.includes('Basal')) {
+                        // Basal is more complex - extract from details
+                        const basalMatch = rec.adjustment.match(/([+-]?\d+\.?\d*)%/);
+                        if (basalMatch) {
+                            const basalPct = parseFloat(basalMatch[1]);
+                            // Apply to hours mentioned in hourlyDisplayData or all hours
+                            if (rec.hourlyDisplayData) {
+                                rec.hourlyDisplayData.forEach(hd => {
+                                    const h = parseInt(hd.hour.split(':')[0]);
+                                    if (hd.new !== hd.old) {
+                                        const localChange = ((hd.new - hd.old) / hd.old) * 100;
+                                        hourlyEffects[h].basalChange += localChange;
+                                        hourlyEffects[h].sources.push(`Basal ${localChange >= 0 ? '+' : ''}${localChange.toFixed(0)}%`);
+                                    }
+                                });
+                            }
+                        }
+                        return; // Already handled
+                    } else {
+                        return; // Unknown type
+                    }
+                    
+                    const affectedHours = getAffectedHours(rec.scheduleTime, schedule);
+                    affectedHours.forEach(h => {
+                        hourlyEffects[h][effectKey] += pctChange;
+                        const label = rec.type.includes('CR') ? 'CR' : 'ISF';
+                        hourlyEffects[h].sources.push(`${label} ${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(0)}%`);
+                    });
+                });
+                
+                // Calculate net insulin effect per hour
+                // CR strengthening (-%) = more meal insulin
+                // ISF strengthening (-%) = more correction insulin
+                // Basal increase (+%) = more basal insulin
+                const hourlyNetEffect = {};
+                let maxEffect = 0;
+                let maxEffectHour = null;
+                
+                for (let h = 0; h < 24; h++) {
+                    const effects = hourlyEffects[h];
+                    // Invert CR and ISF because negative % means stronger (more insulin)
+                    const netInsulinChange = -effects.crChange - effects.isfChange + effects.basalChange;
+                    
+                    if (effects.sources.length > 0) {
+                        hourlyNetEffect[h] = {
+                            net: netInsulinChange,
+                            sources: effects.sources,
+                            cr: effects.crChange,
+                            isf: effects.isfChange,
+                            basal: effects.basalChange
+                        };
+                        
+                        if (Math.abs(netInsulinChange) > Math.abs(maxEffect)) {
+                            maxEffect = netInsulinChange;
+                            maxEffectHour = h;
+                        }
+                    }
+                }
+                
+                // Group consecutive hours with similar effects into ranges
+                const ranges = [];
+                let currentRange = null;
+                
+                for (let h = 0; h < 24; h++) {
+                    if (hourlyNetEffect[h]) {
+                        if (currentRange && 
+                            Math.abs(hourlyNetEffect[h].net - currentRange.avgNet) < 3 &&
+                            h === currentRange.endHour + 1) {
+                            // Extend current range
+                            currentRange.endHour = h;
+                            currentRange.hours.push(h);
+                            currentRange.totalNet += hourlyNetEffect[h].net;
+                            currentRange.avgNet = currentRange.totalNet / currentRange.hours.length;
+                            // Track individual component directions
+                            currentRange.crTotal += hourlyNetEffect[h].cr || 0;
+                            currentRange.isfTotal += hourlyNetEffect[h].isf || 0;
+                            currentRange.basalTotal += hourlyNetEffect[h].basal || 0;
+                            // Merge sources
+                            hourlyNetEffect[h].sources.forEach(s => {
+                                if (!currentRange.sources.includes(s)) {
+                                    currentRange.sources.push(s);
+                                }
+                            });
+                        } else {
+                            // Start new range
+                            if (currentRange) ranges.push(currentRange);
+                            currentRange = {
+                                startHour: h,
+                                endHour: h,
+                                hours: [h],
+                                totalNet: hourlyNetEffect[h].net,
+                                avgNet: hourlyNetEffect[h].net,
+                                crTotal: hourlyNetEffect[h].cr || 0,
+                                isfTotal: hourlyNetEffect[h].isf || 0,
+                                basalTotal: hourlyNetEffect[h].basal || 0,
+                                sources: [...hourlyNetEffect[h].sources]
+                            };
+                        }
+                    } else {
+                        if (currentRange) {
+                            ranges.push(currentRange);
+                            currentRange = null;
+                        }
+                    }
+                }
+                if (currentRange) ranges.push(currentRange);
+                
+                // Determine direction and apply appropriate thresholds
+                // Thresholds based on clinical risk:
+                // - All strengthening (more insulin), concentrated: ≥5% (lows are dangerous)
+                // - All strengthening, spread across day: ≥8%
+                // - All weakening (less insulin): ≥10% (highs are inconvenient, not emergencies)
+                // - Mixed directions: No warning (they partially offset)
+                
+                const analyzeRange = (range) => {
+                    // Determine direction of net change
+                    // Positive avgNet = more insulin (strengthening)
+                    // Negative avgNet = less insulin (weakening)
+                    const isStrengthening = range.avgNet > 0;
+                    const isWeakening = range.avgNet < 0;
+                    
+                    // Check if all changes are in the same direction
+                    // CR/ISF: negative = strengthening, positive = weakening
+                    // Basal: positive = strengthening, negative = weakening
+                    const crDirection = range.crTotal < 0 ? 'strengthen' : (range.crTotal > 0 ? 'weaken' : 'none');
+                    const isfDirection = range.isfTotal < 0 ? 'strengthen' : (range.isfTotal > 0 ? 'weaken' : 'none');
+                    const basalDirection = range.basalTotal > 0 ? 'strengthen' : (range.basalTotal < 0 ? 'weaken' : 'none');
+                    
+                    const activeDirections = [crDirection, isfDirection, basalDirection].filter(d => d !== 'none');
+                    const allSameDirection = activeDirections.length > 0 && 
+                        activeDirections.every(d => d === activeDirections[0]);
+                    const isMixed = activeDirections.length > 1 && !allSameDirection;
+                    
+                    // Determine if this is a concentrated time window
+                    const isConcentrated = range.hours.length <= 8;
+                    
+                    // Apply appropriate threshold
+                    let threshold;
+                    let riskLevel;
+                    
+                    if (isMixed) {
+                        // Mixed directions partially offset - no warning
+                        threshold = Infinity;
+                        riskLevel = 'mixed';
+                    } else if (isStrengthening) {
+                        // More insulin = risk of lows
+                        threshold = isConcentrated ? 5 : 8;
+                        riskLevel = 'strengthening';
+                    } else if (isWeakening) {
+                        // Less insulin = risk of highs (less dangerous)
+                        threshold = 10;
+                        riskLevel = 'weakening';
+                    } else {
+                        threshold = 8;
+                        riskLevel = 'neutral';
+                    }
+                    
+                    return {
+                        ...range,
+                        isStrengthening,
+                        isWeakening,
+                        isMixed,
+                        isConcentrated,
+                        threshold,
+                        riskLevel,
+                        exceedsThreshold: Math.abs(range.avgNet) >= threshold
+                    };
+                };
+                
+                const analyzedRanges = ranges.map(analyzeRange);
+                const significantRanges = analyzedRanges.filter(r => r.exceedsThreshold);
+                const needsWarning = significantRanges.length > 0;
+                
+                // Build warning message with risk-appropriate advice
+                let warningMessage = null;
+                if (needsWarning) {
+                    const hasStrengtheningWarning = significantRanges.some(r => r.isStrengthening);
+                    
+                    const rangeDescriptions = significantRanges.map(r => {
+                        const startStr = `${r.startHour.toString().padStart(2, '0')}:00`;
+                        const endStr = `${((r.endHour + 1) % 24).toString().padStart(2, '0')}:00`;
+                        const sign = r.avgNet >= 0 ? '+' : '';
+                        const riskIcon = r.isStrengthening ? '🔴' : '🟡';
+                        return `${riskIcon} ${startStr}-${endStr}: ${sign}${r.avgNet.toFixed(0)}% (${r.sources.join(', ')})`;
+                    });
+                    
+                    const advice = hasStrengtheningWarning
+                        ? 'All changes increase insulin delivery in these windows. Risk of stacking lows. Apply one parameter type at a time.'
+                        : 'Consider applying one parameter type at a time to monitor effects.';
+                    
+                    warningMessage = {
+                        title: 'Compound Effect Warning',
+                        subtitle: 'Applying all recommendations would change insulin delivery by:',
+                        ranges: rangeDescriptions,
+                        advice: advice,
+                        hasStrengtheningRisk: hasStrengtheningWarning
+                    };
+                }
+                
+                return {
+                    hourlyNetEffect,
+                    ranges,
+                    maxEffect,
+                    maxEffectHour,
+                    needsWarning,
+                    warningMessage
+                };
             };
 
             // ===== SECTION 3: ORCHESTRATION =====
@@ -4199,6 +4712,259 @@
                 });
             };
 
+            /**
+             * Apply Focus Mode: Categorize recommendations into PRIMARY (apply now) 
+             * and REFERENCE (wait 3-5 days)
+             * 
+             * Tiered Priority System:
+             * 
+             * TIER 1 - SAFETY (Always PRIMARY, can coexist):
+             *   - CR Weakening (prevents meal-induced lows)
+             *   - ISF Weakening (prevents correction-induced lows)
+             *   - Basal Optimization WITH safety reductions (resistant lows)
+             * 
+             * TIER 2 - FOUNDATIONAL (PRIMARY, blocks Tier 3-4):
+             *   - Basal Ratio Normalization (rare with ratio constraint)
+             * 
+             * TIER 3 - SIGNIFICANT BASAL (PRIMARY if no Tier 1-2):
+             *   - Basal Optimization with significant change (>3% OR >0.20 U/day)
+             * 
+             * TIER 4 - ROUTINE OPTIMIZATION (REFERENCE):
+             *   - Minor Basal Optimization
+             *   - CR Strengthening
+             *   - ISF Strengthening
+             */
+            const applyFocusMode = (recommendations) => {
+                // Thresholds for significant basal change
+                const SIGNIFICANT_BASAL_PERCENT = 3;  // >3% change
+                const SIGNIFICANT_BASAL_UNITS = 0.20; // >0.20 U/day change
+                
+                // Helper to determine the tier of a recommendation
+                const getTier = (rec) => {
+                    // Tier 1: Safety - all low-prevention
+                    if (rec.type === 'CR Weakening') return 1;
+                    if (rec.type === 'ISF Weakening') return 1;
+                    if (rec.type === 'Basal Optimization') {
+                        // Check if it has safety reductions (resistant lows)
+                        const hasSafetyReductions = rec.details?.includes('Safety Reductions') || 
+                                                    rec.reason?.includes('Safety reduction');
+                        if (hasSafetyReductions) return 1;
+                        
+                        // Check if it's a significant change (Tier 3) or minor (Tier 4)
+                        const percentMatch = rec.adjustment?.match(/([+-]?\d+\.?\d*)%/);
+                        const unitsMatch = rec.adjustment?.match(/([+-]?\d+\.?\d*)\s*U\/day/);
+                        
+                        const percentChange = percentMatch ? Math.abs(parseFloat(percentMatch[1])) : 0;
+                        const unitsChange = unitsMatch ? Math.abs(parseFloat(unitsMatch[1])) : 0;
+                        
+                        if (percentChange >= SIGNIFICANT_BASAL_PERCENT || unitsChange >= SIGNIFICANT_BASAL_UNITS) {
+                            return 3; // Significant basal change
+                        }
+                        return 4; // Minor basal optimization
+                    }
+                    
+                    // Tier 2: Foundational
+                    if (rec.type === 'Basal Ratio Normalization') return 2;
+                    
+                    // Tier 4: Routine optimization (strengthening)
+                    if (rec.type === 'CR Strengthening') return 4;
+                    if (rec.type === 'ISF Strengthening') return 4;
+                    
+                    return 99; // Informational or unknown
+                };
+                
+                // Categorize all recommendations by tier
+                const tier1Recs = recommendations.filter(r => getTier(r) === 1);
+                const tier2Recs = recommendations.filter(r => getTier(r) === 2);
+                const tier3Recs = recommendations.filter(r => getTier(r) === 3);
+                const tier4Recs = recommendations.filter(r => getTier(r) === 4);
+                
+                console.log(`Focus Mode Tiers: T1=${tier1Recs.length}, T2=${tier2Recs.length}, T3=${tier3Recs.length}, T4=${tier4Recs.length}`);
+                
+                // Determine which tier(s) are PRIMARY
+                let primaryTiers = [];
+                let primaryLabel = '';
+                
+                if (tier1Recs.length > 0) {
+                    // Tier 1 always wins - all safety items are PRIMARY together
+                    primaryTiers = [1];
+                    const safetyTypes = [...new Set(tier1Recs.map(r => {
+                        if (r.type === 'CR Weakening') return 'CR Weakening';
+                        if (r.type === 'ISF Weakening') return 'ISF Weakening';
+                        if (r.type === 'Basal Optimization') return 'Basal Safety';
+                        return r.type;
+                    }))];
+                    primaryLabel = `Safety: ${safetyTypes.join(' + ')}`;
+                } else if (tier2Recs.length > 0) {
+                    // Tier 2 blocks Tier 3-4
+                    primaryTiers = [2];
+                    primaryLabel = 'Basal Ratio Normalization';
+                } else if (tier3Recs.length > 0) {
+                    // Significant basal change is PRIMARY
+                    primaryTiers = [3];
+                    primaryLabel = 'Basal Optimization (Significant)';
+                } else if (tier4Recs.length > 0) {
+                    // Pick highest confidence from Tier 4
+                    // Sort by confidence and take the best one's type as primary
+                    const sortedTier4 = [...tier4Recs].sort((a, b) => b.confidence.score - a.confidence.score);
+                    const topRec = sortedTier4[0];
+                    primaryTiers = [4];
+                    primaryLabel = topRec.type;
+                }
+                
+                console.log(`Focus Mode: Primary tiers = [${primaryTiers.join(', ')}], label = ${primaryLabel}`);
+                
+                // Mark each recommendation as primary or reference
+                const categorized = recommendations.map(rec => {
+                    const tier = getTier(rec);
+                    let isPrimary = false;
+                    
+                    if (primaryTiers.includes(tier)) {
+                        if (tier === 4) {
+                            // For Tier 4, only the highest confidence of the same type is primary
+                            const sameTypeRecs = recommendations.filter(r => r.type === rec.type && getTier(r) === 4);
+                            const highestConfidence = Math.max(...sameTypeRecs.map(r => r.confidence.score));
+                            isPrimary = rec.confidence.score === highestConfidence;
+                        } else {
+                            // For Tiers 1-3, all in the tier are primary
+                            isPrimary = true;
+                        }
+                    }
+                    
+                    return {
+                        ...rec,
+                        focusTier: tier,
+                        isPrimaryFocus: isPrimary,
+                        isReferenceFocus: !isPrimary && tier !== 99
+                    };
+                });
+                
+                // Calculate summary info
+                const primaryRecs = categorized.filter(r => r.isPrimaryFocus);
+                const referenceRecs = categorized.filter(r => r.isReferenceFocus);
+                
+                return {
+                    recommendations: categorized,
+                    focusInfo: {
+                        primaryTiers,
+                        primaryLabel,
+                        primaryCount: primaryRecs.length,
+                        referenceCount: referenceRecs.length,
+                        primaryTypes: [...new Set(primaryRecs.map(r => r.type))],
+                        referenceTypes: [...new Set(referenceRecs.map(r => r.type))],
+                        tier1Count: tier1Recs.length,
+                        tier2Count: tier2Recs.length,
+                        tier3Count: tier3Recs.length,
+                        tier4Count: tier4Recs.length
+                    }
+                };
+            };
+
+            /**
+             * Detect conflicts between recommendations and signal analysis
+             * 
+             * Conflict logic:
+             * - Strengthening (more insulin) + LOW signal = CONFLICT (risk of stacking lows)
+             * - Weakening (less insulin) + HIGH signal = CONFLICT (risk of stacking highs)
+             * 
+             * Circadian periods mapping:
+             * - Deep Sleep: 0-4
+             * - Dawn: 4-8
+             * - Morning: 8-12
+             * - Afternoon: 12-17
+             * - Evening: 17-21
+             * - Sleep Onset: 21-24
+             */
+            const detectSignalConflicts = (recommendations, signalAnalysis) => {
+                if (!signalAnalysis || !signalAnalysis.periods) {
+                    return { conflicts: [], hasConflicts: false };
+                }
+                
+                // Build a mapping of hours to signal info
+                const hourToSignal = {};
+                signalAnalysis.periods.forEach(period => {
+                    // Parse hours string like "00-04" or "21-24"
+                    const match = period.hours.match(/(\d+)-(\d+)/);
+                    if (match) {
+                        const start = parseInt(match[1]);
+                        const end = parseInt(match[2]);
+                        for (let h = start; h < end; h++) {
+                            hourToSignal[h] = {
+                                periodName: period.name,
+                                signal: period.signal,
+                                medianDeviation: period.medianDeviation,
+                                hasSufficientData: period.hasSufficientData
+                            };
+                        }
+                    }
+                });
+                
+                const conflicts = [];
+                
+                recommendations.forEach(rec => {
+                    // Only check CR and ISF recommendations
+                    if (!rec.type.includes('CR') && !rec.type.includes('ISF')) return;
+                    
+                    // Determine if strengthening or weakening
+                    const isStrengthening = rec.type.includes('Strengthening');
+                    const isWeakening = rec.type.includes('Weakening');
+                    
+                    // Get the schedule hour
+                    let scheduleHour = null;
+                    if (rec.scheduleTime && rec.scheduleTime !== 'ALL') {
+                        scheduleHour = parseInt(rec.scheduleTime.split(':')[0]);
+                    }
+                    
+                    if (scheduleHour === null) return;
+                    
+                    // Look up the signal for this hour
+                    const signalInfo = hourToSignal[scheduleHour];
+                    if (!signalInfo || !signalInfo.hasSufficientData) return;
+                    
+                    // Check for conflict
+                    let hasConflict = false;
+                    let conflictType = null;
+                    let conflictSeverity = 'low'; // low, medium, high
+                    
+                    if (isStrengthening && signalInfo.signal === 'LOW') {
+                        // Strengthening during LOW signal = risk of stacking lows
+                        hasConflict = true;
+                        conflictType = 'strengthening-low';
+                        conflictSeverity = signalInfo.medianDeviation <= -10 ? 'high' : 
+                                          signalInfo.medianDeviation <= -5 ? 'medium' : 'low';
+                    } else if (isWeakening && signalInfo.signal === 'HIGH') {
+                        // Weakening during HIGH signal = risk of stacking highs
+                        hasConflict = true;
+                        conflictType = 'weakening-high';
+                        conflictSeverity = signalInfo.medianDeviation >= 15 ? 'high' :
+                                          signalInfo.medianDeviation >= 8 ? 'medium' : 'low';
+                    }
+                    
+                    if (hasConflict) {
+                        conflicts.push({
+                            recommendation: rec,
+                            scheduleTime: rec.scheduleTime,
+                            recType: rec.type,
+                            signalPeriod: signalInfo.periodName,
+                            signal: signalInfo.signal,
+                            medianDeviation: signalInfo.medianDeviation,
+                            conflictType,
+                            conflictSeverity,
+                            message: conflictType === 'strengthening-low'
+                                ? `${rec.type} at ${rec.scheduleTime} may conflict with ${signalInfo.periodName} LOW signal (${signalInfo.medianDeviation?.toFixed(1) || 'N/A'}). Both increase insulin.`
+                                : `${rec.type} at ${rec.scheduleTime} may conflict with ${signalInfo.periodName} HIGH signal (+${signalInfo.medianDeviation?.toFixed(1) || 'N/A'}). Both reduce insulin effect.`
+                        });
+                    }
+                });
+                
+                return {
+                    conflicts,
+                    hasConflicts: conflicts.length > 0,
+                    highSeverityCount: conflicts.filter(c => c.conflictSeverity === 'high').length,
+                    mediumSeverityCount: conflicts.filter(c => c.conflictSeverity === 'medium').length
+                };
+            };
+
             // ===== MAIN ANALYSIS FUNCTION =====
             
             const runAnalysis = async (dataToAnalyze = null) => {
@@ -4271,27 +5037,103 @@
                     // Also keep sorted list for summary
                     const sorted = sortByPriority(aggregated);
                     
+                    // Calculate compound effect
+                    const compoundEffect = calculateCompoundEffect(sorted, crSchedule, isfSchedule, basalSchedule);
+                    console.log('Compound effect analysis:', compoundEffect);
+                    
+                    // Handle profile override - convert all to INFORMATIONAL
+                    let finalSorted = sorted;
+                    let finalGrouped = grouped;
+                    if (profileOverrideActive) {
+                        console.log('Profile override active - converting all recommendations to INFORMATIONAL');
+                        finalSorted = sorted.map(rec => ({
+                            ...rec,
+                            originalPriority: rec.priority,
+                            priority: 'INFORMATIONAL',
+                            overrideActive: true
+                        }));
+                        // Re-group with updated priorities
+                        finalGrouped = groupByParameterType(finalSorted, conflicts);
+                    }
+                    
+                    // Apply Focus Mode - categorize into PRIMARY and REFERENCE
+                    let focusInfo = null;
+                    if (focusMode && !profileOverrideActive) {
+                        const focusResult = applyFocusMode(finalSorted);
+                        finalSorted = focusResult.recommendations;
+                        focusInfo = focusResult.focusInfo;
+                        console.log('Focus mode applied:', focusInfo);
+                        
+                        // Re-group with focus annotations
+                        finalGrouped = groupByParameterType(finalSorted, conflicts);
+                    }
+                    
+                    // Detect signal-recommendation conflicts
+                    let signalConflicts = { conflicts: [], hasConflicts: false };
+                    const basalRec = finalSorted.find(r => r.signalAnalysis);
+                    if (basalRec && basalRec.signalAnalysis) {
+                        signalConflicts = detectSignalConflicts(finalSorted, basalRec.signalAnalysis);
+                        console.log('Signal conflicts detected:', signalConflicts);
+                        
+                        // Add conflict flags to recommendations
+                        if (signalConflicts.hasConflicts) {
+                            finalSorted = finalSorted.map(rec => {
+                                const conflict = signalConflicts.conflicts.find(
+                                    c => c.scheduleTime === rec.scheduleTime && c.recType === rec.type
+                                );
+                                if (conflict) {
+                                    return {
+                                        ...rec,
+                                        hasSignalConflict: true,
+                                        signalConflict: conflict
+                                    };
+                                }
+                                return rec;
+                            });
+                            
+                            // Re-group with conflict annotations
+                            finalGrouped = groupByParameterType(finalSorted, conflicts);
+                        }
+                    }
+                    
+                    // In Focus Mode, sort groups so PRIMARY section appears first
+                    if (focusMode && !profileOverrideActive && focusInfo) {
+                        finalGrouped.sort((a, b) => {
+                            const aHasPrimary = a.recommendations.some(r => r.isPrimaryFocus);
+                            const bHasPrimary = b.recommendations.some(r => r.isPrimaryFocus);
+                            if (aHasPrimary && !bHasPrimary) return -1;
+                            if (!aHasPrimary && bHasPrimary) return 1;
+                            return 0; // Keep original order for non-primary
+                        });
+                        console.log('Focus mode: Reordered groups to show PRIMARY first');
+                    }
+                    
                     // Build results object
                     const results = {
-                        recommendations: sorted,
-                        groupedRecommendations: grouped,
+                        recommendations: finalSorted,
+                        groupedRecommendations: finalGrouped,
                         conflicts: conflicts,
                         ratioInfo: ratioInfo,
+                        compoundEffect: compoundEffect,
+                        profileOverrideActive: profileOverrideActive,
+                        focusMode: focusMode && !profileOverrideActive,
+                        focusInfo: focusInfo,
+                        signalConflicts: signalConflicts,
                         summary: {
-                            totalRecommendations: sorted.length,
+                            totalRecommendations: finalSorted.length,
                             byType: {
-                                crWeakening: sorted.filter(r => r.type === 'CR Weakening').length,
-                                crStrengthening: sorted.filter(r => r.type === 'CR Strengthening').length,
-                                isfWeakening: sorted.filter(r => r.type === 'ISF Weakening').length,
-                                isfStrengthening: sorted.filter(r => r.type === 'ISF Strengthening').length,
-                                basalRatioNormalization: sorted.filter(r => r.type === 'Basal Ratio Normalization').length,
-                                informational: sorted.filter(r => r.type === 'Informational').length
+                                crWeakening: finalSorted.filter(r => r.type === 'CR Weakening').length,
+                                crStrengthening: finalSorted.filter(r => r.type === 'CR Strengthening').length,
+                                isfWeakening: finalSorted.filter(r => r.type === 'ISF Weakening').length,
+                                isfStrengthening: finalSorted.filter(r => r.type === 'ISF Strengthening').length,
+                                basalRatioNormalization: finalSorted.filter(r => r.type === 'Basal Ratio Normalization').length,
+                                informational: finalSorted.filter(r => r.type === 'Informational').length
                             },
                             byPriority: {
-                                high: sorted.filter(r => r.priority === 'HIGH').length,
-                                medium: sorted.filter(r => r.priority === 'MEDIUM').length,
-                                low: sorted.filter(r => r.priority === 'LOW').length,
-                                informational: sorted.filter(r => r.priority === 'INFORMATIONAL').length
+                                high: finalSorted.filter(r => r.priority === 'HIGH').length,
+                                medium: finalSorted.filter(r => r.priority === 'MEDIUM').length,
+                                low: finalSorted.filter(r => r.priority === 'LOW').length,
+                                informational: finalSorted.filter(r => r.priority === 'INFORMATIONAL').length
                             }
                         },
                         crSchedule,
@@ -4540,10 +5382,24 @@
                 const isLatest = rec.isLatest;
                 const isOlder = rec.isOlder;
                 
+                // Focus mode styling
+                const isPrimaryFocus = rec.isPrimaryFocus;
+                const isReferenceFocus = rec.isReferenceFocus;
+                
                 let borderClass = '';
                 let opacityClass = '';
+                let bgClass = 'bg-white';
                 
-                if (showConflictWarning) {
+                if (isReferenceFocus) {
+                    // Reference recommendations are muted
+                    borderClass = 'border-2 border-dashed border-gray-300';
+                    opacityClass = 'opacity-70';
+                    bgClass = 'bg-gray-50';
+                } else if (isPrimaryFocus) {
+                    // Primary recommendations have emphasis
+                    borderClass = 'border-2 border-indigo-400';
+                    bgClass = 'bg-white';
+                } else if (showConflictWarning) {
                     if (isLatest) {
                         borderClass = 'border-2 border-green-500';
                     } else if (isOlder) {
@@ -4555,7 +5411,7 @@
                 }
                 
                 return (
-                    <div className={`bg-white rounded-lg shadow p-4 ${borderClass} ${opacityClass}`}>
+                    <div className={`${bgClass} rounded-lg shadow p-4 ${borderClass} ${opacityClass}`}>
                         {/* Header with Type, Value Change, and Adjustment */}
                         <div className="flex justify-between items-start mb-3">
                             <div className="flex-1">
@@ -4574,9 +5430,28 @@
                                     <span className="text-lg font-bold text-indigo-600">
                                         ({rec.adjustment})
                                     </span>
+                                    {isPrimaryFocus && (
+                                        <span className="px-2 py-1 bg-indigo-100 text-indigo-800 border border-indigo-400 rounded text-xs font-bold">
+                                            🎯 PRIMARY
+                                        </span>
+                                    )}
+                                    {isReferenceFocus && (
+                                        <span className="px-2 py-1 bg-gray-100 text-gray-600 border border-gray-400 rounded text-xs font-bold">
+                                            📋 REFERENCE
+                                        </span>
+                                    )}
                                     {isLatest && (
                                         <span className="px-2 py-1 bg-green-100 text-green-800 border border-green-400 rounded text-xs font-bold">
                                             LATEST
+                                        </span>
+                                    )}
+                                    {rec.hasSignalConflict && (
+                                        <span className={`px-2 py-1 rounded text-xs font-bold ${
+                                            rec.signalConflict.conflictSeverity === 'high' ? 'bg-red-100 text-red-800 border border-red-400' :
+                                            rec.signalConflict.conflictSeverity === 'medium' ? 'bg-amber-100 text-amber-800 border border-amber-400' :
+                                            'bg-yellow-100 text-yellow-800 border border-yellow-400'
+                                        }`} title={rec.signalConflict.message}>
+                                            ⚠️ SIGNAL CONFLICT
                                         </span>
                                     )}
                                 </div>
@@ -4665,14 +5540,14 @@
                             <div className="flex items-center gap-3 mb-2">
                                 <Activity />
                                 <h1 className="text-3xl font-bold text-gray-800">
-                                    iAPS Parameter Optimizer
+                                    Daily Insulin Settings Review
                                 </h1>
                                 <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm font-semibold">
-                                    v26 Signal Logging
+                                    v1
                                 </span>
                             </div>
                             <p className="text-gray-600">
-                                Multi-detector system with IOB-calculated multi-hour basal reduction
+                                Multi-detector analysis with signal logging
                             </p>
                         </div>
 
@@ -4773,9 +5648,28 @@
                                             />
                                             <div className="flex justify-between text-xs text-gray-500 mt-1">
                                                 <span>25%</span>
-                                                <span>35% (default)</span>
+                                                <span>38% (fallback)</span>
                                                 <span>45%</span>
                                             </div>
+                                            {/* 7-day average indicator */}
+                                            {basalTargetSource === 'loading' && (
+                                                <div className="mt-1 text-xs text-blue-600 flex items-center gap-1">
+                                                    <span className="animate-pulse">⏳</span>
+                                                    Loading 7-day average from history...
+                                                </div>
+                                            )}
+                                            {basalTargetSource === 'sheet' && basalTargetAvg && (
+                                                <div className="mt-1 text-xs text-green-700 bg-green-50 px-2 py-1 rounded flex items-center gap-1">
+                                                    <span>📊</span>
+                                                    Based on 7-day avg: {basalTargetAvg.toFixed(1)}%
+                                                </div>
+                                            )}
+                                            {basalTargetSource === 'error' && (
+                                                <div className="mt-1 text-xs text-amber-600 flex items-center gap-1">
+                                                    <span>⚠️</span>
+                                                    Could not load history, using 38% default
+                                                </div>
+                                            )}
                                         </div>
                                         
                                         <div className="mt-2">
@@ -4796,6 +5690,44 @@
                                                 <span>2.0:1 (default)</span>
                                                 <span>3.0:1</span>
                                             </div>
+                                        </div>
+                                        
+                                        {/* Focus Mode Toggle */}
+                                        <div className="mt-4 p-3 bg-indigo-50 border border-indigo-200 rounded-lg">
+                                            <label className="flex items-start gap-3 cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={focusMode}
+                                                    onChange={(e) => setFocusMode(e.target.checked)}
+                                                    className="mt-1 h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+                                                />
+                                                <div>
+                                                    <span className="font-medium text-indigo-800">Focus Mode: One Parameter Type</span>
+                                                    <p className="text-xs text-indigo-700 mt-1">
+                                                        Prioritize one parameter type at a time to avoid stacking changes. 
+                                                        Other recommendations shown for reference.
+                                                    </p>
+                                                </div>
+                                            </label>
+                                        </div>
+                                        
+                                        {/* Profile Override Checkbox */}
+                                        <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+                                            <label className="flex items-start gap-3 cursor-pointer">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={profileOverrideActive}
+                                                    onChange={(e) => setProfileOverrideActive(e.target.checked)}
+                                                    className="mt-1 h-4 w-4 text-amber-600 border-gray-300 rounded focus:ring-amber-500"
+                                                />
+                                                <div>
+                                                    <span className="font-medium text-amber-800">Profile Override Active</span>
+                                                    <p className="text-xs text-amber-700 mt-1">
+                                                        Check this if you're running a temporary profile override (illness, growth spurt, etc.). 
+                                                        All recommendations will be shown as informational only.
+                                                    </p>
+                                                </div>
+                                            </label>
                                         </div>
                                     </div>
                                     
@@ -4978,10 +5910,133 @@
                                                     between highest and lowest rates, which exceeds the {analysisResults.ratioInfo.ratioCap.toFixed(1)}:1 cap.
                                                 </p>
                                                 <p className="text-amber-700 text-sm">
-                                                    <strong>CR/ISF recommendations below may be compensating for basal issues.</strong> Apply 
-                                                    the Basal Ratio Normalization recommendation first to establish a reliable baseline, 
-                                                    then re-run analysis for TDD optimization. A 20% confidence penalty has been applied to CR/ISF 
-                                                    recommendations to reflect this uncertainty.
+                                                    <strong>CR/ISF recommendations below may be compensating for basal issues.</strong>{' '}
+                                                    {analysisResults.focusMode && analysisResults.focusInfo?.primaryTiers?.includes(1) ? (
+                                                        <>After addressing tonight's safety items, apply the Basal Ratio Normalization 
+                                                        recommendation to establish a reliable baseline.</>
+                                                    ) : (
+                                                        <>Apply the Basal Ratio Normalization recommendation first to establish a reliable baseline, 
+                                                        then re-run analysis for TDD optimization.</>
+                                                    )}{' '}
+                                                    A 20% confidence penalty has been applied to CR/ISF recommendations to reflect this uncertainty.
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Profile Override Active Banner */}
+                                {analysisResults.profileOverrideActive && (
+                                    <div className="bg-purple-50 border-2 border-purple-400 rounded-lg p-4 mb-6">
+                                        <div className="flex items-start gap-3">
+                                            <span className="text-2xl">🔄</span>
+                                            <div>
+                                                <h3 className="font-bold text-purple-800 text-lg mb-1">
+                                                    Profile Override Active
+                                                </h3>
+                                                <p className="text-purple-700">
+                                                    Recommendations are shown for <strong>reference only</strong>. Do not apply permanent parameter 
+                                                    changes during temporary states (illness, growth spurt, bad insulin, etc.). 
+                                                    Wait until you return to normal profile before making adjustments.
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Compound Effect Warning */}
+                                {analysisResults.compoundEffect && analysisResults.compoundEffect.needsWarning && !analysisResults.profileOverrideActive && (
+                                    <div className={`${analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk ? 'bg-red-50 border-red-400' : 'bg-orange-50 border-orange-400'} border-2 rounded-lg p-4 mb-6`}>
+                                        <div className="flex items-start gap-3">
+                                            <span className="text-2xl">{analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk ? '🚨' : '⚡'}</span>
+                                            <div>
+                                                <h3 className={`font-bold ${analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk ? 'text-red-800' : 'text-orange-800'} text-lg mb-1`}>
+                                                    {analysisResults.compoundEffect.warningMessage.title}
+                                                    {analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk && 
+                                                        <span className="ml-2 text-sm bg-red-200 text-red-800 px-2 py-0.5 rounded">LOW RISK</span>
+                                                    }
+                                                </h3>
+                                                <p className={`${analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk ? 'text-red-700' : 'text-orange-700'} mb-2`}>
+                                                    {analysisResults.compoundEffect.warningMessage.subtitle}
+                                                </p>
+                                                <ul className={`${analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk ? 'text-red-700' : 'text-orange-700'} text-sm space-y-1 mb-2`}>
+                                                    {analysisResults.compoundEffect.warningMessage.ranges.map((range, idx) => (
+                                                        <li key={idx} className="font-mono">• {range}</li>
+                                                    ))}
+                                                </ul>
+                                                <p className={`${analysisResults.compoundEffect.warningMessage.hasStrengtheningRisk ? 'text-red-700' : 'text-orange-700'} text-sm font-medium`}>
+                                                    {analysisResults.compoundEffect.warningMessage.advice}
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Focus Mode Banner */}
+                                {analysisResults.focusMode && analysisResults.focusInfo && (
+                                    <div className="bg-indigo-50 border-2 border-indigo-400 rounded-lg p-4 mb-6">
+                                        <div className="flex items-start gap-3">
+                                            <span className="text-2xl">🎯</span>
+                                            <div>
+                                                <h3 className="font-bold text-indigo-800 text-lg mb-1">
+                                                    Focus Mode Active
+                                                    {analysisResults.focusInfo.primaryTiers?.includes(1) && (
+                                                        <span className="ml-2 text-sm bg-red-200 text-red-800 px-2 py-0.5 rounded">
+                                                            SAFETY
+                                                        </span>
+                                                    )}
+                                                </h3>
+                                                <p className="text-indigo-700 mb-2">
+                                                    <strong>Tonight's Focus: {analysisResults.focusInfo.primaryLabel}</strong>
+                                                    {analysisResults.focusInfo.primaryCount > 0 && 
+                                                        ` (${analysisResults.focusInfo.primaryCount} recommendation${analysisResults.focusInfo.primaryCount > 1 ? 's' : ''})`
+                                                    }
+                                                </p>
+                                                {analysisResults.focusInfo.referenceCount > 0 && (
+                                                    <p className="text-indigo-600 text-sm">
+                                                        {analysisResults.focusInfo.referenceCount} other recommendation{analysisResults.focusInfo.referenceCount > 1 ? 's' : ''} shown 
+                                                        for reference — apply after primary changes settle (3-5 days).
+                                                    </p>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Signal-Recommendation Conflict Banner */}
+                                {analysisResults.signalConflicts && analysisResults.signalConflicts.hasConflicts && !analysisResults.profileOverrideActive && (
+                                    <div className="bg-amber-50 border-2 border-amber-400 rounded-lg p-4 mb-6">
+                                        <div className="flex items-start gap-3">
+                                            <span className="text-2xl">⚠️</span>
+                                            <div>
+                                                <h3 className="font-bold text-amber-800 text-lg mb-1">
+                                                    Signal-Recommendation Conflict
+                                                    {analysisResults.signalConflicts.highSeverityCount > 0 && 
+                                                        <span className="ml-2 text-sm bg-red-200 text-red-800 px-2 py-0.5 rounded">
+                                                            {analysisResults.signalConflicts.highSeverityCount} HIGH
+                                                        </span>
+                                                    }
+                                                </h3>
+                                                <p className="text-amber-700 mb-2">
+                                                    {analysisResults.signalConflicts.conflicts.length} recommendation{analysisResults.signalConflicts.conflicts.length > 1 ? 's' : ''} may 
+                                                    conflict with basal signal analysis:
+                                                </p>
+                                                <ul className="text-amber-700 text-sm space-y-1">
+                                                    {analysisResults.signalConflicts.conflicts.map((conflict, idx) => (
+                                                        <li key={idx} className="flex items-start gap-1">
+                                                            <span className={`font-medium ${
+                                                                conflict.conflictSeverity === 'high' ? 'text-red-700' : 
+                                                                conflict.conflictSeverity === 'medium' ? 'text-amber-700' : 'text-amber-600'
+                                                            }`}>
+                                                                {conflict.conflictSeverity === 'high' ? '🔴' : 
+                                                                 conflict.conflictSeverity === 'medium' ? '🟡' : '🟢'}
+                                                            </span>
+                                                            <span>{conflict.message}</span>
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                                <p className="text-amber-700 text-sm font-medium mt-2">
+                                                    Consider if the signal trend is temporary or if the recommendation addresses a different issue.
                                                 </p>
                                             </div>
                                         </div>
@@ -5129,65 +6184,91 @@
                                                 </div>
                                             );
                                         })()}
+                                    </div>
+                                )}
+
+                                {/* Google Sheets Logging Section - Always visible when URL configured */}
+                                {sheetsWebAppUrl && (
+                                    <div className="bg-white rounded-lg shadow-lg p-6 mt-6">
+                                        <div className="flex justify-between items-center mb-3">
+                                            <h3 className="text-lg font-semibold flex items-center gap-2">
+                                                <span>📊</span> Signal Logging
+                                            </h3>
+                                            {autoLogEnabled && (
+                                                <span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded-full flex items-center gap-1">
+                                                    <span>✓</span> Auto-log enabled
+                                                </span>
+                                            )}
+                                        </div>
                                         
-                                        {/* Log This Analysis Panel */}
-                                        {sheetsWebAppUrl && (
-                                            <div className="mt-4 p-4 bg-indigo-50 border border-indigo-200 rounded-lg">
-                                                <h4 className="font-semibold text-indigo-800 mb-2 flex items-center gap-2">
-                                                    <span>📝</span> Log This Analysis
-                                                </h4>
-                                                <div className="flex flex-col md:flex-row gap-2">
-                                                    <input
-                                                        type="text"
-                                                        placeholder="Notes (optional): e.g., 'After changing ISF'"
-                                                        value={loggingNotes}
-                                                        onChange={(e) => setLoggingNotes(e.target.value)}
-                                                        className="flex-1 px-3 py-2 border rounded text-sm"
-                                                    />
-                                                    <button
-                                                        onClick={logToGoogleSheets}
-                                                        disabled={logStatus === 'logging'}
-                                                        className={`px-4 py-2 rounded font-semibold text-sm whitespace-nowrap ${
-                                                            logStatus === 'success' ? 'bg-green-600 text-white' :
-                                                            logStatus === 'error' ? 'bg-red-600 text-white' :
-                                                            logStatus === 'logging' ? 'bg-gray-400 text-white' :
-                                                            'bg-indigo-600 text-white hover:bg-indigo-700'
-                                                        }`}
-                                                    >
-                                                        {logStatus === 'logging' ? '⏳ Logging...' :
-                                                         logStatus === 'success' ? '✓ Logged!' :
-                                                         logStatus === 'error' ? '✗ Failed' :
-                                                         '📊 Log to Sheets'}
-                                                    </button>
-                                                </div>
-                                                {logMessage && (
-                                                    <p className={`text-xs mt-2 ${
-                                                        logStatus === 'success' ? 'text-green-700' :
-                                                        logStatus === 'error' ? 'text-red-700' :
-                                                        'text-gray-600'
-                                                    }`}>
-                                                        {logMessage}
-                                                    </p>
+                                        {analysisResults.recommendations.some(r => r.signalAnalysis) ? (
+                                            <>
+                                                {/* Auto-log status */}
+                                                {logStatus === 'success' && logMessage.includes('Auto-logged') && (
+                                                    <div className="mb-3 p-2 bg-green-50 border border-green-200 rounded text-sm text-green-700 flex items-center gap-2">
+                                                        <span>✓</span> {logMessage}
+                                                    </div>
                                                 )}
-                                            </div>
-                                        )}
+                                                
+                                                {/* Manual Log Panel */}
+                                                <div className="p-4 bg-indigo-50 border border-indigo-200 rounded-lg">
+                                                    <h4 className="font-semibold text-indigo-800 mb-2 flex items-center gap-2">
+                                                        <span>📝</span> Add Notes & Re-log
+                                                    </h4>
+                                                    <p className="text-xs text-indigo-600 mb-2">
+                                                        Analysis is auto-logged. Use this to add notes or overwrite today's entry.
+                                                    </p>
+                                                    <div className="flex flex-col md:flex-row gap-2">
+                                                        <input
+                                                            type="text"
+                                                            placeholder="Notes (optional): e.g., 'After changing ISF'"
+                                                            value={loggingNotes}
+                                                            onChange={(e) => setLoggingNotes(e.target.value)}
+                                                            className="flex-1 px-3 py-2 border rounded text-sm"
+                                                        />
+                                                        <button
+                                                            onClick={() => logToGoogleSheets(false)}
+                                                            disabled={logStatus === 'logging'}
+                                                            className={`px-4 py-2 rounded font-semibold text-sm whitespace-nowrap ${
+                                                                logStatus === 'success' ? 'bg-green-600 text-white' :
+                                                                logStatus === 'error' ? 'bg-red-600 text-white' :
+                                                                logStatus === 'logging' ? 'bg-gray-400 text-white' :
+                                                                'bg-indigo-600 text-white hover:bg-indigo-700'
+                                                            }`}
+                                                        >
+                                                            {logStatus === 'logging' ? '⏳ Logging...' :
+                                                             logStatus === 'success' ? '✓ Logged!' :
+                                                             logStatus === 'error' ? '✗ Failed' :
+                                                             '📊 Log with Notes'}
+                                                        </button>
+                                                    </div>
+                                                    {logMessage && !logMessage.includes('Auto-logged') && (
+                                                        <p className={`text-xs mt-2 ${
+                                                            logStatus === 'success' ? 'text-green-700' :
+                                                            logStatus === 'error' ? 'text-red-700' :
+                                                            'text-gray-600'
+                                                        }`}>
+                                                            {logMessage}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                                
+                                                {/* View Trend Button */}
+                                                {!showTrend && (
+                                                    <div className="mt-4 text-center">
+                                                        <button
+                                                            onClick={fetchTrendData}
+                                                            disabled={trendLoading}
+                                                            className="px-6 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg font-medium text-sm border"
+                                                        >
+                                                            {trendLoading ? '⏳ Loading Trend Data...' : '📈 View Signal Trend'}
+                                                        </button>
+                                                    </div>
+                                                )}
                                         
-                                        {/* View Trend Button */}
-                                        {sheetsWebAppUrl && !showTrend && (
-                                            <div className="mt-4 text-center">
-                                                <button
-                                                    onClick={fetchTrendData}
-                                                    disabled={trendLoading}
-                                                    className="px-6 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg font-medium text-sm border"
-                                                >
-                                                    {trendLoading ? '⏳ Loading Trend Data...' : '📈 View Signal Trend'}
-                                                </button>
-                                            </div>
-                                        )}
-                                        
-                                        {/* Trend Visualization */}
-                                        {showTrend && (
-                                            <div className="mt-4 p-4 bg-white border border-gray-200 rounded-lg">
+                                                {/* Trend Visualization */}
+                                                {showTrend && (
+                                                    <div className="mt-4 p-4 bg-white border border-gray-200 rounded-lg">
                                                 <div className="flex justify-between items-center mb-3">
                                                     <h4 className="font-semibold text-gray-800 flex items-center gap-2">
                                                         <span>📈</span> Signal Trend Analysis
@@ -5327,6 +6408,21 @@
                                                         </div>
                                                     </div>
                                                 )}
+                                            </div>
+                                        )}
+                                            </>
+                                        ) : (
+                                            <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg">
+                                                <div className="flex items-start gap-3">
+                                                    <span className="text-xl">⚠️</span>
+                                                    <div>
+                                                        <h4 className="font-semibold text-amber-800">Signal Data Not Available</h4>
+                                                        <p className="text-sm text-amber-700 mt-1">
+                                                            Signal analysis requires the basal ratio to be within the {basalRatioCap.toFixed(1)}:1 cap. 
+                                                            Apply the Basal Ratio Normalization recommendation first, then re-run analysis to enable signal logging.
+                                                        </p>
+                                                    </div>
+                                                </div>
                                             </div>
                                         )}
                                     </div>
