@@ -112,6 +112,36 @@
                 }
             ];
             
+            /**
+             * Get adjacent periods for a given period (wraps around)
+             * Used for protected period calculation after resistant lows
+             */
+            function getAdjacentPeriods(periodName) {
+                const idx = CIRCADIAN_PERIODS.findIndex(p => p.name === periodName);
+                if (idx === -1) return [];
+                
+                const prevIdx = (idx - 1 + CIRCADIAN_PERIODS.length) % CIRCADIAN_PERIODS.length;
+                const nextIdx = (idx + 1) % CIRCADIAN_PERIODS.length;
+                
+                return [
+                    CIRCADIAN_PERIODS[prevIdx].name,
+                    CIRCADIAN_PERIODS[nextIdx].name
+                ];
+            }
+            
+            /**
+             * Get protected periods based on periods with resistant lows
+             * Returns the periods with lows plus their adjacent periods
+             */
+            function getProtectedPeriods(periodsWithLows) {
+                const protectedSet = new Set();
+                periodsWithLows.forEach(periodName => {
+                    protectedSet.add(periodName);
+                    getAdjacentPeriods(periodName).forEach(adj => protectedSet.add(adj));
+                });
+                return protectedSet;
+            }
+            
             // =========================================================================
             // HELPER FUNCTIONS
             // =========================================================================
@@ -265,49 +295,91 @@
             // =========================================================================
             
             /**
-             * Pool clean window data by circadian period.
+             * Pool clean window data by circadian period with recency weighting.
+             * Recent samples (last 1-2 days) weighted more heavily than older samples.
              * 
              * @param {Object} cleanResult - Result from analyzeCleanWindows
              * @param {Number} minSampleSize - Minimum samples required for a period
+             * @param {Number} analysisWindowDays - Number of days in analysis window (for weighting)
              * @returns {Object} Analysis results per period
              */
-            function poolByCircadianPeriod(cleanResult, minSampleSize = 10) {
+            function poolByCircadianPeriod(cleanResult, minSampleSize = 10, analysisWindowDays = 7) {
                 const periodAnalysis = {};
+                const now = new Date();
+                
+                // Calculate recency weight: Day 0 = 1.0, Day 7 ≈ 0.21 (decay factor 0.8)
+                const getRecencyWeight = (sampleTime) => {
+                    const daysAgo = (now - sampleTime) / (24 * 60 * 60 * 1000);
+                    return Math.pow(0.8, daysAgo);
+                };
+                
+                // Weighted median function
+                const weightedMedian = (samples) => {
+                    if (samples.length === 0) return null;
+                    
+                    // Sort by deviation value
+                    const sorted = [...samples].sort((a, b) => a.deviation - b.deviation);
+                    
+                    // Calculate total weight
+                    const totalWeight = sorted.reduce((sum, s) => sum + s.weight, 0);
+                    
+                    // Find median (value where cumulative weight reaches 50%)
+                    let cumulativeWeight = 0;
+                    for (const sample of sorted) {
+                        cumulativeWeight += sample.weight;
+                        if (cumulativeWeight >= totalWeight / 2) {
+                            return sample.deviation;
+                        }
+                    }
+                    return sorted[sorted.length - 1].deviation;
+                };
                 
                 CIRCADIAN_PERIODS.forEach(period => {
-                    const pooledDeviations = [];
+                    const pooledSamples = [];
                     const hoursCovered = [];
                     
                     for (let h = period.startHour; h < period.endHour; h++) {
                         const hourData = cleanResult.hourlyStats[h];
-                        if (hourData && hourData.values.length > 0) {
-                            pooledDeviations.push(...hourData.values);
+                        if (hourData && hourData.samples && hourData.samples.length > 0) {
+                            // Add samples with recency weight
+                            hourData.samples.forEach(sample => {
+                                pooledSamples.push({
+                                    deviation: sample.deviation,
+                                    time: sample.time,
+                                    weight: getRecencyWeight(sample.time)
+                                });
+                            });
                             hoursCovered.push({ hour: h, count: hourData.count });
                         }
                     }
                     
-                    const medianDev = pooledDeviations.length >= minSampleSize ? median(pooledDeviations) : null;
-                    const hasSufficientData = pooledDeviations.length >= minSampleSize;
+                    const hasSufficientData = pooledSamples.length >= minSampleSize;
+                    const weightedMedianDev = hasSufficientData ? weightedMedian(pooledSamples) : null;
                     
-                    // Determine signal
+                    // Also calculate unweighted for comparison/debugging
+                    const unweightedDeviations = pooledSamples.map(s => s.deviation);
+                    const unweightedMedian = unweightedDeviations.length >= minSampleSize ? median(unweightedDeviations) : null;
+                    
+                    // Determine signal based on weighted median
                     let signal = null;
                     if (hasSufficientData) {
-                        if (medianDev > 5) signal = 'HIGH';      // Basal too weak
-                        else if (medianDev < -5) signal = 'LOW'; // Basal too strong
+                        if (weightedMedianDev > 5) signal = 'HIGH';      // Basal too weak
+                        else if (weightedMedianDev < -5) signal = 'LOW'; // Basal too strong
                         else signal = 'NEUTRAL';
                     }
                     
                     periodAnalysis[period.name] = {
                         period: period,
-                        pooledCount: pooledDeviations.length,
-                        medianDeviation: medianDev,
-                        meanDeviation: pooledDeviations.length > 0 
-                            ? pooledDeviations.reduce((a, b) => a + b, 0) / pooledDeviations.length 
+                        pooledCount: pooledSamples.length,
+                        medianDeviation: weightedMedianDev,  // Now recency-weighted
+                        unweightedMedian: unweightedMedian,  // Keep for comparison
+                        meanDeviation: pooledSamples.length > 0 
+                            ? pooledSamples.reduce((a, b) => a + b.deviation, 0) / pooledSamples.length 
                             : null,
                         hoursCovered,
                         hasSufficientData,
                         signal,
-                        values: pooledDeviations
+                        values: unweightedDeviations  // Keep raw values for compatibility
                     };
                 });
                 
@@ -380,19 +452,30 @@
             
             /**
              * Distribute increments to hit target, prioritizing periods where adjustment helps.
-             * Respects protected hours (safety hours) which cannot receive increases.
+             * Respects protected hours (safety hours) and protected periods (entire periods with recent lows).
+             * When safetyCapActive is true, limits total to safetyTotal (no net increases above safety level).
              * 
              * @param {Array} hourlySchedule - 24-element array of hourly rates
              * @param {Array} recommendations - Signal recommendations from calculateSignalAdjustments
              * @param {Number} targetTotal - Target total daily basal
              * @param {Set} protectedHours - Set of hour strings (e.g., "00:00") that cannot receive increases
+             * @param {Number} ratioCap - Maximum allowed high:low ratio
+             * @param {Set} protectedPeriods - Set of period names that cannot receive increases
+             * @param {Number} safetyTotal - If set, cap total at this level (no net increase)
              * @returns {Object} Distribution results
              */
-            function distributeIncrements(hourlySchedule, recommendations, targetTotal, protectedHours = new Set(), ratioCap = 2.0) {
+            function distributeIncrements(hourlySchedule, recommendations, targetTotal, protectedHours = new Set(), ratioCap = 2.0, protectedPeriods = new Set(), safetyTotal = null) {
                 const schedule = [...hourlySchedule]; // Copy
                 const currentTotal = schedule.reduce((sum, r) => sum + r, 0);
-                const difference = targetTotal - currentTotal;
+                
+                // If safety cap is active, limit target to safety level
+                const effectiveTarget = safetyTotal !== null ? Math.min(targetTotal, safetyTotal) : targetTotal;
+                
+                const difference = effectiveTarget - currentTotal;
                 const incrementsNeeded = Math.round(difference / PUMP_INCREMENT);
+                
+                // Track if we capped due to safety
+                const safetyCapped = safetyTotal !== null && targetTotal > safetyTotal;
                 
                 if (incrementsNeeded === 0) {
                     return {
@@ -400,7 +483,9 @@
                         incrementsNeeded: 0,
                         appliedHours: [],
                         direction: 'none',
-                        finalTotal: currentTotal
+                        finalTotal: currentTotal,
+                        safetyCapped,
+                        protectedPeriods: Array.from(protectedPeriods)
                     };
                 }
                 
@@ -421,10 +506,25 @@
                     return ratio > ratioCap;
                 };
                 
+                // Helper to check if hour is in a protected period
+                const isHourInProtectedPeriod = (hour) => {
+                    const period = getPeriodForHour(hour);
+                    return period && protectedPeriods.has(period.name);
+                };
+                
                 // Log protection status
                 if (protectedHours.size > 0 && isIncrease) {
                     console.log(`    Signal Distribution: Protecting ${protectedHours.size} safety hours from increases`);
                     console.log(`    Protected hours: ${Array.from(protectedHours).sort().join(', ')}`);
+                }
+                
+                if (protectedPeriods.size > 0 && isIncrease) {
+                    console.log(`    Signal Distribution: Protecting ${protectedPeriods.size} periods from increases (resistant lows in window)`);
+                    console.log(`    Protected periods: ${Array.from(protectedPeriods).join(', ')}`);
+                }
+                
+                if (safetyCapped) {
+                    console.log(`    Signal Distribution: Safety cap active - capping total at ${safetyTotal.toFixed(2)}U (signal wanted ${targetTotal.toFixed(2)}U)`);
                 }
                 
                 console.log(`    Signal Distribution: Ratio cap ${ratioCap}:1 active`);
@@ -441,14 +541,15 @@
                         : (rec.analysis.medianDeviation || 0) > 0  // Increase matches positive
                 }));
                 
-                // Build spread-ordered hours within each period, excluding protected hours for increases
+                // Build spread-ordered hours within each period, excluding protected hours and periods for increases
                 periodInfo.forEach(p => {
                     const hours = [];
                     for (let h = p.period.startHour; h < p.period.endHour; h++) {
-                        // For increases, skip protected hours
+                        // For increases, skip protected hours and hours in protected periods
                         if (isIncrease) {
                             const hourStr = `${h.toString().padStart(2, '0')}:00`;
                             if (protectedHours.has(hourStr)) continue;
+                            if (isHourInProtectedPeriod(h)) continue;
                         }
                         hours.push(h);
                     }
@@ -532,7 +633,9 @@
                     matchingPeriods: matching.map(p => p.period.name),
                     nonMatchingPeriods: nonMatching.map(p => p.period.name),
                     finalTotal: schedule.reduce((sum, r) => sum + r, 0),
-                    ratioCapLimited
+                    ratioCapLimited,
+                    safetyCapped,
+                    protectedPeriods: Array.from(protectedPeriods)
                 };
             }
             
@@ -566,6 +669,8 @@
                     minSampleSize = 10,
                     analysisWindowDays = 7,
                     protectedHours = new Set(),
+                    protectedPeriods = new Set(),  // Periods with resistant lows (+ adjacent)
+                    safetyTotal = null,            // Cap total at this level if set
                     ratioCap = 2.0
                 } = options;
                 
@@ -617,8 +722,8 @@
                 const signalOnlyTotal = signalHourlySchedule.reduce((sum, r) => sum + r, 0);
                 const signalOnlyAnchor = (signalOnlyTotal / tdd) * 100;
                 
-                // Step 5: Distribute increments to hit target (with safety hour protection and ratio cap)
-                const distribution = distributeIncrements(signalHourlySchedule, recommendations, targetTotal, protectedHours, ratioCap);
+                // Step 5: Distribute increments to hit target (with safety hour protection, period protection, and ratio cap)
+                const distribution = distributeIncrements(signalHourlySchedule, recommendations, targetTotal, protectedHours, ratioCap, protectedPeriods, safetyTotal);
                 
                 const finalTotal = distribution.finalTotal;
                 const finalAnchor = (finalTotal / tdd) * 100;
@@ -659,7 +764,9 @@
                         direction: distribution.direction,
                         appliedHours: distribution.appliedHours,
                         matchingPeriods: distribution.matchingPeriods,
-                        nonMatchingPeriods: distribution.nonMatchingPeriods
+                        nonMatchingPeriods: distribution.nonMatchingPeriods,
+                        safetyCapped: distribution.safetyCapped,
+                        protectedPeriods: distribution.protectedPeriods || []
                     },
                     
                     totals: {
@@ -679,6 +786,8 @@
                             ? safetyAdjustedSchedule[idx].value
                             : safetyAdjustedSchedule[idx];
                         const originalRate = getScheduleValueForHour(basalSchedule, idx);
+                        const period = getPeriodForHour(idx);
+                        const isProtectedPeriod = period && protectedPeriods.has(period.name);
                         
                         return {
                             hour: entry.time,
@@ -687,7 +796,9 @@
                             change: (entry.value - originalRate).toFixed(3),
                             hasChange: Math.abs(entry.value - originalRate) > 0.001,
                             safetyValue: safetyRate.toFixed(3),
-                            isSignalChange: distribution.appliedHours.some(a => a.hour === idx)
+                            isSignalChange: distribution.appliedHours.some(a => a.hour === idx),
+                            isProtectedPeriod: isProtectedPeriod,
+                            periodName: period ? period.name : 'Unknown'
                         };
                     })
                 };
@@ -3792,6 +3903,65 @@
                 console.log(`  Safety adjustment: ${originalTotal.toFixed(2)}U  ->  ${safetyAdjustedTotal.toFixed(2)}U (-${totalSafetyReduction.toFixed(2)}U/day)`);
                 
                 // ============================================================
+                // STEP 2b: Scan 7-day window for resistant lows (period protection)
+                // ============================================================
+                console.log('\n  Step 2b: Scanning 7-day window for resistant low periods');
+                
+                // Calculate 7-day window start
+                const now = new Date();
+                const sevenDayStart = new Date(now.getTime() - basalSignalWindow * 24 * 60 * 60 * 1000);
+                
+                // Find ALL resistant lows in 7-day window
+                const resistantLows7Day = [];
+                nightscoutData.glucose.forEach(reading => {
+                    const readingTime = new Date(reading.dateString);
+                    if (readingTime < sevenDayStart) return;
+                    
+                    if (reading.sgv <= 70) {
+                        let nearestIOB = null;
+                        let minTimeDiff = Infinity;
+                        
+                        iobData.forEach(iob => {
+                            const timeDiff = Math.abs(iob.time - readingTime);
+                            if (timeDiff < 10 * 60 * 1000 && timeDiff < minTimeDiff) {
+                                minTimeDiff = timeDiff;
+                                nearestIOB = iob;
+                            }
+                        });
+                        
+                        if (nearestIOB && nearestIOB.totalIOB < 0) {
+                            const hour = readingTime.getHours();
+                            const period = BasalSignalModule.getPeriodForHour(hour);
+                            resistantLows7Day.push({ 
+                                reading, 
+                                hour,
+                                period: period ? period.name : 'Unknown',
+                                date: readingTime.toLocaleDateString()
+                            });
+                        }
+                    }
+                });
+                
+                // Get unique periods with resistant lows
+                const periodsWithLows = [...new Set(resistantLows7Day.map(l => l.period))];
+                
+                // Calculate protected periods (periods with lows + adjacent periods)
+                const protectedPeriods = BasalSignalModule.getProtectedPeriods(periodsWithLows);
+                
+                // Determine if safety cap should be active (any resistant lows in window)
+                const safetyCapActive = resistantLows7Day.length > 0;
+                const safetyTotalCap = safetyCapActive ? safetyAdjustedTotal : null;
+                
+                if (resistantLows7Day.length > 0) {
+                    console.log(`  Found ${resistantLows7Day.length} resistant lows in ${basalSignalWindow}-day window`);
+                    console.log(`  Periods with lows: ${periodsWithLows.join(', ')}`);
+                    console.log(`  Protected periods (no increases): ${Array.from(protectedPeriods).join(', ')}`);
+                    console.log(`  Safety cap active: total capped at ${safetyAdjustedTotal.toFixed(2)}U`);
+                } else {
+                    console.log(`  No resistant lows in ${basalSignalWindow}-day window - full optimization enabled`);
+                }
+                
+                // ============================================================
                 // STEP 3: Apply 35% TDD optimization
                 // ============================================================
                 console.log('\n  Step 3: Applying 35% TDD Optimization');
@@ -3873,6 +4043,8 @@
                     minSampleSize: 10,
                     analysisWindowDays: basalSignalWindow,  // Use basal-specific window
                     protectedHours: safetyHoursSet,
+                    protectedPeriods: protectedPeriods,    // Periods with resistant lows (+ adjacent)
+                    safetyTotal: safetyTotalCap,           // Cap total at safety level if lows present
                     ratioCap: basalRatioCap
                 });
                 
@@ -3948,6 +4120,8 @@
                     hourlyDisplayData = finalSchedule.map((entry, idx) => {
                         const originalRate = BasalSignalModule.getScheduleValueForHour(basalSchedule, idx);
                         const hour = parseInt(entry.time.split(':')[0]);
+                        const period = BasalSignalModule.getPeriodForHour(hour);
+                        const isProtectedPeriod = period && protectedPeriods.has(period.name);
                         return {
                             hour: entry.time,
                             oldValue: originalRate.toFixed(3),
@@ -3956,14 +4130,19 @@
                             hasChange: Math.abs(entry.value - originalRate) > 0.001,
                             isSafetyChange: safetyHourlyReductions[hour] !== undefined,
                             isRatioConstrained: ratioConstraintInfo.hoursDecreased?.includes(entry.time) || 
-                                               ratioConstraintInfo.hoursIncreased?.includes(entry.time)
+                                               ratioConstraintInfo.hoursIncreased?.includes(entry.time),
+                            isProtectedPeriod: isProtectedPeriod,
+                            periodName: period ? period.name : 'Unknown'
                         };
                     });
                 } else {
-                    hourlyDisplayData = signalResult.hourlyDisplayData.map((h, idx) => ({
-                        ...h,
-                        isSafetyChange: safetyHourlyReductions[h.hour] !== undefined
-                    }));
+                    hourlyDisplayData = signalResult.hourlyDisplayData.map((h, idx) => {
+                        const hour = parseInt(h.hour.split(':')[0]);
+                        return {
+                            ...h,
+                            isSafetyChange: safetyHourlyReductions[h.hour] !== undefined
+                        };
+                    });
                 }
                 
                 const totalChange = finalTotal - originalTotal;
@@ -3988,10 +4167,19 @@
                 signalResult.signalAnalysis.periods.forEach(p => {
                     if (p.hasSufficientData && p.signal !== 'NEUTRAL') {
                         const arrow = p.signal === 'HIGH' ? '↑' : '↓';
-                        detailsText += `${p.emoji} ${p.name}: ${p.medianDeviation >= 0 ? '+' : ''}${p.medianDeviation.toFixed(1)} mg/dL ${arrow}\n`;
+                        const protectedMark = protectedPeriods.has(p.name) ? ' 🔒' : '';
+                        detailsText += `${p.emoji} ${p.name}: ${p.medianDeviation >= 0 ? '+' : ''}${p.medianDeviation.toFixed(1)} mg/dL ${arrow}${protectedMark}\n`;
                     }
                 });
-                detailsText += `Signals suggest: ${signalResult.totals.signalPercent.toFixed(1)}% of TDD\n\n`;
+                detailsText += `Signals suggest: ${signalResult.totals.signalPercent.toFixed(1)}% of TDD\n`;
+                
+                // Protected periods info
+                if (protectedPeriods.size > 0) {
+                    detailsText += `\n**🔒 Protected Periods** (resistant lows in ${basalSignalWindow}-day window)\n`;
+                    detailsText += `${Array.from(protectedPeriods).join(', ')}\n`;
+                    detailsText += `Signal increases blocked in these periods. Safety reductions applied.\n`;
+                }
+                detailsText += '\n';
                 
                 // Increment distribution
                 if (Math.abs(signalResult.incrementDistribution.incrementsNeeded) > 0) {
@@ -4023,7 +4211,25 @@
                 detailsText += `TDD: ${tdd.toFixed(2)}U (${tddSource})\n`;
                 detailsText += `Target: ${cappedTargetBasal.toFixed(2)}U (${actualTargetPercent.toFixed(1)}% of TDD)\n`;
                 detailsText += `Original: ${originalTotal.toFixed(2)}U  ->  Final: ${finalTotal.toFixed(2)}U\n`;
-                detailsText += `Net: ${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)}U/day`;
+                detailsText += `Net: ${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)}U/day\n\n`;
+                
+                // Add hourly schedule table
+                detailsText += `**Proposed Hourly Schedule**\n`;
+                detailsText += `| Hour | Current | Proposed | Change | Type |\n`;
+                detailsText += `|------|---------|----------|--------|------|\n`;
+                hourlyDisplayData.forEach(h => {
+                    const changeNum = parseFloat(h.change);
+                    const changeStr = changeNum === 0 ? '—' : (changeNum > 0 ? '+' : '') + changeNum.toFixed(2);
+                    let typeStr = '—';
+                    if (h.isSafetyChange) typeStr = 'Safety ↓';
+                    else if (h.isProtectedPeriod && changeNum === 0) typeStr = '🔒 Protected';
+                    else if (h.isSignalChange && changeNum !== 0) typeStr = 'Signal';
+                    else if (h.isRatioConstrained) typeStr = 'Ratio';
+                    
+                    if (changeNum !== 0 || h.isProtectedPeriod) {
+                        detailsText += `| ${h.hour} | ${h.oldValue} | ${h.newValue} | ${changeStr} | ${typeStr} |\n`;
+                    }
+                });
                 
                 const hasSafetyReductions = safetyEventSummary && safetyEventSummary.totalLows > 0;
                 const percentChange = ((totalChange) / originalTotal * 100).toFixed(1);
@@ -4057,6 +4263,8 @@
                     signalTotals: signalResult.totals,
                     patternAnalysis: { before: analyzeBasalPattern(basalSchedule), after: analyzeBasalPattern(finalSchedule) },
                     ratioConstrained: ratioWasConstrained,
+                    protectedPeriods: Array.from(protectedPeriods),
+                    safetyCapActive: safetyCapActive,
                     ...(ratioConstraintInfo && { ratioConstraintInfo }),
                     ...(safetyNote && { safetyNote })
                 });
