@@ -76,6 +76,7 @@
         const FindingType = {
             DIRECT_MEAL_LOW: 'direct_meal_low',
             TRANSIENT_HIGH_CRASH: 'transient_high_crash',
+            TRANSIENT_HIGH_LOW: 'transient_high_low', // Meal → Brief spike → Crash (no corrections)
             ISF_INDUCED_LOW: 'isf_induced_low',
             UNEXPLAINED_LOW: 'unexplained_low',
             RESISTANT_LOW: 'resistant_low',
@@ -126,6 +127,11 @@
             highThreshold: 180,
             targetBG: 110,
             
+            // URGENCY thresholds - severe events that warrant immediate action
+            urgentLowThreshold: 55,      // Severe low - always address
+            urgentHighThreshold: 250,    // Severe high - address if extended
+            urgentHighDurationHours: 3,  // How long high must persist
+            
             // Adjustment limits
             maxCRChangeHigh: 0.03,
             maxCRChangeLow: 0.075,
@@ -168,6 +174,24 @@
             { name: 'Evening', emoji: '🌆', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
             { name: 'Sleep Onset', emoji: '😴', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
         ];
+        
+        // Independent time blocks for multi-action support
+        // Changes in different blocks don't compound with each other
+        const TIME_BLOCKS = [
+            { name: 'Overnight', startHour: 0, endHour: 6 },
+            { name: 'Morning', startHour: 6, endHour: 12 },
+            { name: 'Afternoon', startHour: 12, endHour: 18 },
+            { name: 'Evening', startHour: 18, endHour: 24 }
+        ];
+        
+        // Helper to get time block for a schedule time
+        const getTimeBlock = (scheduleTime) => {
+            if (!scheduleTime || scheduleTime === 'Multiple' || scheduleTime === 'All') return 'General';
+            const hour = parseInt(scheduleTime.split(':')[0]);
+            if (isNaN(hour)) return 'General';
+            const block = TIME_BLOCKS.find(b => hour >= b.startHour && hour < b.endHour);
+            return block ? block.name : 'General';
+        };
 
         // =========================================================================
         // CHANGE TRACKER MODULE
@@ -664,11 +688,20 @@
                         compoundEffect: null,
                         rootCause: 'Conflicting findings at same schedule slot',
                         evidenceSummary: `Both strengthening (${conflict.strengthenCount}) and weakening (${conflict.weakenCount}) patterns detected`,
+                        evidenceDetails: [
+                            { icon: '↑', detail: `Strengthen: ${conflict.strengthenTypes}`, type: 'conflict' },
+                            { icon: '↓', detail: `Weaken: ${conflict.weakenTypes}`, type: 'conflict' }
+                        ],
                         conflictsWith: [],
                         blockedBy: `High variability - ${conflict.details}. Hold changes until patterns stabilize.`,
                         confidence: 0.3,
                         isSlotConflict: true,
-                        conflictDetails: conflict
+                        conflictDetails: conflict,
+                        // BUG-022: Conflicts are structural - always current
+                        hasStructuralFinding: true,
+                        hasRecentEvents: true,
+                        hasLast3DayEvents: true,
+                        bestRecencyTier: 'CURRENT'
                     });
                 });
                 
@@ -691,10 +724,20 @@
                         compoundEffect: null,
                         rootCause: `Basal ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`,
                         evidenceSummary: `Max ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}, Min ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}. Extreme ratios can mask CR/ISF issues.`,
+                        evidenceDetails: [
+                            { icon: '●', detail: `Maximum rate: ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}`, type: 'structural' },
+                            { icon: '●', detail: `Minimum rate: ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}`, type: 'structural' },
+                            { icon: '⚠️', detail: `Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`, type: 'structural' }
+                        ],
                         conflictsWith: [],
                         blockedBy: null,
                         confidence: 0.95,
-                        isBasalRatioWarning: true
+                        isBasalRatioWarning: true,
+                        // BUG-022: Basal ratio is structural - always current
+                        hasStructuralFinding: true,
+                        hasRecentEvents: true,
+                        hasLast3DayEvents: true,
+                        bestRecencyTier: 'CURRENT'
                     });
                 }
                 
@@ -834,17 +877,60 @@
             calculateConfidence(finding, bodyState) {
                 let base = finding.severity || 0.5;
                 
-                // Recency factor - minor adjustment
-                const recency = finding.recencyWeight || 1.0;
-                base *= Math.max(recency, 0.7); // Floor at 0.7 to prevent over-penalizing older events
+                // Structural findings (basal signals, ratio warnings) skip recency penalties
+                if (finding.isStructural) {
+                    // Apply only state factor for structural findings
+                    const stateMultipliers = {
+                        [BodyStateType.STABLE]: 1.0,
+                        [BodyStateType.RECOVERY]: 0.85,
+                        [BodyStateType.HIGH_VARIABILITY]: 0.7,
+                        [BodyStateType.TRANSIENT_RESISTANCE]: 0.9,
+                        [BodyStateType.TRANSIENT_SENSITIVITY]: 0.9,
+                        [BodyStateType.OVERRIDE_ACTIVE]: 0.85
+                    };
+                    base *= stateMultipliers[bodyState.state] || 1.0;
+                    return Math.min(base, 1.0);
+                }
                 
-                // Sample size factor - less aggressive penalties
-                if (finding.similarEventsCount >= CONFIG.minEventsHighConfidence) {
+                // RECENCY FACTOR - New tier-based system (BUG-022)
+                // CURRENT (last 24h): full weight
+                // RECENT (1-3 days): 50% weight
+                // STALE (3-7 days): 20% weight
+                // EXPIRED (>7 days): effectively 0
+                const recencyTier = finding.recencyTier || 'UNKNOWN';
+                const recencyMultipliers = {
+                    'CURRENT': 1.0,    // Full priority
+                    'RECENT': 0.5,     // Include but defer to CURRENT
+                    'STALE': 0.2,      // Background context only
+                    'EXPIRED': 0.05,   // Essentially ignore
+                    'UNKNOWN': 0.5     // Fallback
+                };
+                base *= recencyMultipliers[recencyTier] || 0.5;
+                
+                // Bonus for having recent events even if older events exist
+                if (finding.eventsLast24h > 0) {
+                    // Recent activity confirms pattern - boost confidence
+                    base *= 1.2;
+                } else if (finding.eventsLast3Days > 0) {
+                    // Somewhat recent - minor boost
                     base *= 1.0;
-                } else if (finding.similarEventsCount >= CONFIG.minEventsMediumConfidence) {
-                    base *= 0.9;  // Was 0.85
                 } else {
-                    base *= 0.8;  // Was 0.7 - single events still meaningful
+                    // No recent events - this pattern may have resolved
+                    base *= 0.5;
+                }
+                
+                // Sample size factor - weighted toward recent events
+                const recentEvents = finding.eventsLast24h || 0;
+                const totalEvents = finding.similarEventsCount || 1;
+                
+                if (recentEvents >= CONFIG.minEventsHighConfidence) {
+                    base *= 1.0;  // Multiple recent events = high confidence
+                } else if (recentEvents >= 1) {
+                    base *= 0.9;  // At least one recent event
+                } else if (totalEvents >= CONFIG.minEventsHighConfidence) {
+                    base *= 0.6;  // Many old events but none recent
+                } else {
+                    base *= 0.5;  // Few events, none recent
                 }
                 
                 // Stability factor - only apply if oscillation is truly detected
@@ -854,21 +940,18 @@
                         finding.scheduleTime
                     );
                     if (velocity.oscillationDetected) {
-                        base *= 0.6;  // Was 0.5 - still significant penalty for oscillation
+                        base *= 0.6;  // Significant penalty for oscillation
                     }
-                    // Removed consecutiveSameDirection penalty - that's a good sign, not bad
                 }
                 
-                // State factor - adjusted for more reasonable output
-                // Note: OVERRIDE_ACTIVE recommendations are already marked informational
-                // No need to also dramatically reduce confidence scores
+                // State factor
                 const stateMultipliers = {
                     [BodyStateType.STABLE]: 1.0,
-                    [BodyStateType.RECOVERY]: 0.85,           // Was 0.7
-                    [BodyStateType.HIGH_VARIABILITY]: 0.7,    // Was 0.6
-                    [BodyStateType.TRANSIENT_RESISTANCE]: 0.9, // Was 0.8
-                    [BodyStateType.TRANSIENT_SENSITIVITY]: 0.9, // Was 0.8
-                    [BodyStateType.OVERRIDE_ACTIVE]: 0.85     // Was 0.5 - informational flag is sufficient
+                    [BodyStateType.RECOVERY]: 0.85,
+                    [BodyStateType.HIGH_VARIABILITY]: 0.7,
+                    [BodyStateType.TRANSIENT_RESISTANCE]: 0.9,
+                    [BodyStateType.TRANSIENT_SENSITIVITY]: 0.9,
+                    [BodyStateType.OVERRIDE_ACTIVE]: 0.85
                 };
                 base *= stateMultipliers[bodyState.state] || 1.0;
                 
@@ -969,6 +1052,8 @@
                 switch (finding.type) {
                     case FindingType.DIRECT_MEAL_LOW:
                         return `Safety: ${time} Meal-Induced Low`;
+                    case FindingType.TRANSIENT_HIGH_LOW:
+                        return `Safety: ${time} Spike & Crash`;
                     case FindingType.ISF_INDUCED_LOW:
                         return `Safety: ${time} Correction-Induced Low`;
                     case FindingType.UNEXPLAINED_LOW:
@@ -989,6 +1074,7 @@
             isSafetyFinding(finding) {
                 const safetyTypes = [
                     FindingType.DIRECT_MEAL_LOW,
+                    FindingType.TRANSIENT_HIGH_LOW,
                     FindingType.TRANSIENT_HIGH_CRASH,
                     FindingType.ISF_INDUCED_LOW,
                     FindingType.UNEXPLAINED_LOW,
@@ -1064,6 +1150,7 @@
                     compoundEffect: {},
                     rootCause: this.generateRootCause(findings),
                     evidenceSummary: this.generateEvidenceSummary(findings),
+                    evidenceDetails: this.generateEvidenceDetails(findings),
                     conflictsWith: [],
                     blockedBy: null,
                     confidence,
@@ -1125,6 +1212,9 @@
                 if (types.includes(FindingType.DIRECT_MEAL_LOW)) {
                     return 'Meals causing direct lows without prior highs - CR too strong';
                 }
+                if (types.includes(FindingType.TRANSIENT_HIGH_LOW)) {
+                    return 'Meals causing spike then crash (no corrections) - CR too strong';
+                }
                 if (types.includes(FindingType.POST_MEAL_HIGH)) {
                     return 'Post-meal highs requiring corrections - CR too weak';
                 }
@@ -1145,10 +1235,70 @@
             },
             
             generateEvidenceSummary(findings) {
-                const eventCount = findings.reduce((sum, f) => sum + (f.similarEventsCount || 1), 0);
-                const days = findings.reduce((sum, f) => sum + (f.daysWithPattern || 1), 0) / findings.length;
+                const totalEvents = findings.reduce((sum, f) => sum + (f.similarEventsCount || 1), 0);
+                const recentEvents = findings.reduce((sum, f) => sum + (f.eventsLast24h || 0), 0);
+                const last3DayEvents = findings.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0);
                 
-                return `${eventCount} event(s) over ${Math.round(days)} day(s)`;
+                // Check if any findings are structural (always current)
+                const hasStructural = findings.some(f => f.isStructural);
+                if (hasStructural) {
+                    return `Current analysis ✓`;
+                }
+                
+                // Find most recent event across all findings
+                let mostRecentHours = null;
+                findings.forEach(f => {
+                    const hours = f.hoursSinceMostRecent;
+                    if (hours !== null && hours !== undefined && !isNaN(hours)) {
+                        if (mostRecentHours === null || hours < mostRecentHours) {
+                            mostRecentHours = hours;
+                        }
+                    }
+                });
+                
+                // Build summary with recency info
+                if (recentEvents > 0) {
+                    if (recentEvents === totalEvents) {
+                        return `${totalEvents} event(s) in last 24h ✓`;
+                    } else {
+                        return `${recentEvents} recent + ${totalEvents - recentEvents} older event(s)`;
+                    }
+                } else if (last3DayEvents > 0) {
+                    return `${last3DayEvents} event(s) in last 3 days (${totalEvents - last3DayEvents} older)`;
+                } else if (mostRecentHours !== null && !isNaN(mostRecentHours)) {
+                    const daysAgo = Math.round(mostRecentHours / 24);
+                    return `⚠️ ${totalEvents} event(s) - most recent ${daysAgo} day(s) ago`;
+                } else {
+                    // Fallback when we can't determine recency
+                    const days = findings.reduce((sum, f) => sum + (f.daysWithPattern || 1), 0) / findings.length;
+                    return `${totalEvents} event(s) over ~${Math.round(days)} day(s) (recency unknown)`;
+                }
+            },
+            
+            /**
+             * Generate detailed evidence list showing actual events
+             */
+            generateEvidenceDetails(findings) {
+                // Sort findings by recency (most recent first)
+                const sorted = [...findings].sort((a, b) => {
+                    const aHours = a.hoursSinceMostRecent ?? 999;
+                    const bHours = b.hoursSinceMostRecent ?? 999;
+                    return aHours - bHours;
+                });
+                
+                // Extract the details from each finding
+                return sorted.map(f => {
+                    // Add recency indicator
+                    const icon = f.eventsLast24h > 0 ? '✓' : 
+                                f.eventsLast3Days > 0 ? '○' : 
+                                f.isStructural ? '●' : '⚠️';
+                    return {
+                        icon,
+                        detail: f.details || 'No details available',
+                        type: f.type,
+                        severity: f.severity
+                    };
+                }).slice(0, 5); // Limit to 5 most relevant
             },
             
             calculateCompoundEffect(bundle) {
@@ -1256,53 +1406,151 @@
             },
             
             prioritize(bundles, bodyState) {
-                // Sort by tier, then confidence
+                // Step 1: Add metadata to each bundle
+                bundles.forEach(bundle => {
+                    // Check if bundle is already marked as structural (conflict/ratio bundles)
+                    const isPreMarkedStructural = bundle.isSlotConflict || 
+                                                  bundle.isBasalRatioWarning || 
+                                                  bundle.hasStructuralFinding;
+                    
+                    if (isPreMarkedStructural) {
+                        bundle.hasStructuralFinding = true;
+                        bundle.hasRecentEvents = true;
+                        bundle.hasLast3DayEvents = true;
+                        bundle.bestRecencyTier = 'CURRENT';
+                        bundle.recencyScore = 100;
+                    } else {
+                        // Calculate recency score from findings
+                        const findings = bundle.findings || [];
+                        const totalRecent = findings.reduce((sum, f) => sum + (f.eventsLast24h || 0), 0);
+                        const totalLast3Days = findings.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0);
+                        const hasStructural = findings.some(f => f.isStructural);
+                        
+                        let bestTier = 'EXPIRED';
+                        findings.forEach(f => {
+                            const tier = f.recencyTier || 'UNKNOWN';
+                            if (tier === 'CURRENT') bestTier = 'CURRENT';
+                            else if (tier === 'RECENT' && bestTier !== 'CURRENT') bestTier = 'RECENT';
+                            else if (tier === 'STALE' && bestTier === 'EXPIRED') bestTier = 'STALE';
+                        });
+                        
+                        bundle.recencyScore = totalRecent * 10 + totalLast3Days;
+                        bundle.bestRecencyTier = hasStructural ? 'CURRENT' : bestTier;
+                        bundle.hasRecentEvents = hasStructural || totalRecent > 0;
+                        bundle.hasLast3DayEvents = hasStructural || totalLast3Days > 0;
+                        bundle.hasStructuralFinding = hasStructural;
+                    }
+                    
+                    // Assign time block based on first recommendation's schedule time
+                    const scheduleTime = bundle.recommendations?.[0]?.scheduleTime || 
+                                        bundle.findings?.[0]?.scheduleTime || 
+                                        'General';
+                    bundle.timeBlock = getTimeBlock(scheduleTime);
+                    
+                    // Check for URGENT severity (severe lows)
+                    bundle.isUrgent = false;
+                    bundle.urgentReason = null;
+                    
+                    const findings = bundle.findings || [];
+                    for (const finding of findings) {
+                        // Check for severe low
+                        const events = finding.events || [];
+                        for (const event of events) {
+                            if (event.lowBG && event.lowBG < CONFIG.urgentLowThreshold) {
+                                bundle.isUrgent = true;
+                                bundle.urgentReason = `Severe low (${event.lowBG} mg/dL)`;
+                                break;
+                            }
+                        }
+                        if (bundle.isUrgent) break;
+                    }
+                });
+                
+                // Step 2: Sort by urgency, then tier, then recency, then confidence
                 bundles.sort((a, b) => {
+                    // Urgent first
+                    if (a.isUrgent !== b.isUrgent) return a.isUrgent ? -1 : 1;
+                    // Then by tier
                     if (a.tier !== b.tier) return a.tier - b.tier;
+                    // Then by recency
+                    if (a.hasRecentEvents !== b.hasRecentEvents) return a.hasRecentEvents ? -1 : 1;
+                    if (a.hasLast3DayEvents !== b.hasLast3DayEvents) return a.hasLast3DayEvents ? -1 : 1;
+                    // Then by confidence
                     return b.confidence - a.confidence;
                 });
                 
-                // Check for Tier 2 blockers (basal ratio warning)
+                // Step 3: Check for blockers
                 const hasBasalRatioWarning = bundles.some(b => b.isBasalRatioWarning);
                 
-                // Mark primary - but check compound effect threshold first
-                let primarySet = false;
                 bundles.forEach(bundle => {
-                    // Check if compound effect exceeds BLOCK threshold
+                    // Compound effect blocking (only within same time block now handled separately)
                     const compoundBlocked = bundle.compoundEffect && 
                         bundle.compoundEffect.warning === 'BLOCKED';
                     
-                    if (compoundBlocked) {
+                    if (compoundBlocked && !bundle.isUrgent) {
                         bundle.blockedBy = `Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) exceeds safe threshold. Address findings individually.`;
                     }
                     
-                    // BUG-014: Tier 2 (basal ratio) blocks Tier 3-4 CR/ISF strengthening
-                    if (hasBasalRatioWarning && 
-                        bundle.tier >= Tier.SIGNIFICANT_BASAL && // Tier 3 or 4
+                    // Stale blocking (skip for urgent)
+                    if (!bundle.isUrgent && !bundle.hasRecentEvents && !bundle.hasLast3DayEvents && !bundle.hasStructuralFinding) {
+                        if (!bundle.blockedBy) {
+                            bundle.blockedBy = `No recent events (pattern may have resolved)`;
+                            bundle.isStale = true;
+                        }
+                    }
+                    
+                    // Basal ratio blocking (skip for urgent safety)
+                    if (!bundle.isUrgent && hasBasalRatioWarning && 
+                        bundle.tier >= Tier.SIGNIFICANT_BASAL &&
                         !bundle.isBasalRatioWarning && 
                         !bundle.isSlotConflict &&
                         bundle.recommendations.some(r => r.param === 'CR' || r.param === 'ISF')) {
                         
-                        // Only block if it involves CR/ISF strengthening (more insulin)
                         const hasStrengthening = bundle.recommendations.some(r => 
-                            (r.param === 'CR' && r.changePercent < 0) || // Lower CR = more insulin
-                            (r.param === 'ISF' && r.changePercent < 0)   // Lower ISF = more insulin
+                            (r.param === 'CR' && r.changePercent < 0) ||
+                            (r.param === 'ISF' && r.changePercent < 0)
                         );
                         
                         if (hasStrengthening && !bundle.blockedBy) {
-                            bundle.blockedBy = `Blocked by Tier 2 (basal ratio). Normalize basal ratio first - extreme ratios can mask CR/ISF issues.`;
+                            bundle.blockedBy = `Blocked by Tier 2 (basal ratio). Normalize basal ratio first.`;
                         }
                     }
+                });
+                
+                // Step 4: Multi-action PRIMARY selection
+                // - All URGENT bundles become PRIMARY (regardless of time block)
+                // - Then one non-urgent PRIMARY per time block
+                const primaryByBlock = {};
+                
+                bundles.forEach(bundle => {
+                    if (bundle.blockedBy || 
+                        bundle.recommendations.length === 0 ||
+                        bodyState.state === BodyStateType.OVERRIDE_ACTIVE) {
+                        bundle.priority = 'REFERENCE';
+                        return;
+                    }
                     
-                    if (!primarySet && 
-                        !bundle.blockedBy && 
-                        bundle.recommendations.length > 0 &&
-                        bodyState.state !== BodyStateType.OVERRIDE_ACTIVE) {
+                    // URGENT always becomes PRIMARY
+                    if (bundle.isUrgent) {
                         bundle.priority = 'PRIMARY';
-                        primarySet = true;
+                        return;
+                    }
+                    
+                    // One non-urgent PRIMARY per time block
+                    const block = bundle.timeBlock;
+                    if (!primaryByBlock[block]) {
+                        bundle.priority = 'PRIMARY';
+                        primaryByBlock[block] = bundle;
                     } else {
                         bundle.priority = 'REFERENCE';
                     }
+                });
+                
+                // Log multi-action summary
+                const primaries = bundles.filter(b => b.priority === 'PRIMARY');
+                console.log('Multi-action selection:', {
+                    urgent: primaries.filter(b => b.isUrgent).map(b => b.name),
+                    byBlock: Object.entries(primaryByBlock).map(([block, b]) => `${block}: ${b.name}`)
                 });
                 
                 return bundles;
@@ -1316,7 +1564,23 @@
         const formatTimeForDisplay = (timeStr) => {
             if (!timeStr) return '';
             const dt = new Date(timeStr);
-            return dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            const now = new Date();
+            const isToday = dt.toDateString() === now.toDateString();
+            const yesterday = new Date(now);
+            yesterday.setDate(yesterday.getDate() - 1);
+            const isYesterday = dt.toDateString() === yesterday.toDateString();
+            
+            const timeOnly = dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            
+            if (isToday) {
+                return `${timeOnly} today`;
+            } else if (isYesterday) {
+                return `${timeOnly} yesterday`;
+            } else {
+                // Show month/day for older dates
+                const dateStr = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                return `${timeOnly} on ${dateStr}`;
+            }
         };
         
         const getEventId = (event) => {
@@ -1445,6 +1709,172 @@
         
         const PatternDetectors = {
             /**
+             * DETECTOR 1b: Transient High with Subsequent Low
+             * Priority: 1 (Safety First - More Specific Pattern)
+             * Pattern: Meal -> Brief High >180 (<60 min) -> Low (within 3 hours) with NO corrections
+             * Conclusion: CR too strong (too much upfront insulin caused brief spike then crash)
+             * Output: Finding of type TRANSIENT_HIGH_LOW
+             */
+            detectTransientHighWithLow(lowProblems, nightscoutData, crSchedule, claimedEvents, analysisWindow) {
+                const findings = [];
+                
+                lowProblems.forEach(low => {
+                    const lowId = getEventId(low);
+                    if (claimedEvents.lows.has(lowId)) return;
+                    
+                    const lowTime = new Date(low.localTime || low.time);
+                    const fourHoursAgo = new Date(lowTime - 4 * 60 * 60 * 1000);
+                    const twentyMinutesAgo = new Date(lowTime - 20 * 60 * 1000);
+                    
+                    // Find meals in 20min-4hr lookback window
+                    const recentMeals = nightscoutData.treatments.filter(t => {
+                        if (!t.created_at || !t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution) return false;
+                        const tTime = new Date(t.created_at);
+                        return tTime >= fourHoursAgo && tTime <= twentyMinutesAgo;
+                    });
+                    
+                    if (recentMeals.length === 0) return;
+                    
+                    // Check EACH meal for transient high pattern
+                    let bestMatch = null;
+                    let bestMatchScore = 0;
+                    
+                    for (const meal of recentMeals) {
+                        const mealId = getEventId(meal);
+                        if (claimedEvents.meals.has(mealId)) continue;
+                        
+                        const mealTime = new Date(meal.created_at);
+                        
+                        // Find BG readings between this meal and the low
+                        const bgBetweenMealAndLow = nightscoutData.glucose.filter(reading => {
+                            const rTime = new Date(reading.dateString);
+                            return rTime > mealTime && rTime < lowTime;
+                        });
+                        
+                        // Check for high readings >180
+                        const highReadings = bgBetweenMealAndLow.filter(r => r.sgv > 180);
+                        if (highReadings.length === 0) continue; // No high after this meal
+                        
+                        // Calculate high duration
+                        const firstHigh = highReadings.reduce((earliest, r) => {
+                            return new Date(r.dateString) < new Date(earliest.dateString) ? r : earliest;
+                        });
+                        const lastHigh = highReadings.reduce((latest, r) => {
+                            return new Date(r.dateString) > new Date(latest.dateString) ? r : latest;
+                        });
+                        
+                        const firstHighTime = new Date(firstHigh.dateString);
+                        const lastHighTime = new Date(lastHigh.dateString);
+                        const highDurationMinutes = (lastHighTime - firstHighTime) / (1000 * 60);
+                        const peakBG = Math.max(...highReadings.map(r => r.sgv));
+                        
+                        // Check if high was TRANSIENT (<60 minutes)
+                        const HIGH_DURATION_THRESHOLD = 60;
+                        if (highDurationMinutes >= HIGH_DURATION_THRESHOLD) continue; // Sustained high - not transient
+                        
+                        // Check if low occurred within 3 hours of high ending
+                        const timeFromHighToLowHours = (lowTime - lastHighTime) / (1000 * 60 * 60);
+                        const TIME_TO_LOW_THRESHOLD = 3;
+                        if (timeFromHighToLowHours > TIME_TO_LOW_THRESHOLD) continue; // Low too far after high
+                        
+                        // Check for corrections between high and low - if corrections were given, skip
+                        // (Let Detector 2 handle correction overcorrection)
+                        const correctionsDuringPeriod = nightscoutData.treatments.filter(t => {
+                            if (!isTrueCorrection(t, nightscoutData.treatments)) return false;
+                            const tTime = new Date(t.created_at);
+                            return tTime >= firstHighTime && tTime <= lowTime;
+                        });
+                        
+                        if (correctionsDuringPeriod.length > 0) continue; // Corrections given - not pure meal effect
+                        
+                        // This meal has the transient high pattern!
+                        // Score based on peak BG and timing
+                        const score = peakBG + (100 / (timeFromHighToLowHours + 0.1));
+                        
+                        if (score > bestMatchScore) {
+                            bestMatch = {
+                                meal: meal,
+                                mealId: mealId,
+                                highReadings: highReadings,
+                                firstHigh: firstHigh,
+                                lastHigh: lastHigh,
+                                highDurationMinutes: highDurationMinutes,
+                                peakBG: peakBG,
+                                timeFromHighToLowHours: timeFromHighToLowHours
+                            };
+                            bestMatchScore = score;
+                        }
+                    }
+                    
+                    if (!bestMatch) return;
+                    
+                    // TRANSIENT HIGH DETECTED!
+                    const crEntry = getCRForTime(bestMatch.meal.created_at, crSchedule);
+                    
+                    // Claim events - claim ALL lows within 15 min window to prevent duplicates
+                    claimedEvents.meals.add(bestMatch.mealId);
+                    claimedEvents.lows.add(lowId);
+                    // Also claim nearby lows (same low event may have multiple CGM readings)
+                    const lowTimeMs = new Date(low.localTime || low.time).getTime();
+                    lowProblems.forEach(otherLow => {
+                        const otherTimeMs = new Date(otherLow.localTime || otherLow.time).getTime();
+                        if (Math.abs(otherTimeMs - lowTimeMs) <= 15 * 60 * 1000) {
+                            claimedEvents.lows.add(getEventId(otherLow));
+                        }
+                    });
+                    bestMatch.highReadings.forEach(h => {
+                        claimedEvents.highs.add(getEventId(h));
+                    });
+                    
+                    // Calculate adjustment based on severity
+                    let adjustmentPercent;
+                    if (low.bg < 55 || bestMatch.peakBG > 220) {
+                        adjustmentPercent = 10; // Severe
+                    } else if (low.bg < 65 || bestMatch.peakBG > 200) {
+                        adjustmentPercent = 7.5; // Moderate
+                    } else {
+                        adjustmentPercent = 5; // Minor
+                    }
+                    
+                    const mealTime = new Date(bestMatch.meal.created_at);
+                    const period = CIRCADIAN_PERIODS.find(p => {
+                        const hour = mealTime.getHours();
+                        return hour >= p.startHour && hour < p.endHour;
+                    });
+                    
+                    findings.push({
+                        id: `finding_transient_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                        type: FindingType.TRANSIENT_HIGH_LOW,
+                        detectedAt: new Date().toISOString(),
+                        eventTime: low.localTime || low.time,
+                        scheduleTime: crEntry.time,
+                        period: period?.name || 'Unknown',
+                        severity: low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.75,
+                        events: [{
+                            mealTime: formatTimeForDisplay(bestMatch.meal.created_at),
+                            mealCarbs: bestMatch.meal.carbs,
+                            peakBG: bestMatch.peakBG,
+                            highDuration: bestMatch.highDurationMinutes,
+                            lowBG: low.bg,
+                            lowTime: formatTimeForDisplay(low.localTime || low.time),
+                            timeToLow: bestMatch.timeFromHighToLowHours
+                        }],
+                        similarEventsCount: 1,
+                        daysWithPattern: 1,
+                        primaryParameter: 'CR',
+                        suggestedChangePercent: adjustmentPercent,
+                        contributingFactors: ['strong_cr', 'spike_and_crash'],
+                        claimedEventIds: [bestMatch.mealId, lowId, ...bestMatch.highReadings.map(getEventId)],
+                        conflictsWith: [],
+                        recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
+                        details: `Meal at ${formatTimeForDisplay(bestMatch.meal.created_at)} (${bestMatch.meal.carbs}g) → Brief spike to ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min) → Crash to ${low.bg} mg/dL (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later). Peak-to-crash pattern indicates excessive upfront insulin.`
+                    });
+                });
+                
+                return findings;
+            },
+
+            /**
              * DETECTOR 1: Direct Meal-Induced Low
              * Pattern: Meal -> Low (no high >180 between)
              * Output: Finding of type DIRECT_MEAL_LOW
@@ -1497,6 +1927,14 @@
                     const crEntry = getCRForTime(relevantMeal.created_at, crSchedule);
                     claimedEvents.meals.add(mealId);
                     claimedEvents.lows.add(lowId);
+                    // Also claim nearby lows (same low event may have multiple CGM readings)
+                    const lowTimeMs = lowTime.getTime();
+                    lowProblems.forEach(otherLow => {
+                        const otherTimeMs = new Date(otherLow.localTime || otherLow.time).getTime();
+                        if (Math.abs(otherTimeMs - lowTimeMs) <= 15 * 60 * 1000) {
+                            claimedEvents.lows.add(getEventId(otherLow));
+                        }
+                    });
                     
                     const lowSeverity = low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.75;
                     const adjustmentPercent = low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5;
@@ -1510,6 +1948,7 @@
                         id: `finding_dml_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.DIRECT_MEAL_LOW,
                         detectedAt: new Date().toISOString(),
+                        eventTime: low.localTime || low.time, // BUG-022: Store original timestamp
                         scheduleTime: crEntry.time,
                         period: period?.name || 'Unknown',
                         severity: lowSeverity,
@@ -1535,8 +1974,10 @@
             },
 
             /**
-             * DETECTOR 2: ISF-Induced Low
-             * Pattern: Correction -> Low within 4 hours
+             * DETECTOR 2: ISF-Induced Low (Correction Overcorrection)
+             * Pattern: HIGH >180 -> Corrections (within 1-3hr) -> Low
+             * CRITICAL: Must have a HIGH that corrections were addressing
+             * Also checks for meals between correction and low (stacking)
              * Output: Finding of type ISF_INDUCED_LOW
              */
             detectISFInducedLows(lowProblems, nightscoutData, isfSchedule, claimedEvents, analysisWindow) {
@@ -1544,33 +1985,64 @@
                 
                 lowProblems.forEach(low => {
                     const lowId = getEventId(low);
-                    if (claimedEvents.lows.has(lowId)) return;
+                    // Note: Don't skip claimed lows - allow multiple attributions for stacking
                     
                     const lowTime = new Date(low.localTime || low.time);
-                    const fourHoursAgo = new Date(lowTime - 4 * 60 * 60 * 1000);
+                    const threeHoursAgo = new Date(lowTime - 3 * 60 * 60 * 1000);
+                    const oneHourAgo = new Date(lowTime - 1 * 60 * 60 * 1000);
                     
+                    // Find corrections in 1-3 hour lookback window (v25 used this tighter window)
                     const recentCorrections = nightscoutData.treatments.filter(t => {
                         if (!isTrueCorrection(t, nightscoutData.treatments)) return false;
                         const tTime = new Date(t.created_at);
-                        return tTime >= fourHoursAgo && tTime < lowTime;
+                        return tTime >= oneHourAgo && tTime < lowTime;
                     });
                     
                     if (recentCorrections.length === 0) return;
                     
-                    const unclaimedCorrections = recentCorrections.filter(c => 
-                        !claimedEvents.corrections.has(getEventId(c))
+                    // Get earliest correction time for high lookup
+                    const earliestCorrectionTime = new Date(
+                        Math.min(...recentCorrections.map(c => new Date(c.created_at)))
                     );
                     
-                    if (unclaimedCorrections.length === 0) return;
+                    // CRITICAL: Find the HIGH that these corrections were addressing
+                    // Look back up to 3 hours before the earliest correction
+                    const threeHoursBeforeCorrection = new Date(earliestCorrectionTime - 3 * 60 * 60 * 1000);
                     
-                    const relevantCorrection = unclaimedCorrections[unclaimedCorrections.length - 1];
-                    const correctionId = getEventId(relevantCorrection);
-                    const correctionTime = new Date(relevantCorrection.created_at);
+                    const bgBeforeCorrections = nightscoutData.glucose.filter(reading => {
+                        const rTime = new Date(reading.dateString);
+                        return rTime >= threeHoursBeforeCorrection && rTime <= earliestCorrectionTime;
+                    });
                     
-                    // Check BG wasn't already dropping before correction
+                    // Check if ANY high >180 occurred within 3 hours BEFORE corrections
+                    const highReadings = bgBeforeCorrections.filter(r => r.sgv > 180);
+                    
+                    if (highReadings.length === 0) {
+                        // NO HIGH before correction - this is NOT a correction overcorrection
+                        // Skip - likely the tiny correction wasn't addressing a high
+                        return;
+                    }
+                    
+                    // Find the last high reading for reporting
+                    const lastHighReading = highReadings.reduce((latest, r) => {
+                        const latestTime = new Date(latest.dateString);
+                        const rTime = new Date(r.dateString);
+                        return rTime > latestTime ? r : latest;
+                    });
+                    
+                    // CHECK FOR STACKING: meals between correction and low
+                    const mealsBetweenCorrectionAndLow = nightscoutData.treatments.filter(t => {
+                        if (!t.created_at || !t.carbs || t.carbs < 15) return false;
+                        const tTime = new Date(t.created_at);
+                        return tTime > earliestCorrectionTime && tTime < lowTime;
+                    });
+                    
+                    const hasStacking = mealsBetweenCorrectionAndLow.length > 0;
+                    
+                    // Check BG wasn't already dropping fast before correction
                     const bgBeforeCorrection = nightscoutData.glucose.filter(reading => {
                         const rTime = new Date(reading.dateString);
-                        return rTime >= new Date(correctionTime - 30 * 60 * 1000) && rTime < correctionTime;
+                        return rTime >= new Date(earliestCorrectionTime - 30 * 60 * 1000) && rTime < earliestCorrectionTime;
                     });
                     
                     if (bgBeforeCorrection.length >= 2) {
@@ -1580,43 +2052,64 @@
                         const dropRate = (sorted[0].sgv - sorted[sorted.length - 1].sgv) / 
                             ((new Date(sorted[sorted.length - 1].dateString) - new Date(sorted[0].dateString)) / 60000);
                         
-                        if (dropRate > 2) return; // Already dropping fast
+                        if (dropRate > 2) return; // Already dropping fast - not correction's fault
                     }
                     
-                    claimedEvents.corrections.add(correctionId);
-                    claimedEvents.lows.add(lowId);
+                    // Claim corrections (but NOT lows - allow multiple attributions)
+                    recentCorrections.forEach(c => {
+                        claimedEvents.corrections.add(getEventId(c));
+                    });
+                    highReadings.forEach(h => {
+                        claimedEvents.highs.add(getEventId(h));
+                    });
                     
-                    const isfEntry = getISFForTime(relevantCorrection.created_at, isfSchedule);
-                    const lowSeverity = low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.75;
+                    const totalCorrectionInsulin = recentCorrections.reduce((sum, c) => sum + (c.insulin || 0), 0);
+                    const isfEntry = getISFForTime(earliestCorrectionTime.toISOString(), isfSchedule);
+                    
+                    // Severity and adjustment
+                    const lowSeverity = hasStacking ? 
+                        (low.bg < 55 ? 0.75 : low.bg < 65 ? 0.65 : 0.55) : // Reduced for stacking
+                        (low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.75);
                     const adjustmentPercent = low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5;
                     
                     const period = CIRCADIAN_PERIODS.find(p => {
-                        const hour = correctionTime.getHours();
+                        const hour = earliestCorrectionTime.getHours();
                         return hour >= p.startHour && hour < p.endHour;
                     });
+                    
+                    // Build details with stacking note if applicable
+                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)} → ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) → Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}.`;
+                    
+                    if (hasStacking) {
+                        details += ` Note: ${mealsBetweenCorrectionAndLow.length} meal(s) between corrections and low may have contributed (insulin stacking).`;
+                    }
                     
                     findings.push({
                         id: `finding_isf_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.ISF_INDUCED_LOW,
                         detectedAt: new Date().toISOString(),
+                        eventTime: low.localTime || low.time,
                         scheduleTime: isfEntry.time,
                         period: period?.name || 'Unknown',
                         severity: lowSeverity,
                         events: [{
-                            time: formatTimeForDisplay(relevantCorrection.created_at),
-                            insulin: relevantCorrection.insulin,
+                            highBG: lastHighReading.sgv,
+                            highTime: formatTimeForDisplay(lastHighReading.dateString),
+                            corrections: recentCorrections.length,
+                            totalInsulin: totalCorrectionInsulin,
                             lowBG: low.bg,
-                            lowTime: formatTimeForDisplay(low.localTime || low.time)
+                            lowTime: formatTimeForDisplay(low.localTime || low.time),
+                            hasStacking: hasStacking
                         }],
                         similarEventsCount: 1,
                         daysWithPattern: 1,
                         primaryParameter: 'ISF',
                         suggestedChangePercent: adjustmentPercent,
-                        contributingFactors: ['strong_isf'],
-                        claimedEventIds: [correctionId, lowId],
+                        contributingFactors: hasStacking ? ['strong_isf', 'insulin_stacking'] : ['strong_isf'],
+                        claimedEventIds: [...recentCorrections.map(getEventId), ...highReadings.map(getEventId)],
                         conflictsWith: [],
                         recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
-                        details: `Correction at ${formatTimeForDisplay(relevantCorrection.created_at)} (${relevantCorrection.insulin}U) → Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}.`
+                        details: details
                     });
                 });
                 
@@ -1631,6 +2124,29 @@
             detectPostMealHighs(nightscoutData, crSchedule, claimedEvents, analysisWindow) {
                 const findings = [];
                 const analysisStart = new Date(Date.now() - analysisWindow * 24 * 60 * 60 * 1000);
+                
+                // Helper to get IOB at a specific time
+                const getIOBAtTime = (deviceStatus, targetTime) => {
+                    if (!deviceStatus || deviceStatus.length === 0) return null;
+                    const targetTimestamp = new Date(targetTime).getTime();
+                    let closestIOB = null;
+                    let minTimeDiff = Infinity;
+                    
+                    deviceStatus.forEach(status => {
+                        if (status.created_at && status.iob !== undefined) {
+                            const iobValue = typeof status.iob === 'object' ? status.iob.iob : status.iob;
+                            if (typeof iobValue === 'number') {
+                                const statusTime = new Date(status.created_at).getTime();
+                                const timeDiff = Math.abs(statusTime - targetTimestamp);
+                                if (timeDiff < 15 * 60 * 1000 && timeDiff < minTimeDiff) {
+                                    minTimeDiff = timeDiff;
+                                    closestIOB = iobValue;
+                                }
+                            }
+                        }
+                    });
+                    return closestIOB;
+                };
                 
                 const meals = nightscoutData.treatments.filter(t => 
                     t.carbs && t.carbs >= CONFIG.minMealCarbsForAttribution && !claimedEvents.meals.has(getEventId(t))
@@ -1665,20 +2181,94 @@
                         return tTime > mealTime && tTime <= threeHoursAfter;
                     });
                     
-                    // Check for rebound pattern
+                    // Get CR entry for calculations
+                    const crEntry = getCRForTime(meal.created_at, crSchedule);
+                    
+                    // ===== REBOUND DETECTION (Enhanced from v25) =====
+                    
+                    // SIGNAL 1: Meal during low (<80 mg/dL)
                     const bgAtMealTime = nightscoutData.glucose.find(reading => {
                         const rTime = new Date(reading.dateString);
                         const timeDiff = Math.abs(rTime - mealTime);
                         return timeDiff < 10 * 60 * 1000;
                     });
+                    const mealDuringLow = bgAtMealTime && bgAtMealTime.sgv < 80;
                     
+                    // SIGNAL 2: Underdosing with IOB check (only if BG wasn't low)
+                    let isSafetyReduction = false;
+                    if (!mealDuringLow && meal.carbs > 0 && crEntry) {
+                        const expectedBolus = meal.carbs / crEntry.value;
+                        const actualBolus = meal.insulin || 0;
+                        const percentGiven = expectedBolus > 0 ? (actualBolus / expectedBolus) * 100 : 100;
+                        
+                        if (percentGiven < 70) {
+                            // Check IOB at meal time
+                            const iobAtMealTime = getIOBAtTime(nightscoutData.deviceStatus, mealTime);
+                            
+                            if (iobAtMealTime !== null && iobAtMealTime > 1.0) {
+                                // High IOB explains the reduction - not safety
+                                isSafetyReduction = false;
+                            } else {
+                                // Low/no IOB but still underdosed - safety reduction
+                                isSafetyReduction = true;
+                            }
+                        }
+                    }
+                    
+                    // If EITHER signal present, check for severe low + rebound
+                    if (mealDuringLow || isSafetyReduction) {
+                        // Check if severe low occurred within 2 hours after meal
+                        const twoHoursAfterMeal = new Date(mealTime.getTime() + 2 * 60 * 60 * 1000);
+                        const severeLowReadings = nightscoutData.glucose.filter(reading => {
+                            const rTime = new Date(reading.dateString);
+                            return rTime > mealTime && rTime <= twoHoursAfterMeal && reading.sgv < 55;
+                        });
+                        
+                        if (severeLowReadings.length > 0) {
+                            const lowestReading = severeLowReadings.reduce((min, r) => r.sgv < min.sgv ? r : min);
+                            
+                            // This is a rebound high from severe hypoglycemia - create informational finding
+                            findings.push({
+                                id: `finding_rebound_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.REBOUND_HIGH,
+                                detectedAt: new Date().toISOString(),
+                                scheduleTime: crEntry?.time || '00:00',
+                                period: CIRCADIAN_PERIODS.find(p => {
+                                    const hour = mealTime.getHours();
+                                    return hour >= p.startHour && hour < p.endHour;
+                                })?.name || 'Unknown',
+                                severity: 0.3,
+                                events: [{
+                                    time: formatTimeForDisplay(meal.created_at),
+                                    mealCarbs: meal.carbs,
+                                    bgAtMeal: bgAtMealTime?.sgv,
+                                    severeLow: lowestReading.sgv,
+                                    severeLowTime: formatTimeForDisplay(lowestReading.dateString),
+                                    peakBG,
+                                    pattern: mealDuringLow ? 'meal_during_low' : 'safety_underdose'
+                                }],
+                                similarEventsCount: 1,
+                                daysWithPattern: 1,
+                                primaryParameter: null,
+                                suggestedChangePercent: 0,
+                                contributingFactors: ['hypoglycemia_rebound', 'severe_low'],
+                                claimedEventIds: [mealId],
+                                conflictsWith: [],
+                                recencyWeight: calculateRecencyWeight(meal.created_at, analysisWindow),
+                                details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} → Severe low ${lowestReading.sgv} mg/dL → Rebound spike to ${peakBG} mg/dL. This is physiological rebound from hypoglycemia, not weak CR.`
+                            });
+                            claimedEvents.meals.add(mealId);
+                            return; // Skip CR strengthening
+                        }
+                    }
+                    
+                    // Simple rebound check (meal during low without severe crash)
                     if (bgAtMealTime && bgAtMealTime.sgv < 70) {
-                        // Likely rebound - skip or mark as such
                         findings.push({
                             id: `finding_rebound_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                             type: FindingType.REBOUND_HIGH,
                             detectedAt: new Date().toISOString(),
-                            scheduleTime: getCRForTime(meal.created_at, crSchedule).time,
+                            scheduleTime: crEntry?.time || '00:00',
                             period: CIRCADIAN_PERIODS.find(p => {
                                 const hour = mealTime.getHours();
                                 return hour >= p.startHour && hour < p.endHour;
@@ -1710,7 +2300,6 @@
                     highReadings.forEach(h => claimedEvents.highs.add(getEventId(h)));
                     correctionsAfterMeal.forEach(c => claimedEvents.corrections.add(getEventId(c)));
                     
-                    const crEntry = getCRForTime(meal.created_at, crSchedule);
                     const adjustmentPercent = peakBG > 250 ? -3 : peakBG > 220 ? -2 : -1;
                     
                     const period = CIRCADIAN_PERIODS.find(p => {
@@ -1722,6 +2311,7 @@
                         id: `finding_pmh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.POST_MEAL_HIGH,
                         detectedAt: new Date().toISOString(),
+                        eventTime: meal.created_at, // BUG-022: Store original timestamp
                         scheduleTime: crEntry.time,
                         period: period?.name || 'Unknown',
                         severity: peakBG > 250 ? 0.85 : peakBG > 220 ? 0.7 : 0.55,
@@ -1765,7 +2355,12 @@
                     if (Math.abs(deviation) < 8) return; // Within acceptable range
                     
                     const type = deviation > 0 ? FindingType.BASAL_SIGNAL_HIGH : FindingType.BASAL_SIGNAL_LOW;
-                    const adjustmentPercent = deviation > 0 ? -Math.min(Math.abs(deviation) * 0.5, 5) : Math.min(Math.abs(deviation) * 0.5, 7.5);
+                    // BUG FIX: Correct the sign
+                    // BG HIGH (deviation > 0) → need MORE basal → POSITIVE adjustment
+                    // BG LOW (deviation < 0) → need LESS basal → NEGATIVE adjustment
+                    const adjustmentPercent = deviation > 0 
+                        ? Math.min(Math.abs(deviation) * 0.5, 5)     // BG high → increase basal
+                        : -Math.min(Math.abs(deviation) * 0.5, 7.5); // BG low → decrease basal
                     
                     // Find schedule time in this period
                     const periodStart = period.startHour || CIRCADIAN_PERIODS.find(p => p.name === period.name)?.startHour || 0;
@@ -1827,6 +2422,7 @@
                             id: `finding_resistant_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                             type: FindingType.RESISTANT_LOW,
                             detectedAt: new Date().toISOString(),
+                            eventTime: low.localTime || low.time, // BUG-022: Store original timestamp
                             scheduleTime: `${String(lowTime.getHours()).padStart(2, '0')}:00`,
                             period: period?.name || 'Unknown',
                             severity: 0.5, // Lower severity - hard to fix
@@ -1865,6 +2461,7 @@
                         id: `finding_unexplained_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.UNEXPLAINED_LOW,
                         detectedAt: new Date().toISOString(),
+                        eventTime: low.localTime || low.time, // BUG-022: Store original timestamp
                         scheduleTime: basalEntry.time,
                         period: period?.name || 'Unknown',
                         severity: low.bg < 55 ? 0.9 : low.bg < 65 ? 0.75 : 0.6,
@@ -2029,6 +2626,38 @@
                     // Skip if had a low (not safe to strengthen)
                     if (hasLow) return;
                     
+                    // Check for treatment rebound pattern (unannounced carb treatment)
+                    // Pattern: Low followed by rapid rise (>2 mg/dL/min) to >130
+                    // This indicates the high BG is from treating a low, not weak ISF
+                    let hadTreatmentRebound = false;
+                    const sortedReadings = [...readings].sort((a, b) => 
+                        new Date(a.dateString) - new Date(b.dateString)
+                    );
+                    
+                    for (let i = 0; i < sortedReadings.length - 1; i++) {
+                        const reading = sortedReadings[i];
+                        if (reading.sgv >= 70) continue; // Not a low
+                        
+                        // Look for rapid rise in next 30 minutes (next ~6 readings at 5-min intervals)
+                        const nextReadings = sortedReadings.slice(i + 1, Math.min(i + 7, sortedReadings.length));
+                        if (nextReadings.length === 0) continue;
+                        
+                        const peakAfterLow = Math.max(...nextReadings.map(r => r.sgv));
+                        const minutesElapsed = nextReadings.length * 5; // Approximate
+                        const riseRate = (peakAfterLow - reading.sgv) / minutesElapsed; // mg/dL per minute
+                        
+                        // Fast rise (>2 mg/dL/min) to >130 suggests carb treatment
+                        if (riseRate > 2 && peakAfterLow > 130) {
+                            hadTreatmentRebound = true;
+                            break;
+                        }
+                    }
+                    
+                    if (hadTreatmentRebound) {
+                        // High BG likely from treating low, not weak ISF
+                        return;
+                    }
+                    
                     // Skip if no corrections
                     if (corrections.length === 0) return;
                     
@@ -2080,6 +2709,7 @@
                         id: `finding_corr_ineff_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.CORRECTION_INEFFECTIVE,
                         detectedAt: new Date().toISOString(),
+                        eventTime: corrections[0]?.created_at || new Date().toISOString(), // BUG-022: Store original timestamp
                         scheduleTime: isfEntry.time,
                         period: period?.name || segment.name,
                         severity: 0.7,
@@ -2359,7 +2989,9 @@
                         direction: incrementsNeeded > 0 ? 'increase' : 'decrease',
                         appliedHours: distribution.appliedHours,
                         matchingPeriods: distribution.matchingPeriods,
-                        nonMatchingPeriods: distribution.nonMatchingPeriods,
+                        neutralPeriods: distribution.neutralPeriods,
+                        skippedPeriods: distribution.skippedPeriods,
+                        incrementsSkipped: distribution.incrementsSkipped || 0,
                         currentTotal,
                         proposedTotal
                     }
@@ -2406,20 +3038,30 @@
                 const isDecrease = incrementsNeeded < 0;
                 const isIncrease = !isDecrease;
                 
-                // Build period info with signal direction matching
+                // Build period info with signal direction categorization
                 const periodInfo = CIRCADIAN_PERIODS.map(period => {
                     const signal = periodSignals?.find(p => p.name === period.name);
                     const medianDev = signal?.medianDeviation || 0;
+                    
+                    // Categorize: MATCHING, NEUTRAL, or OPPOSITE
+                    let category;
+                    if (isIncrease) {
+                        // For INCREASE: HIGH is matching, LOW is opposite
+                        if (medianDev > 5) category = 'MATCHING';
+                        else if (medianDev < -5) category = 'OPPOSITE';
+                        else category = 'NEUTRAL';
+                    } else {
+                        // For DECREASE: LOW is matching, HIGH is opposite
+                        if (medianDev < -5) category = 'MATCHING';
+                        else if (medianDev > 5) category = 'OPPOSITE';
+                        else category = 'NEUTRAL';
+                    }
                     
                     return {
                         period,
                         signalValue: medianDev,
                         signalStrength: Math.abs(medianDev),
-                        // Matching: if we need to increase and signal is HIGH (positive),
-                        // or if we need to decrease and signal is LOW (negative)
-                        matchesDirection: isDecrease 
-                            ? medianDev < -5  // Decrease matches LOW signal
-                            : medianDev > 5,  // Increase matches HIGH signal
+                        category,
                         hours: []
                     };
                 });
@@ -2436,20 +3078,23 @@
                     p.hours = [...evens, ...odds];
                 });
                 
-                // Separate into matching and non-matching groups
-                const matching = periodInfo.filter(p => p.matchesDirection);
-                const nonMatching = periodInfo.filter(p => !p.matchesDirection);
+                // Separate into three groups: MATCHING, NEUTRAL, OPPOSITE
+                const matching = periodInfo.filter(p => p.category === 'MATCHING');
+                const neutral = periodInfo.filter(p => p.category === 'NEUTRAL');
+                const opposite = periodInfo.filter(p => p.category === 'OPPOSITE');
                 
-                // Sort each group by signal strength (strongest first)
+                // Sort each group by signal strength (strongest first for matching/opposite, weakest first for neutral)
                 const sortByStrength = (a, b) => {
                     const strengthDiff = b.signalStrength - a.signalStrength;
                     if (Math.abs(strengthDiff) > 0.1) return strengthDiff;
                     return a.period.startHour - b.period.startHour;
                 };
                 matching.sort(sortByStrength);
-                nonMatching.sort(sortByStrength);
+                neutral.sort((a, b) => a.signalStrength - b.signalStrength); // Weakest signal first for neutral
+                // Don't sort opposite - we won't use them
                 
-                // Build spread order: exhaust matching periods first
+                // Build spread order: MATCHING first, then NEUTRAL
+                // OPPOSITE periods are excluded - don't add insulin where BG is already low (or vice versa)
                 const buildGroupOrder = (periods) => {
                     const maxHours = Math.max(...periods.map(p => p.hours.length), 0);
                     const order = [];
@@ -2464,8 +3109,9 @@
                 };
                 
                 const matchingOrder = buildGroupOrder(matching);
-                const nonMatchingOrder = buildGroupOrder(nonMatching);
-                const spreadOrder = [...matchingOrder, ...nonMatchingOrder];
+                const neutralOrder = buildGroupOrder(neutral);
+                // Note: opposite periods excluded from spread order
+                const spreadOrder = [...matchingOrder, ...neutralOrder];
                 
                 // Apply increments
                 let remaining = Math.abs(incrementsNeeded);
@@ -2487,17 +3133,26 @@
                     }
                 }
                 
+                // Log if we couldn't apply all increments
+                if (remaining > 0) {
+                    console.log(`Distribution: ${remaining} increments could not be applied (avoiding opposite-signal periods)`);
+                }
+                
                 console.log('Distribution:', {
                     matching: matching.map(p => p.period.name),
-                    nonMatching: nonMatching.map(p => p.period.name),
-                    appliedCount: appliedHours.length
+                    neutral: neutral.map(p => p.period.name),
+                    opposite: opposite.map(p => `${p.period.name} (${p.signalValue > 0 ? 'HIGH' : 'LOW'} - SKIPPED)`),
+                    appliedCount: appliedHours.length,
+                    requestedCount: Math.abs(incrementsNeeded)
                 });
                 
                 return {
                     schedule,
                     appliedHours,
                     matchingPeriods: matching.map(p => p.period.name),
-                    nonMatchingPeriods: nonMatching.map(p => p.period.name)
+                    neutralPeriods: neutral.map(p => p.period.name),
+                    skippedPeriods: opposite.map(p => p.period.name),
+                    incrementsSkipped: remaining
                 };
             }
         };
@@ -2507,7 +3162,7 @@
         // =========================================================================
         
         const OutputFormatter = {
-            formatForClaude(analysisResults, bodyState, bundles, schedules, config) {
+            formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null) {
                 const now = new Date();
                 const dateStr = now.toLocaleDateString('en-US', { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
@@ -2549,36 +3204,91 @@
                 
                 output += `---\n\n`;
                 
-                // Tonight's Action Section
+                // Tonight's Action Section - now supports multiple PRIMARY bundles
                 output += `## Tonight's Action\n\n`;
                 
-                const primaryBundle = bundles.find(b => b.priority === 'PRIMARY');
+                const primaryBundles = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
                 
-                if (primaryBundle && primaryBundle.recommendations.length > 0) {
-                    output += `### ${primaryBundle.name}\n\n`;
-                    output += `**Why:** ${primaryBundle.rootCause}\n\n`;
-                    
-                    output += `| Parameter | Current | Recommended | Change |\n`;
-                    output += `|-----------|---------|-------------|--------|\n`;
-                    
-                    primaryBundle.recommendations.forEach(rec => {
-                        const changeStr = `${rec.changePercent >= 0 ? '+' : ''}${rec.changePercent.toFixed(1)}%`;
-                        const protection = rec.protectionLevel !== ProtectionLevel.CLEAR 
-                            ? ` ${ProtectionSystem.getProtectionIcon(rec.protectionLevel)}`
-                            : '';
-                        output += `| ${rec.scheduleTime} ${rec.param} | ${rec.currentValue} | ${rec.newValue} | ${changeStr}${protection} |\n`;
-                    });
-                    output += `\n`;
-                    
-                    output += `**Evidence:** ${primaryBundle.evidenceSummary}\n\n`;
-                    
-                    if (primaryBundle.compoundEffect && primaryBundle.compoundEffect.description) {
-                        output += `**Compound Effect:** ${primaryBundle.compoundEffect.description}`;
-                        if (primaryBundle.compoundEffect.warning) {
-                            output += ` ⚠️ ${primaryBundle.compoundEffect.warning}`;
-                        }
-                        output += `\n\n`;
+                if (primaryBundles.length > 0) {
+                    // Show summary if multiple actions
+                    if (primaryBundles.length > 1) {
+                        const urgentCount = primaryBundles.filter(b => b.isUrgent).length;
+                        const blocks = [...new Set(primaryBundles.map(b => b.timeBlock))];
+                        output += `**${primaryBundles.length} actions recommended**`;
+                        if (urgentCount > 0) output += ` (${urgentCount} urgent)`;
+                        output += ` across ${blocks.join(', ')}\n\n`;
                     }
+                    
+                    primaryBundles.forEach((primaryBundle, idx) => {
+                        // Add recency indicator
+                        const recencyIcon = primaryBundle.hasRecentEvents ? '✓' : 
+                                           primaryBundle.hasLast3DayEvents ? '○' : '⚠️';
+                        const urgentTag = primaryBundle.isUrgent ? ' 🚨 URGENT' : '';
+                        const blockTag = primaryBundles.length > 1 ? ` [${primaryBundle.timeBlock}]` : '';
+                        
+                        output += `### ${primaryBundle.name} ${recencyIcon}${urgentTag}${blockTag}\n\n`;
+                        
+                        if (primaryBundle.urgentReason) {
+                            output += `⚠️ **${primaryBundle.urgentReason}** - requires immediate attention\n\n`;
+                        }
+                        
+                        output += `**Why:** ${primaryBundle.rootCause}\n\n`;
+                        
+                        output += `| Parameter | Current | Recommended | Change |\n`;
+                        output += `|-----------|---------|-------------|--------|\n`;
+                        
+                        primaryBundle.recommendations.forEach(rec => {
+                            const changeStr = `${rec.changePercent >= 0 ? '+' : ''}${rec.changePercent.toFixed(1)}%`;
+                            const protection = rec.protectionLevel !== ProtectionLevel.CLEAR 
+                                ? ` ${ProtectionSystem.getProtectionIcon(rec.protectionLevel)}`
+                                : '';
+                            output += `| ${rec.scheduleTime} ${rec.param} | ${rec.currentValue} | ${rec.newValue} | ${changeStr}${protection} |\n`;
+                        });
+                        output += `\n`;
+                        
+                        // Show detailed evidence
+                        output += `**Evidence:**\n`;
+                        if (primaryBundle.evidenceDetails && primaryBundle.evidenceDetails.length > 0) {
+                            primaryBundle.evidenceDetails.forEach(ev => {
+                                output += `- ${ev.icon} ${ev.detail}\n`;
+                            });
+                        } else {
+                            output += `- ${primaryBundle.evidenceSummary}\n`;
+                        }
+                        output += `\n`;
+                        
+                        // Show recency details
+                        if (primaryBundle.isSlotConflict) {
+                            output += `**Recency:** Current - conflicting patterns\n`;
+                        } else if (primaryBundle.isBasalRatioWarning) {
+                            output += `**Recency:** Current - structural\n`;
+                        } else if (primaryBundle.hasStructuralFinding && primaryBundle.findings?.some(f => f.isStructural)) {
+                            output += `**Recency:** Current analysis ✓\n`;
+                        } else if (primaryBundle.hasRecentEvents) {
+                            const recentCount = primaryBundle.findings?.reduce((sum, f) => sum + (f.eventsLast24h || 0), 0) || 0;
+                            output += `**Recency:** ${recentCount} event(s) in last 24h ✓\n`;
+                        } else if (primaryBundle.hasLast3DayEvents) {
+                            const last3Count = primaryBundle.findings?.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0) || 0;
+                            output += `**Recency:** ${last3Count} event(s) in last 3 days\n`;
+                        } else {
+                            output += `**Recency:** ⚠️ Caution - no events in last 3 days\n`;
+                        }
+                        
+                        if (primaryBundle.compoundEffect && primaryBundle.compoundEffect.description) {
+                            output += `**Compound Effect:** ${primaryBundle.compoundEffect.description}`;
+                            if (primaryBundle.compoundEffect.warning) {
+                                output += ` ⚠️ ${primaryBundle.compoundEffect.warning}`;
+                            }
+                            output += `\n`;
+                        }
+                        
+                        // Add separator between multiple actions
+                        if (idx < primaryBundles.length - 1) {
+                            output += `\n---\n\n`;
+                        } else {
+                            output += `\n`;
+                        }
+                    });
                 } else {
                     output += `No action recommended tonight. Continue monitoring.\n\n`;
                 }
@@ -2592,7 +3302,10 @@
                 
                 if (referenceBundles.length > 0) {
                     referenceBundles.forEach(bundle => {
-                        output += `### ${bundle.name} (Tier ${bundle.tier})\n`;
+                        // Add recency indicator to name
+                        const recencyIcon = bundle.hasRecentEvents ? '✓' : 
+                                           bundle.hasLast3DayEvents ? '○' : '⚠️';
+                        output += `### ${recencyIcon} ${bundle.name} (Tier ${bundle.tier})\n`;
                         
                         // Generate appropriate status message
                         let status;
@@ -2610,7 +3323,37 @@
                         
                         output += `- **Status:** ${status}\n`;
                         output += `- **Confidence:** ${(bundle.confidence * 100).toFixed(0)}%\n`;
-                        output += `- **Summary:** ${bundle.evidenceSummary}\n\n`;
+                        
+                        // Show recency details - special handling for structural findings
+                        if (bundle.isSlotConflict) {
+                            output += `- **Recency:** Current - conflicting patterns\n`;
+                        } else if (bundle.isBasalRatioWarning) {
+                            output += `- **Recency:** Current - structural\n`;
+                        } else if (bundle.hasStructuralFinding && bundle.findings?.some(f => f.isStructural)) {
+                            output += `- **Recency:** Current analysis ✓\n`;
+                        } else if (bundle.hasRecentEvents) {
+                            const recentCount = bundle.findings?.reduce((sum, f) => sum + (f.eventsLast24h || 0), 0) || 0;
+                            output += `- **Recency:** ${recentCount} event(s) in last 24h ✓\n`;
+                        } else if (bundle.hasLast3DayEvents) {
+                            const last3Count = bundle.findings?.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0) || 0;
+                            output += `- **Recency:** ${last3Count} event(s) in last 3 days\n`;
+                        } else {
+                            output += `- **Recency:** ⚠️ No recent events - pattern may have resolved\n`;
+                        }
+                        
+                        // Show brief evidence details (first 2)
+                        if (bundle.evidenceDetails && bundle.evidenceDetails.length > 0) {
+                            output += `- **Evidence:**\n`;
+                            bundle.evidenceDetails.slice(0, 2).forEach(ev => {
+                                output += `  - ${ev.icon} ${ev.detail}\n`;
+                            });
+                            if (bundle.evidenceDetails.length > 2) {
+                                output += `  - _(${bundle.evidenceDetails.length - 2} more)_\n`;
+                            }
+                        } else {
+                            output += `- **Summary:** ${bundle.evidenceSummary}\n`;
+                        }
+                        output += `\n`;
                     });
                 } else {
                     output += `No emerging patterns to watch.\n\n`;
@@ -2674,12 +3417,42 @@
                         const signalPct = analysisResults.signalAnalysis.signalOnlyAnchor;
                         const targetPct = analysisResults.effectiveBasalTarget;
                         const finalPct = analysisResults.finalPercent;
+                        const isSignalFallback = analysisResults.effectiveTargetSource === 'signal-fallback';
                         
                         output += `**Basal % of TDD:**\n`;
                         if (currentPct) output += `- Current: ${currentPct.toFixed(1)}% (actual basal schedule ÷ TDD)\n`;
                         if (signalPct) output += `- Signal: ${signalPct.toFixed(1)}% (today's clean windows suggest)\n`;
-                        output += `- Target: ${targetPct.toFixed(1)}% (${analysisResults.effectiveTargetSource || 'configured'} - 3-day avg)\n`;
+                        
+                        // BUG-023: Show different message for signal fallback
+                        if (isSignalFallback) {
+                            output += `- Target: ${targetPct.toFixed(1)}% (using today's signal`;
+                            if (dynamicTarget?.hasGap) {
+                                output += ` - historical data has gap from override`;
+                            } else if (dynamicTarget?.insufficientEntries) {
+                                output += ` - insufficient recent history`;
+                            }
+                            output += `)\n`;
+                        } else {
+                            output += `- Target: ${targetPct.toFixed(1)}% (${analysisResults.effectiveTargetSource || 'configured'})`;
+                            
+                            // BUG-023: Add info about excluded stale data or gaps
+                            if (dynamicTarget?.excludedStaleRows > 0) {
+                                output += ` ⚠️ (${dynamicTarget.excludedStaleRows} stale rows excluded)`;
+                            }
+                            if (dynamicTarget?.hasGap) {
+                                output += ` ⚠️ (gap detected - post-override transition)`;
+                            }
+                            output += `\n`;
+                        }
+                        
                         if (finalPct) output += `- Final: ${finalPct.toFixed(1)}% (rate-limited recommendation)\n`;
+                        
+                        // BUG-023: Show conflict warning if target diverges from signal (only for non-fallback)
+                        if (!isSignalFallback && signalPct && Math.abs(targetPct - signalPct) > 1.5) {
+                            const direction = targetPct > signalPct ? 'increase' : 'decrease';
+                            output += `\n⚠️ **Target/Signal Divergence:** Target (${targetPct.toFixed(1)}%) suggests ${direction}, but today's signal (${signalPct.toFixed(1)}%) differs by ${Math.abs(targetPct - signalPct).toFixed(1)}%.\n`;
+                        }
+                        
                         output += `\n`;
                     }
                     
@@ -2704,8 +3477,21 @@
                 if (analysisResults.basalOptimization && analysisResults.basalOptimization.distribution?.direction !== 'none') {
                     output += `## Proposed Basal Schedule\n\n`;
                     
+                    // BUG-023: Show safety override warning if active
+                    if (analysisResults.basalOptimization.safetyOverride) {
+                        output += `⚠️ **Safety Override Active:** ${analysisResults.basalOptimization.safetyOverrideReason}\n\n`;
+                    }
+                    
                     const dist = analysisResults.basalOptimization.distribution;
                     const change = dist.proposedTotal - dist.currentTotal;
+                    
+                    // Show the reasoning (BUG-022: add context)
+                    const tdd = analysisResults.tdd || analysisResults.basalOptimization.tdd;
+                    const finalPercent = analysisResults.finalPercent;
+                    if (tdd && finalPercent) {
+                        const targetBasal = (finalPercent / 100) * tdd;
+                        output += `**Target:** ${finalPercent.toFixed(1)}% of ${tdd.toFixed(1)} U TDD = ${targetBasal.toFixed(2)} U/day basal\n\n`;
+                    }
                     
                     output += `**Summary:** ${dist.currentTotal.toFixed(2)} U/day → ${dist.proposedTotal.toFixed(2)} U/day (${change >= 0 ? '+' : ''}${change.toFixed(2)} U, ${dist.incrementsNeeded} increments)\n\n`;
                     
@@ -2720,9 +3506,24 @@
                     });
                     output += `\n`;
                     
+                    // Show distribution info
+                    const parts = [];
                     if (dist.matchingPeriods?.length > 0) {
-                        output += `**Distribution:** Signal-aligned periods (${dist.matchingPeriods.join(', ')}) prioritized for ${dist.direction}s.\n\n`;
+                        parts.push(`Signal-aligned: ${dist.matchingPeriods.join(', ')}`);
                     }
+                    if (dist.neutralPeriods?.length > 0) {
+                        parts.push(`Neutral: ${dist.neutralPeriods.join(', ')}`);
+                    }
+                    if (dist.skippedPeriods?.length > 0) {
+                        parts.push(`Skipped (opposite signal): ${dist.skippedPeriods.join(', ')}`);
+                    }
+                    if (parts.length > 0) {
+                        output += `**Distribution:** ${parts.join(' | ')}\n`;
+                    }
+                    if (dist.incrementsSkipped > 0) {
+                        output += `⚠️ ${dist.incrementsSkipped} increment(s) not applied - no suitable periods available.\n`;
+                    }
+                    output += `\n`;
                 }
                 
                 output += `---\n\n`;
@@ -2753,10 +3554,25 @@
                 });
                 output += `- **Total:** ${basalTotal.toFixed(2)} U/day\n\n`;
                 
-                // All Findings
+                // All Findings (sorted by recency, then severity)
                 output += `### All Findings\n\n`;
-                analysisResults.findings.forEach((finding, idx) => {
-                    output += `${idx + 1}. **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
+                
+                // Sort findings by recency tier, then severity
+                const sortedFindings = [...analysisResults.findings].sort((a, b) => {
+                    // Recency first
+                    const aRecent = a.eventsLast24h > 0 ? 0 : (a.eventsLast3Days > 0 ? 1 : 2);
+                    const bRecent = b.eventsLast24h > 0 ? 0 : (b.eventsLast3Days > 0 ? 1 : 2);
+                    if (aRecent !== bRecent) return aRecent - bRecent;
+                    // Then severity
+                    return b.severity - a.severity;
+                });
+                
+                sortedFindings.forEach((finding, idx) => {
+                    // Recency indicator
+                    const recencyIcon = finding.eventsLast24h > 0 ? '✓' : 
+                                       finding.eventsLast3Days > 0 ? '○' : 
+                                       finding.isStructural ? '●' : '⚠️';
+                    output += `${idx + 1}. ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
                     output += `   - Severity: ${(finding.severity * 100).toFixed(0)}%\n`;
                     output += `   - ${finding.details}\n\n`;
                 });
@@ -2784,10 +3600,15 @@
                 let output = `# Daily Review - ${dateStr}\n`;
                 output += `**State:** ${this.formatStateName(bodyState.state)} ${bodyState.state === BodyStateType.STABLE ? '✓' : '⚠️'}\n\n`;
                 
-                const primary = bundles.find(b => b.priority === 'PRIMARY');
-                if (primary && primary.recommendations.length > 0) {
-                    const rec = primary.recommendations[0];
-                    output += `**Tonight:** ${rec.scheduleTime} ${rec.param} ${rec.currentValue} → ${rec.newValue} (${rec.changePercent >= 0 ? '+' : ''}${rec.changePercent.toFixed(0)}%) — ${primary.name.toLowerCase()}\n\n`;
+                const primaryBundles = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
+                if (primaryBundles.length > 0) {
+                    output += `**Tonight:** `;
+                    const summaries = primaryBundles.map(primary => {
+                        const rec = primary.recommendations[0];
+                        const urgentTag = primary.isUrgent ? '🚨 ' : '';
+                        return `${urgentTag}${rec.scheduleTime} ${rec.param} ${rec.currentValue} → ${rec.newValue}`;
+                    });
+                    output += summaries.join(' | ') + '\n\n';
                 } else {
                     output += `**Tonight:** No changes recommended\n\n`;
                 }
@@ -3109,30 +3930,105 @@
                     
                     console.log('Yesterday Final %:', yesterdayFinal, 'from row date:', mostRecentRow.date);
                     
-                    // Use most recent 3 NON-OVERRIDE days for Target % averaging
-                    const recentRows = validRows.slice(0, Math.min(3, validRows.length));
+                    // BUG-023 FIX: Calculate days-ago for each row and detect gaps
+                    const now = new Date();
+                    const rowsWithAge = validRows.map(row => {
+                        const rowDate = new Date(row.date || row.timestamp);
+                        const daysAgo = Math.floor((now - rowDate) / (24 * 60 * 60 * 1000));
+                        return { ...row, daysAgo, rowDate };
+                    });
                     
-                    // Calculate average signal %
-                    const sum = recentRows.reduce((acc, row) => acc + parseFloat(row.signalPercent), 0);
-                    const avg = sum / recentRows.length;
+                    // Only use data from last 5 days for target calculation
+                    // This prevents stale pre-override data from contaminating the target
+                    const MAX_AGE_DAYS = 5;
+                    const recentEnoughRows = rowsWithAge.filter(row => row.daysAgo <= MAX_AGE_DAYS);
+                    
+                    console.log(`Dynamic target: ${recentEnoughRows.length} rows within ${MAX_AGE_DAYS} days (${validRows.length} total valid)`);
+                    
+                    // Detect if there's a gap (indicates override period was skipped)
+                    let hasGap = false;
+                    let gapDays = 0;
+                    if (recentEnoughRows.length >= 2) {
+                        for (let i = 0; i < recentEnoughRows.length - 1; i++) {
+                            const daysBetween = recentEnoughRows[i + 1].daysAgo - recentEnoughRows[i].daysAgo;
+                            if (daysBetween > 2) { // Gap of more than 2 days
+                                hasGap = true;
+                                gapDays = daysBetween;
+                                console.log(`Dynamic target: Gap detected - ${daysBetween} days between entries`);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Use recent data for averaging (max 3 days, but only recent ones)
+                    const recentRows = recentEnoughRows.slice(0, Math.min(3, recentEnoughRows.length));
+                    
+                    // BUG-023: Require minimum 2 entries within recency window for reliable average
+                    // If only 1 entry (just today) or 0, we don't have enough history
+                    const MIN_ENTRIES_FOR_AVERAGE = 2;
+                    
+                    if (recentRows.length < MIN_ENTRIES_FOR_AVERAGE) {
+                        console.log(`Dynamic target: Only ${recentRows.length} recent entries (need ${MIN_ENTRIES_FOR_AVERAGE}), flagging for signal fallback`);
+                        return {
+                            value: null, // Signal to use today's signal as fallback
+                            noRecentData: true,
+                            insufficientEntries: true,
+                            entriesFound: recentRows.length,
+                            entriesRequired: MIN_ENTRIES_FOR_AVERAGE,
+                            totalDaysAvailable: validRows.length,
+                            yesterdayFinal: yesterdayFinal,
+                            hasGap: hasGap,
+                            gapDays: gapDays
+                        };
+                    }
+                    
+                    // BUG-023: If gap detected, also flag for signal fallback
+                    // Gap indicates state transition - historical average may be contaminated
+                    if (hasGap) {
+                        console.log(`Dynamic target: Gap of ${gapDays} days detected, flagging for signal fallback`);
+                        return {
+                            value: null,
+                            noRecentData: false,
+                            hasGap: true,
+                            gapDays: gapDays,
+                            totalDaysAvailable: validRows.length,
+                            yesterdayFinal: yesterdayFinal,
+                            useSignalFallback: true
+                        };
+                    }
+                    
+                    // Weight by recency: today=1.0, yesterday=0.9, 2 days ago=0.8, etc.
+                    let weightedSum = 0;
+                    let totalWeight = 0;
+                    recentRows.forEach(row => {
+                        const weight = Math.max(0.5, 1.0 - (row.daysAgo * 0.1));
+                        weightedSum += parseFloat(row.signalPercent) * weight;
+                        totalWeight += weight;
+                        console.log(`  Row ${row.date}: Signal ${row.signalPercent}%, ${row.daysAgo} days ago, weight ${weight.toFixed(2)}`);
+                    });
+                    
+                    const avg = totalWeight > 0 ? weightedSum / totalWeight : parseFloat(recentRows[0].signalPercent);
                     
                     // Apply guardrails (30-50%)
                     const bounded = Math.max(30, Math.min(50, avg));
                     
-                    // Determine confidence based on data quantity and recency
+                    // Determine confidence based on data quantity, recency, and gaps
                     const mostRecentDate = new Date(recentRows[0].date || recentRows[0].timestamp);
                     const daysSinceMostRecent = Math.floor((Date.now() - mostRecentDate) / (24 * 60 * 60 * 1000));
                     
                     let confidence;
-                    if (validRows.length >= 7 && daysSinceMostRecent <= 7) {
+                    if (hasGap) {
+                        // Gaps indicate state transition - reduce confidence
+                        confidence = 'LOW';
+                    } else if (recentEnoughRows.length >= 5 && daysSinceMostRecent <= 1) {
                         confidence = 'HIGH';
-                    } else if (validRows.length >= 3 && daysSinceMostRecent <= 14) {
+                    } else if (recentEnoughRows.length >= 2 && daysSinceMostRecent <= 2) {
                         confidence = 'MEDIUM';
                     } else {
                         confidence = 'LOW';
                     }
                     
-                    console.log(`Dynamic target: Using ${recentRows.length} most recent days, avg ${avg.toFixed(1)} -> Bounded ${bounded.toFixed(1)} (${confidence} confidence)`);
+                    console.log(`Dynamic target: Weighted avg ${avg.toFixed(1)} -> Bounded ${bounded.toFixed(1)} (${confidence} confidence${hasGap ? ', GAP DETECTED' : ''})`);
                     
                     return {
                         value: bounded,
@@ -3142,7 +4038,10 @@
                         wasGuardrailed: Math.abs(bounded - avg) > 0.01,
                         confidence: confidence,
                         daysSinceMostRecent: daysSinceMostRecent,
-                        yesterdayFinal: yesterdayFinal
+                        yesterdayFinal: yesterdayFinal,
+                        hasGap: hasGap,
+                        gapDays: gapDays,
+                        excludedStaleRows: validRows.length - recentEnoughRows.length
                     };
                     
                 } catch (error) {
@@ -3325,7 +4224,7 @@
                     let yesterdayFinal = null;
                     
                     const dynamicResult = await loadDynamicTarget();
-                    if (dynamicResult) {
+                    if (dynamicResult && dynamicResult.value !== null && !dynamicResult.noRecentData) {
                         effectiveBasalTarget = dynamicResult.value;
                         effectiveTargetSource = 'dynamic';
                         yesterdayFinal = dynamicResult.yesterdayFinal;
@@ -3333,10 +4232,23 @@
                         setTargetSource('dynamic');
                         console.log(`Using dynamic target: ${effectiveBasalTarget}% (${dynamicResult.daysOfData} days of data)`);
                         console.log(`Yesterday Final %: ${yesterdayFinal}`);
+                        if (dynamicResult.hasGap) {
+                            console.log(`⚠️ Gap detected: ${dynamicResult.gapDays} days - post-override transition`);
+                        }
+                        if (dynamicResult.excludedStaleRows > 0) {
+                            console.log(`⚠️ Excluded ${dynamicResult.excludedStaleRows} stale rows (>5 days old)`);
+                        }
                     } else {
-                        setDynamicTarget(null);
-                        setTargetSource('configured');
-                        console.log(`Using configured target: ${effectiveBasalTarget}%`);
+                        // BUG-023: Mark that we need to fall back to today's signal
+                        // (will be applied after signal analysis completes)
+                        setDynamicTarget(dynamicResult); // Store for display
+                        setTargetSource('signal-fallback');
+                        effectiveTargetSource = 'signal-fallback'; // Also update local variable
+                        
+                        const reason = dynamicResult?.hasGap ? 'gap detected (post-override transition)' :
+                                       dynamicResult?.insufficientEntries ? `only ${dynamicResult.entriesFound} entries (need ${dynamicResult.entriesRequired})` :
+                                       'no recent non-override data';
+                        console.log(`Dynamic target unavailable: ${reason} - will use today's signal as fallback`);
                     }
                     
                     const nightscoutData = await fetchNightscoutData();
@@ -3414,6 +4326,12 @@
                         tddForSignal
                     );
                     
+                    // BUG-023: Apply signal fallback if dynamic target unavailable
+                    if (effectiveTargetSource === 'signal-fallback' && signalAnalysis?.signalOnlyAnchor) {
+                        effectiveBasalTarget = signalAnalysis.signalOnlyAnchor;
+                        console.log(`Applied signal fallback: Using today's signal ${effectiveBasalTarget.toFixed(1)}% as target`);
+                    }
+                    
                     // Event claiming system
                     const claimedEvents = {
                         meals: new Set(),
@@ -3425,12 +4343,17 @@
                     // Run all detectors to produce findings
                     const allFindings = [];
                     
+                    // Detector 1b: Transient High with Subsequent Low (more specific pattern - runs first)
+                    allFindings.push(...PatternDetectors.detectTransientHighWithLow(
+                        lowProblems, nightscoutData, activeSchedules.cr, claimedEvents, analysisWindow
+                    ));
+                    
                     // Detector 1: Direct Meal-Induced Lows
                     allFindings.push(...PatternDetectors.detectDirectMealLows(
                         lowProblems, nightscoutData, activeSchedules.cr, claimedEvents, analysisWindow
                     ));
                     
-                    // Detector 2: ISF-Induced Lows
+                    // Detector 2: ISF-Induced Lows (Correction Overcorrection)
                     allFindings.push(...PatternDetectors.detectISFInducedLows(
                         lowProblems, nightscoutData, activeSchedules.isf, claimedEvents, analysisWindow
                     ));
@@ -3496,8 +4419,70 @@
                     // Aggregate similar findings
                     const aggregatedFindings = aggregateFindings(allFindings);
                     
+                    // Calculate current basal percent for comparison
+                    const currentBasalTotal = activeSchedules.basal.reduce((sum, entry, idx, arr) => {
+                        const nextIdx = (idx + 1) % arr.length;
+                        const currentHour = parseInt(entry.time.split(':')[0]);
+                        const nextHour = nextIdx === 0 ? 24 : parseInt(arr[nextIdx].time.split(':')[0]);
+                        const hours = nextHour - currentHour;
+                        return sum + (entry.value * hours);
+                    }, 0);
+                    const currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
+                    
+                    // BUG-023 FIX 2: Safety override when LOW signals dominate
+                    // Count period signals
+                    let lowPeriodCount = 0;
+                    let highPeriodCount = 0;
+                    let safetyOverrideActive = false;
+                    let safetyOverrideReason = null;
+                    
+                    if (signalAnalysis?.periods) {
+                        signalAnalysis.periods.forEach(p => {
+                            if (p.medianDeviation < -10) lowPeriodCount++;
+                            else if (p.medianDeviation > 10) highPeriodCount++;
+                        });
+                    }
+                    
+                    const todaySignal = signalAnalysis?.signalOnlyAnchor;
+                    
+                    console.log('=== Safety Override Check ===');
+                    console.log(`LOW periods: ${lowPeriodCount}, HIGH periods: ${highPeriodCount}`);
+                    console.log(`Today's signal: ${todaySignal?.toFixed(1)}%, Current: ${currentBasalPercent?.toFixed(1)}%, Target: ${effectiveBasalTarget?.toFixed(1)}%`);
+                    
                     // Calculate Final % for basal optimization (same logic as auto-log)
                     let finalPercent = effectiveBasalTarget;
+                    
+                    // Safety override: don't increase basal when multiple periods are LOW
+                    if (lowPeriodCount >= 2 && effectiveBasalTarget > currentBasalPercent) {
+                        // Multiple LOW signals + target wants increase = DANGER
+                        if (todaySignal !== null && todaySignal < currentBasalPercent) {
+                            // Today's signal ALSO says decrease - definitely don't increase
+                            finalPercent = Math.min(currentBasalPercent, todaySignal);
+                            safetyOverrideActive = true;
+                            safetyOverrideReason = `${lowPeriodCount} periods show LOW signals and today's signal (${todaySignal.toFixed(1)}%) < current (${currentBasalPercent.toFixed(1)}%). Using today's signal instead of target.`;
+                        } else {
+                            // Today's signal is neutral/high but periods are LOW - hold at current
+                            finalPercent = currentBasalPercent;
+                            safetyOverrideActive = true;
+                            safetyOverrideReason = `${lowPeriodCount} periods show LOW signals. Holding at current (${currentBasalPercent.toFixed(1)}%) instead of increasing to target (${effectiveBasalTarget.toFixed(1)}%).`;
+                        }
+                        console.log(`SAFETY OVERRIDE: ${safetyOverrideReason}`);
+                    }
+                    
+                    // Safety override: don't decrease basal when multiple periods are HIGH  
+                    if (highPeriodCount >= 2 && effectiveBasalTarget < currentBasalPercent) {
+                        if (todaySignal !== null && todaySignal > currentBasalPercent) {
+                            finalPercent = Math.max(currentBasalPercent, todaySignal);
+                            safetyOverrideActive = true;
+                            safetyOverrideReason = `${highPeriodCount} periods show HIGH signals and today's signal (${todaySignal.toFixed(1)}%) > current (${currentBasalPercent.toFixed(1)}%). Using today's signal instead of target.`;
+                        } else {
+                            finalPercent = currentBasalPercent;
+                            safetyOverrideActive = true;
+                            safetyOverrideReason = `${highPeriodCount} periods show HIGH signals. Holding at current (${currentBasalPercent.toFixed(1)}%) instead of decreasing to target (${effectiveBasalTarget.toFixed(1)}%).`;
+                        }
+                        console.log(`SAFETY OVERRIDE: ${safetyOverrideReason}`);
+                    }
+                    
                     finalPercent = Math.max(30, Math.min(50, finalPercent)); // Guardrails
                     if (yesterdayFinal !== null && yesterdayFinal !== undefined) {
                         const maxDailyChange = 2.0;
@@ -3508,7 +4493,7 @@
                             finalPercent = yesterdayFinal - maxDailyChange;
                         }
                     }
-                    console.log('Final % for basal optimization:', finalPercent.toFixed(2));
+                    console.log('Final % for basal optimization:', finalPercent.toFixed(2), safetyOverrideActive ? '(SAFETY OVERRIDE)' : '');
                     
                     // Generate proposed basal schedule
                     const basalOptimization = BasalOptimizer.generateProposedSchedule({
@@ -3517,6 +4502,12 @@
                         finalPercent: finalPercent,
                         tdd: tddForSignal
                     });
+                    
+                    // Add safety override info to optimization result
+                    if (basalOptimization) {
+                        basalOptimization.safetyOverride = safetyOverrideActive;
+                        basalOptimization.safetyOverrideReason = safetyOverrideReason;
+                    }
                     
                     // Detect body state
                     const changeHistory = ChangeTracker.getHistory();
@@ -3548,7 +4539,8 @@
                         effectiveBasalTarget,
                         effectiveTargetSource,
                         finalPercent,
-                        basalOptimization
+                        basalOptimization,
+                        tdd: tddForSignal  // BUG-022: Include TDD for output context
                     });
                     setBodyState(detectedState);
                     setBundles(processedBundles);
@@ -3564,21 +4556,111 @@
                 }
             };
             
-            // Aggregate similar findings
+            // Aggregate similar findings with recency tracking
             const aggregateFindings = (findings) => {
                 const grouped = {};
+                const now = new Date();
+                
+                // Finding types that are always "current" (structural or from current analysis)
+                const alwaysCurrentTypes = [
+                    'basal_ratio_exceeded',
+                    'basal_signal_high',
+                    'basal_signal_low', 
+                    'basal_signal_neutral',
+                    'slot_conflict'
+                ];
                 
                 findings.forEach(finding => {
                     const key = `${finding.type}_${finding.scheduleTime}_${finding.primaryParameter}`;
                     
+                    // Check if this is a structural finding that's always current
+                    const isAlwaysCurrent = alwaysCurrentTypes.some(t => finding.type?.includes(t)) ||
+                                           finding.type?.startsWith('basal_signal') ||
+                                           finding.type === 'basal_ratio_exceeded';
+                    
+                    // Get event time from finding - try multiple sources (BUG-022: prioritize eventTime)
+                    let eventTime = null;
+                    if (finding.eventTime) {
+                        // New field added to all detectors
+                        eventTime = new Date(finding.eventTime);
+                    } else if (finding.time) {
+                        eventTime = new Date(finding.time);
+                    } else if (finding.localTime) {
+                        eventTime = new Date(finding.localTime);
+                    } else if (finding.events?.[0]) {
+                        // Try to get original timestamp from events
+                        const event = finding.events[0];
+                        const eventTimeStr = event.created_at || event.dateString || event.localTime;
+                        if (eventTimeStr) {
+                            eventTime = new Date(eventTimeStr);
+                        }
+                    }
+                    
+                    // Validate the parsed date
+                    if (eventTime && isNaN(eventTime.getTime())) {
+                        console.log(`Invalid date for finding ${finding.type}: eventTime=${finding.eventTime}, time=${finding.time}`);
+                        eventTime = null;
+                    }
+                    
+                    const hoursAgo = eventTime ? (now - eventTime) / (1000 * 60 * 60) : null;
+                    
                     if (!grouped[key]) {
-                        grouped[key] = { ...finding, similarEventsCount: 1 };
+                        grouped[key] = { 
+                            ...finding, 
+                            similarEventsCount: 1,
+                            // Recency tracking
+                            eventsLast24h: isAlwaysCurrent ? 1 : (hoursAgo !== null && hoursAgo <= 24 ? 1 : 0),
+                            eventsLast3Days: isAlwaysCurrent ? 1 : (hoursAgo !== null && hoursAgo <= 72 ? 1 : 0),
+                            mostRecentTime: isAlwaysCurrent ? now : eventTime,
+                            hoursSinceMostRecent: isAlwaysCurrent ? 0 : hoursAgo,
+                            isStructural: isAlwaysCurrent
+                        };
                     } else {
                         grouped[key].similarEventsCount++;
-                        grouped[key].events = [...grouped[key].events, ...finding.events];
+                        grouped[key].events = [...(grouped[key].events || []), ...(finding.events || [])];
                         grouped[key].severity = Math.max(grouped[key].severity, finding.severity);
-                        grouped[key].daysWithPattern++;
+                        grouped[key].daysWithPattern = (grouped[key].daysWithPattern || 1) + 1;
+                        
+                        // Update recency tracking (skip for structural findings)
+                        if (!isAlwaysCurrent && hoursAgo !== null) {
+                            if (hoursAgo <= 24) grouped[key].eventsLast24h++;
+                            if (hoursAgo <= 72) grouped[key].eventsLast3Days++;
+                            
+                            // Track most recent
+                            if (!grouped[key].mostRecentTime || eventTime > grouped[key].mostRecentTime) {
+                                grouped[key].mostRecentTime = eventTime;
+                                grouped[key].hoursSinceMostRecent = hoursAgo;
+                            }
+                        }
                     }
+                });
+                
+                // Calculate recency tier for each grouped finding
+                Object.values(grouped).forEach(finding => {
+                    // Structural findings are always current
+                    if (finding.isStructural) {
+                        finding.recencyTier = 'CURRENT';
+                        finding.eventsLast24h = Math.max(1, finding.eventsLast24h);
+                        finding.eventsLast3Days = Math.max(1, finding.eventsLast3Days);
+                        finding.hoursSinceMostRecent = 0;
+                        console.log(`Finding ${finding.type} @ ${finding.scheduleTime}: STRUCTURAL - always current`);
+                        return;
+                    }
+                    
+                    const hours = finding.hoursSinceMostRecent;
+                    if (hours === null || hours === undefined || isNaN(hours)) {
+                        finding.recencyTier = 'UNKNOWN';
+                    } else if (hours <= 24) {
+                        finding.recencyTier = 'CURRENT';
+                    } else if (hours <= 72) {
+                        finding.recencyTier = 'RECENT';
+                    } else if (hours <= 168) { // 7 days
+                        finding.recencyTier = 'STALE';
+                    } else {
+                        finding.recencyTier = 'EXPIRED';
+                    }
+                    
+                    console.log(`Finding ${finding.type} @ ${finding.scheduleTime}: ${finding.eventsLast24h} last 24h, ${finding.eventsLast3Days} last 3d, hours=${hours?.toFixed(1)}, tier=${finding.recencyTier}`);
                 });
                 
                 return Object.values(grouped);
@@ -3594,7 +4676,8 @@
                     bodyState,
                     bundles,
                     schedules,
-                    CONFIG
+                    CONFIG,
+                    dynamicTarget // BUG-023: Pass dynamic target info for gap/stale detection display
                 );
                 
                 try {
@@ -4034,24 +5117,35 @@
                                     </div>
                                 )}
                                 
-                                {/* Dynamic Target Indicator (BUG-018) */}
+                                {/* Dynamic Target Indicator (BUG-018, BUG-023) */}
                                 {analysisResults.effectiveTargetSource && (
                                     <div className={`glass-card rounded-xl p-4 ${
                                         analysisResults.effectiveTargetSource === 'dynamic' 
                                             ? 'border border-cyan-500/30 bg-cyan-500/5' 
+                                            : analysisResults.effectiveTargetSource === 'signal-fallback'
+                                            ? 'border border-amber-500/30 bg-amber-500/5'
                                             : 'border border-gray-600'
                                     }`}>
                                         <div className="flex items-center justify-between">
                                             <div className="flex items-center gap-2">
                                                 <span className={`text-sm font-medium ${
-                                                    analysisResults.effectiveTargetSource === 'dynamic' ? 'text-cyan-400' : 'text-gray-400'
+                                                    analysisResults.effectiveTargetSource === 'dynamic' ? 'text-cyan-400' : 
+                                                    analysisResults.effectiveTargetSource === 'signal-fallback' ? 'text-amber-400' :
+                                                    'text-gray-400'
                                                 }`}>
-                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? '🎯 Dynamic Target' : '📌 Configured Target'}
+                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? '🎯 Dynamic Target' : 
+                                                     analysisResults.effectiveTargetSource === 'signal-fallback' ? '📡 Signal Fallback' :
+                                                     '📌 Configured Target'}
                                                 </span>
                                                 <span className="text-white font-bold">
                                                     {analysisResults.effectiveBasalTarget?.toFixed(1) || basalTDDPercent}%
                                                 </span>
-                                                {dynamicTarget?.confidence && (
+                                                {analysisResults.effectiveTargetSource === 'signal-fallback' && (
+                                                    <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400">
+                                                        {dynamicTarget?.hasGap ? 'Gap Detected' : 'Insufficient History'}
+                                                    </span>
+                                                )}
+                                                {dynamicTarget?.confidence && analysisResults.effectiveTargetSource !== 'signal-fallback' && (
                                                     <span className={`text-xs px-1.5 py-0.5 rounded ${
                                                         dynamicTarget.confidence === 'HIGH' ? 'bg-green-500/20 text-green-400' :
                                                         dynamicTarget.confidence === 'MEDIUM' ? 'bg-yellow-500/20 text-yellow-400' :
@@ -4111,7 +5205,7 @@
                                 {/* Basal Optimization (BUG-019) */}
                                 {analysisResults.basalOptimization && analysisResults.basalOptimization.distribution?.direction !== 'none' && (
                                     <div className="glass-card rounded-2xl p-6">
-                                        <div className="flex items-center justify-between mb-4">
+                                        <div className="flex items-center justify-between mb-2">
                                             <h2 className="text-xl font-bold text-white flex items-center gap-2">
                                                 📊 Proposed Basal Schedule
                                             </h2>
@@ -4132,6 +5226,13 @@
                                                 </span>
                                             </div>
                                         </div>
+                                        
+                                        {/* Target calculation context */}
+                                        {analysisResults.tdd && analysisResults.finalPercent && (
+                                            <div className="text-xs text-gray-500 mb-4">
+                                                Target: {analysisResults.finalPercent.toFixed(1)}% × {analysisResults.tdd.toFixed(1)} U TDD = {((analysisResults.finalPercent / 100) * analysisResults.tdd).toFixed(2)} U/day
+                                            </div>
+                                        )}
                                         
                                         {/* Hour-by-hour grid (v25 style) */}
                                         {analysisResults.basalOptimization.hourlyChanges && (
@@ -4158,17 +5259,27 @@
                                         {/* Distribution info */}
                                         {analysisResults.basalOptimization.distribution?.appliedHours?.length > 0 && (
                                             <div className="mt-4 text-xs text-gray-500">
-                                                <span className="text-gray-400">Distribution priority:</span>{' '}
+                                                <span className="text-gray-400">Distribution:</span>{' '}
                                                 {analysisResults.basalOptimization.distribution.matchingPeriods?.length > 0 && (
                                                     <span className="text-green-400">
                                                         Signal-aligned: {analysisResults.basalOptimization.distribution.matchingPeriods.join(', ')}
                                                     </span>
                                                 )}
-                                                {analysisResults.basalOptimization.distribution.nonMatchingPeriods?.length > 0 && (
-                                                    <span className="text-gray-500 ml-2">
-                                                        | Other: {analysisResults.basalOptimization.distribution.nonMatchingPeriods.join(', ')}
+                                                {analysisResults.basalOptimization.distribution.neutralPeriods?.length > 0 && (
+                                                    <span className="text-gray-400 ml-2">
+                                                        | Neutral: {analysisResults.basalOptimization.distribution.neutralPeriods.join(', ')}
                                                     </span>
                                                 )}
+                                                {analysisResults.basalOptimization.distribution.skippedPeriods?.length > 0 && (
+                                                    <span className="text-orange-400 ml-2">
+                                                        | Skipped: {analysisResults.basalOptimization.distribution.skippedPeriods.join(', ')}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        )}
+                                        {analysisResults.basalOptimization.distribution?.incrementsSkipped > 0 && (
+                                            <div className="mt-2 text-xs text-orange-400">
+                                                ⚠️ {analysisResults.basalOptimization.distribution.incrementsSkipped} increment(s) not applied - avoiding opposite-signal periods
                                             </div>
                                         )}
                                     </div>
@@ -4196,12 +5307,12 @@
                                     </div>
                                 )}
                                 
-                                {/* Tonight's Action */}
+                                {/* Tonight's Action - now supports multiple PRIMARY bundles */}
                                 <div className="glass-card rounded-2xl p-6">
                                     <h2 className="text-xl font-bold text-white mb-4">Tonight's Action</h2>
                                     
                                     {(() => {
-                                        const primary = bundles.find(b => b.priority === 'PRIMARY');
+                                        const primaryBundles = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
                                         const blockedSafetyBundles = bundles.filter(b => 
                                             b.tier === Tier.SAFETY && 
                                             b.blockedBy && 
@@ -4209,7 +5320,7 @@
                                         );
                                         
                                         // Case 1: No primary and safety bundles were blocked
-                                        if (!primary && blockedSafetyBundles.length > 0) {
+                                        if (primaryBundles.length === 0 && blockedSafetyBundles.length > 0) {
                                             return (
                                                 <div className="space-y-4">
                                                     <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4">
@@ -4253,7 +5364,7 @@
                                         }
                                         
                                         // Case 2: No primary and no blocked bundles - truly nothing
-                                        if (!primary || primary.recommendations.length === 0) {
+                                        if (primaryBundles.length === 0) {
                                             return (
                                                 <div className="text-center py-8 text-gray-400">
                                                     <span className="text-4xl mb-2 block">✓</span>
@@ -4262,69 +5373,140 @@
                                             );
                                         }
                                         
-                                        // Case 3: Normal primary recommendation
+                                        // Case 3: One or more primary recommendations
                                         return (
-                                            <div className={`border-l-4 tier-${primary.tier} pl-4`}>
-                                                <div className="flex items-center gap-3 mb-3">
-                                                    <h3 className="text-lg font-semibold text-white">{primary.name}</h3>
-                                                    <TierBadge tier={primary.tier} />
-                                                </div>
-                                                <p className="text-gray-400 text-sm mb-4">{primary.rootCause}</p>
-                                                
-                                                {primary.signalConflict && (
-                                                    <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-3 mb-4">
-                                                        <p className="text-orange-400 text-sm">{primary.signalConflict}</p>
+                                            <div className="space-y-6">
+                                                {/* Summary when multiple actions */}
+                                                {primaryBundles.length > 1 && (
+                                                    <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
+                                                        <p className="text-blue-400 font-medium">
+                                                            📋 {primaryBundles.length} actions recommended
+                                                            {primaryBundles.some(b => b.isUrgent) && (
+                                                                <span className="ml-2 text-red-400">
+                                                                    ({primaryBundles.filter(b => b.isUrgent).length} urgent)
+                                                                </span>
+                                                            )}
+                                                        </p>
+                                                        <p className="text-gray-400 text-sm mt-1">
+                                                            Affecting: {[...new Set(primaryBundles.map(b => b.timeBlock))].join(', ')}
+                                                        </p>
                                                     </div>
                                                 )}
                                                 
-                                                <div className="overflow-x-auto">
-                                                    <table className="w-full text-sm">
-                                                        <thead>
-                                                            <tr className="text-gray-400 border-b border-gray-700">
-                                                                <th className="text-left py-2">Parameter</th>
-                                                                <th className="text-right py-2">Current</th>
-                                                                <th className="text-right py-2">Recommended</th>
-                                                                <th className="text-right py-2">Change</th>
-                                                                <th className="text-center py-2">Status</th>
-                                                            </tr>
-                                                        </thead>
-                                                        <tbody>
-                                                            {primary.recommendations.map((rec, idx) => (
-                                                                <tr key={idx} className="border-b border-gray-700/50">
-                                                                    <td className="py-3 text-white font-mono">
-                                                                        {rec.scheduleTime} {rec.param}
-                                                                    </td>
-                                                                    <td className="text-right text-gray-400 font-mono">{rec.currentValue}</td>
-                                                                    <td className="text-right text-white font-mono font-bold">{rec.newValue}</td>
-                                                                    <td className={`text-right font-mono ${rec.changePercent < 0 ? 'text-red-400' : 'text-green-400'}`}>
-                                                                        {rec.changePercent >= 0 ? '+' : ''}{rec.changePercent.toFixed(1)}%
-                                                                    </td>
-                                                                    <td className="text-center">
-                                                                        {ProtectionSystem.getProtectionIcon(rec.protectionLevel)}
-                                                                    </td>
-                                                                </tr>
-                                                            ))}
-                                                        </tbody>
-                                                    </table>
-                                                </div>
-                                                
-                                                <div className="mt-4 flex items-center justify-between text-sm">
-                                                    <span className="text-gray-400">
-                                                        Evidence: {primary.evidenceSummary}
-                                                    </span>
-                                                    {primary.compoundEffect?.description && (
-                                                        <span className={`${primary.compoundEffect.warning ? 'text-yellow-400' : 'text-gray-400'}`}>
-                                                            Compound: {primary.compoundEffect.description}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                
-                                                <button
-                                                    onClick={() => primary.recommendations.forEach(logAppliedChange)}
-                                                    className="mt-4 px-4 py-2 bg-green-600/20 hover:bg-green-600/30 text-green-400 border border-green-500/30 rounded-lg text-sm transition-colors"
-                                                >
-                                                    Log as Applied
-                                                </button>
+                                                {primaryBundles.map((primary, bundleIdx) => (
+                                                    <div key={primary.id} className={`border-l-4 tier-${primary.tier} pl-4 ${bundleIdx > 0 ? 'pt-4 border-t border-gray-700' : ''}`}>
+                                                        <div className="flex items-center gap-3 mb-3 flex-wrap">
+                                                            {/* Recency indicator */}
+                                                            <span className={`text-sm ${
+                                                                primary.hasRecentEvents ? 'text-green-400' :
+                                                                primary.hasLast3DayEvents ? 'text-yellow-400' :
+                                                                'text-gray-500'
+                                                            }`}>
+                                                                {primary.hasRecentEvents ? '●' :
+                                                                 primary.hasLast3DayEvents ? '○' : '◌'}
+                                                            </span>
+                                                            <h3 className="text-lg font-semibold text-white">{primary.name}</h3>
+                                                            <TierBadge tier={primary.tier} />
+                                                            {primary.isUrgent && (
+                                                                <span className="px-2 py-0.5 bg-red-500/20 text-red-400 text-xs rounded-full animate-pulse">
+                                                                    🚨 URGENT
+                                                                </span>
+                                                            )}
+                                                            {primaryBundles.length > 1 && (
+                                                                <span className="px-2 py-0.5 bg-gray-500/20 text-gray-400 text-xs rounded-full">
+                                                                    {primary.timeBlock}
+                                                                </span>
+                                                            )}
+                                                            {!primary.hasRecentEvents && !primary.hasLast3DayEvents && (
+                                                                <span className="px-2 py-0.5 bg-yellow-500/20 text-yellow-400 text-xs rounded-full">
+                                                                    CAUTION: No recent events
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        
+                                                        {primary.urgentReason && (
+                                                            <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 mb-4">
+                                                                <p className="text-red-400 text-sm font-medium">⚠️ {primary.urgentReason}</p>
+                                                            </div>
+                                                        )}
+                                                        
+                                                        <p className="text-gray-400 text-sm mb-4">{primary.rootCause}</p>
+                                                        
+                                                        {primary.signalConflict && (
+                                                            <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-3 mb-4">
+                                                                <p className="text-orange-400 text-sm">{primary.signalConflict}</p>
+                                                            </div>
+                                                        )}
+                                                        
+                                                        <div className="overflow-x-auto">
+                                                            <table className="w-full text-sm">
+                                                                <thead>
+                                                                    <tr className="text-gray-400 border-b border-gray-700">
+                                                                        <th className="text-left py-2">Parameter</th>
+                                                                        <th className="text-right py-2">Current</th>
+                                                                        <th className="text-right py-2">Recommended</th>
+                                                                        <th className="text-right py-2">Change</th>
+                                                                        <th className="text-center py-2">Status</th>
+                                                                    </tr>
+                                                                </thead>
+                                                                <tbody>
+                                                                    {primary.recommendations.map((rec, idx) => (
+                                                                        <tr key={idx} className="border-b border-gray-700/50">
+                                                                            <td className="py-3 text-white font-mono">
+                                                                                {rec.scheduleTime} {rec.param}
+                                                                            </td>
+                                                                            <td className="text-right text-gray-400 font-mono">{rec.currentValue}</td>
+                                                                            <td className="text-right text-white font-mono font-bold">{rec.newValue}</td>
+                                                                            <td className={`text-right font-mono ${rec.changePercent < 0 ? 'text-red-400' : 'text-green-400'}`}>
+                                                                                {rec.changePercent >= 0 ? '+' : ''}{rec.changePercent.toFixed(1)}%
+                                                                            </td>
+                                                                            <td className="text-center">
+                                                                                {ProtectionSystem.getProtectionIcon(rec.protectionLevel)}
+                                                                            </td>
+                                                                        </tr>
+                                                                    ))}
+                                                                </tbody>
+                                                            </table>
+                                                        </div>
+                                                        
+                                                        {/* Detailed Evidence Section */}
+                                                        <div className="mt-4 border-t border-gray-700 pt-4">
+                                                            <div className="text-sm text-gray-400 mb-2">Evidence:</div>
+                                                            {primary.evidenceDetails && primary.evidenceDetails.length > 0 ? (
+                                                                <div className="space-y-1.5">
+                                                                    {primary.evidenceDetails.map((ev, evIdx) => (
+                                                                        <div key={evIdx} className="flex items-start gap-2 text-sm">
+                                                                            <span className={`flex-shrink-0 ${
+                                                                                ev.icon === '✓' ? 'text-green-400' :
+                                                                                ev.icon === '○' ? 'text-yellow-400' :
+                                                                                ev.icon === '●' ? 'text-blue-400' :
+                                                                                'text-gray-500'
+                                                                            }`}>{ev.icon}</span>
+                                                                            <span className="text-gray-300">{ev.detail}</span>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            ) : (
+                                                                <span className="text-gray-400 text-sm">{primary.evidenceSummary}</span>
+                                                            )}
+                                                        </div>
+                                                        
+                                                        {primary.compoundEffect?.description && (
+                                                            <div className="mt-3 text-sm">
+                                                                <span className={`${primary.compoundEffect.warning ? 'text-yellow-400' : 'text-gray-400'}`}>
+                                                                    Compound: {primary.compoundEffect.description}
+                                                                </span>
+                                                            </div>
+                                                        )}
+                                                        
+                                                        <button
+                                                            onClick={() => primary.recommendations.forEach(logAppliedChange)}
+                                                            className="mt-4 px-4 py-2 bg-green-600/20 hover:bg-green-600/30 text-green-400 border border-green-500/30 rounded-lg text-sm transition-colors"
+                                                        >
+                                                            Log as Applied
+                                                        </button>
+                                                    </div>
+                                                ))}
                                             </div>
                                         );
                                     })()}
@@ -4346,12 +5528,22 @@
                                             <div className="space-y-4">
                                                 {watchBundles.map(bundle => (
                                                     <div key={bundle.id} className={`border-l-4 ${
+                                                        bundle.isStale ? 'border-l-gray-600 opacity-60' :
                                                         bundle.isSlotConflict ? 'border-l-purple-500' :
                                                         bundle.isBasalRatioWarning ? 'border-l-orange-500' :
                                                         `tier-${bundle.tier}`
                                                     } pl-4 py-2`}>
                                                         <div className="flex items-center justify-between">
                                                             <div className="flex items-center gap-2">
+                                                                {/* Recency indicator */}
+                                                                <span className={`text-xs ${
+                                                                    bundle.hasRecentEvents ? 'text-green-400' :
+                                                                    bundle.hasLast3DayEvents ? 'text-yellow-400' :
+                                                                    'text-gray-500'
+                                                                }`}>
+                                                                    {bundle.hasRecentEvents ? '●' :
+                                                                     bundle.hasLast3DayEvents ? '○' : '◌'}
+                                                                </span>
                                                                 <span className="text-white font-medium">{bundle.name}</span>
                                                                 {!bundle.isSlotConflict && !bundle.isBasalRatioWarning && (
                                                                     <TierBadge tier={bundle.tier} />
@@ -4359,6 +5551,11 @@
                                                                 {bundle.isSlotConflict && (
                                                                     <span className="px-2 py-0.5 bg-purple-500/20 text-purple-400 text-xs rounded-full">
                                                                         CONFLICT
+                                                                    </span>
+                                                                )}
+                                                                {bundle.isStale && (
+                                                                    <span className="px-2 py-0.5 bg-gray-500/20 text-gray-400 text-xs rounded-full">
+                                                                        STALE
                                                                     </span>
                                                                 )}
                                                             </div>
