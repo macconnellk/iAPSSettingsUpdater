@@ -674,8 +674,8 @@
                     calculatedConfidence: this.calculateConfidence(f, bodyState)
                 }));
                 
-                // Step 3: Group into bundles
-                const bundles = this.createBundles(scoredFindings, schedules, bodyState, signalAnalysis);
+                // Step 3: Group into bundles (pass basalRatioInfo for ratio protection)
+                const bundles = this.createBundles(scoredFindings, schedules, bodyState, signalAnalysis, basalRatioInfo);
                 
                 // Step 3b: Add conflict bundles if any
                 slotConflicts.forEach(conflict => {
@@ -958,7 +958,7 @@
                 return Math.min(base, 1.0);
             },
             
-            createBundles(findings, schedules, bodyState, signalAnalysis) {
+            createBundles(findings, schedules, bodyState, signalAnalysis, basalRatioInfo = null) {
                 // Group findings by root cause / time window
                 const bundles = [];
                 
@@ -978,7 +978,8 @@
                         this.generateSafetyBundleName(finding),
                         Tier.SAFETY,
                         [finding],
-                        schedules
+                        schedules,
+                        basalRatioInfo
                     );
                     
                     // Add signal conflict warning to bundle if present
@@ -1009,7 +1010,8 @@
                         name,
                         tier,
                         windowFindings,
-                        schedules
+                        schedules,
+                        basalRatioInfo
                     ));
                 });
                 
@@ -1132,9 +1134,9 @@
                 return `${window} ${param.toUpperCase()} ${type}`;
             },
             
-            createBundle(id, name, tier, findings, schedules) {
+            createBundle(id, name, tier, findings, schedules, basalRatioInfo = null) {
                 const recommendations = findings.map(f => 
-                    this.findingToRecommendation(f, schedules)
+                    this.findingToRecommendation(f, schedules, basalRatioInfo)
                 ).filter(r => r !== null);
                 
                 const confidence = findings.length > 0
@@ -1158,7 +1160,7 @@
                 };
             },
             
-            findingToRecommendation(finding, schedules) {
+            findingToRecommendation(finding, schedules, basalRatioInfo = null) {
                 if (!finding.primaryParameter || !finding.scheduleTime) return null;
                 
                 const schedule = schedules[finding.primaryParameter.toLowerCase()];
@@ -1171,6 +1173,9 @@
                     (this.isStrengthening(finding) ? -2 : 5);
                 
                 let newValue;
+                let ratioProtected = false;
+                let ratioProtectionReason = null;
+                
                 if (finding.primaryParameter === 'basal') {
                     // For basal, round to pump increment (0.05)
                     const rawNew = currentEntry.value * (1 + changePercent / 100);
@@ -1186,8 +1191,55 @@
                         newValue = Math.max(CONFIG.pumpIncrement, newValue);
                     }
                     newValue = Math.round(newValue * 20) / 20; // Final rounding
+                    
+                    // Apply ratio protection for basal changes
+                    if (basalRatioInfo && basalRatioInfo.exceedsCap) {
+                        const targetRatioCap = 2.0;
+                        const isDecrease = newValue < currentEntry.value;
+                        const isIncrease = newValue > currentEntry.value;
+                        
+                        if (isDecrease) {
+                            // When decreasing and ratio already exceeded:
+                            // Don't allow ANY rate to go to or below current minimum
+                            // This prevents entrenching low rates
+                            const minAllowedRate = Math.round((basalRatioInfo.maxRate / targetRatioCap) * 20) / 20;
+                            const strictMinRate = basalRatioInfo.minRate + CONFIG.pumpIncrement; // Stay above current min
+                            const effectiveMin = Math.max(minAllowedRate, strictMinRate);
+                            
+                            if (newValue < effectiveMin) {
+                                console.log(`Ratio protection: Blocking decrease from ${currentEntry.value} to ${newValue} (min allowed: ${effectiveMin})`);
+                                // If current value is already at or near min, block entirely
+                                if (currentEntry.value <= effectiveMin) {
+                                    newValue = currentEntry.value; // No change
+                                    ratioProtected = true;
+                                    ratioProtectionReason = `Rate already at/near minimum (${basalRatioInfo.minRate} U/hr) - cannot decrease further`;
+                                } else {
+                                    newValue = effectiveMin; // Clamp to minimum allowed
+                                    ratioProtected = true;
+                                    ratioProtectionReason = `Clamped to ${effectiveMin} U/hr floor to protect ratio`;
+                                }
+                            }
+                        } else if (isIncrease) {
+                            // When increasing: don't go above (minRate * targetRatioCap)
+                            const maxAllowedRate = Math.round((basalRatioInfo.minRate * targetRatioCap) * 20) / 20;
+                            if (newValue > maxAllowedRate) {
+                                console.log(`Ratio protection: Blocking increase from ${currentEntry.value} to ${newValue} (max allowed: ${maxAllowedRate})`);
+                                newValue = Math.min(currentEntry.value, maxAllowedRate); // Don't increase past threshold
+                                ratioProtected = true;
+                                ratioProtectionReason = `Would worsen ratio above ${maxAllowedRate} U/hr ceiling`;
+                            }
+                        }
+                    }
                 } else {
                     newValue = parseFloat((currentEntry.value * (1 + changePercent / 100)).toFixed(1));
+                }
+                
+                // If ratio protection blocked the change entirely, don't create recommendation
+                if (newValue === currentEntry.value) {
+                    if (ratioProtected) {
+                        console.log(`Ratio protection: Skipping recommendation for ${finding.scheduleTime} - change blocked to maintain ratio`);
+                    }
+                    return null;
                 }
                 
                 // Recalculate actual change percent based on rounded values
@@ -1199,8 +1251,9 @@
                     currentValue: currentEntry.value,
                     newValue,
                     changePercent: actualChangePercent,
-                    protectionLevel: ProtectionLevel.CLEAR,
-                    protectionReason: null
+                    protectionLevel: ratioProtected ? ProtectionLevel.CAUTION : ProtectionLevel.CLEAR,
+                    protectionReason: ratioProtectionReason,
+                    ratioProtected
                 };
             },
             
@@ -3032,11 +3085,45 @@
             /**
              * Distribute increments across hours, prioritizing periods where
              * signal matches the direction of change needed.
+             * Includes ratio protection to avoid making basal ratio worse.
              */
-            distributeIncrements(currentHourly, periodSignals, incrementsNeeded) {
+            distributeIncrements(currentHourly, periodSignals, incrementsNeeded, ratioProtection = null) {
                 const schedule = [...currentHourly];
                 const isDecrease = incrementsNeeded < 0;
                 const isIncrease = !isDecrease;
+                
+                // Calculate current ratio for protection
+                const currentMax = Math.max(...schedule);
+                const currentMin = Math.min(...schedule.filter(r => r > 0));
+                const currentRatio = currentMax / currentMin;
+                const targetRatioCap = 2.0; // Don't let ratio exceed 2:1
+                
+                // Calculate protection thresholds MORE STRICTLY
+                // When decreasing: don't reduce any rate to or below the minimum needed to maintain ratio
+                // This prevents entrenching low rates that worsen the ratio
+                const minAllowedRate = isDecrease 
+                    ? Math.max(currentMax / targetRatioCap, currentMin) // Don't go below current min OR ratio floor
+                    : this.PUMP_INCREMENT;
+                const maxAllowedRate = isIncrease 
+                    ? Math.min(currentMin * targetRatioCap, currentMax) // Don't go above current max OR ratio ceiling
+                    : Infinity;
+                
+                // If ratio already exceeds cap and we're decreasing, be even stricter
+                // Don't decrease ANY rate that's near the minimum
+                const ratioAlreadyExceeded = currentRatio > targetRatioCap;
+                const strictMinThreshold = ratioAlreadyExceeded && isDecrease 
+                    ? currentMin + this.PUMP_INCREMENT // Don't let anything get within one increment of min
+                    : minAllowedRate;
+                
+                console.log('Ratio protection:', {
+                    currentRatio: currentRatio.toFixed(2),
+                    ratioExceeded: ratioAlreadyExceeded,
+                    currentMax,
+                    currentMin,
+                    minAllowedRate: minAllowedRate.toFixed(2),
+                    strictMinThreshold: strictMinThreshold.toFixed(2),
+                    maxAllowedRate: maxAllowedRate === Infinity ? 'Infinity' : maxAllowedRate.toFixed(2)
+                });
                 
                 // Build period info with signal direction categorization
                 const periodInfo = CIRCADIAN_PERIODS.map(period => {
@@ -3117,25 +3204,43 @@
                 let remaining = Math.abs(incrementsNeeded);
                 const delta = isDecrease ? -this.PUMP_INCREMENT : this.PUMP_INCREMENT;
                 const appliedHours = [];
+                let ratioBlockedCount = 0;
                 
                 for (const { hour, period } of spreadOrder) {
                     if (remaining <= 0) break;
                     const newRate = schedule[hour] + delta;
-                    if (newRate >= this.PUMP_INCREMENT) {
-                        schedule[hour] = this.roundToIncrement(newRate);
-                        remaining--;
-                        appliedHours.push({
-                            hour,
-                            period,
-                            delta,
-                            newRate: schedule[hour]
-                        });
+                    
+                    // Check minimum rate (can't go below pump increment)
+                    if (newRate < this.PUMP_INCREMENT) {
+                        continue;
                     }
+                    
+                    // Check ratio protection - use stricter threshold when ratio already exceeded
+                    const effectiveMinAllowed = ratioAlreadyExceeded ? strictMinThreshold : minAllowedRate;
+                    if (isDecrease && newRate < effectiveMinAllowed) {
+                        console.log(`Ratio protection: Skipping hour ${hour} - would reduce to ${newRate.toFixed(2)} below min allowed ${effectiveMinAllowed.toFixed(2)}`);
+                        ratioBlockedCount++;
+                        continue;
+                    }
+                    if (isIncrease && newRate > maxAllowedRate) {
+                        console.log(`Ratio protection: Skipping hour ${hour} - would increase to ${newRate.toFixed(2)} above max allowed ${maxAllowedRate.toFixed(2)}`);
+                        ratioBlockedCount++;
+                        continue;
+                    }
+                    
+                    schedule[hour] = this.roundToIncrement(newRate);
+                    remaining--;
+                    appliedHours.push({
+                        hour,
+                        period,
+                        delta,
+                        newRate: schedule[hour]
+                    });
                 }
                 
                 // Log if we couldn't apply all increments
                 if (remaining > 0) {
-                    console.log(`Distribution: ${remaining} increments could not be applied (avoiding opposite-signal periods)`);
+                    console.log(`Distribution: ${remaining} increments could not be applied (${ratioBlockedCount} blocked by ratio protection)`);
                 }
                 
                 console.log('Distribution:', {
@@ -3143,7 +3248,8 @@
                     neutral: neutral.map(p => p.period.name),
                     opposite: opposite.map(p => `${p.period.name} (${p.signalValue > 0 ? 'HIGH' : 'LOW'} - SKIPPED)`),
                     appliedCount: appliedHours.length,
-                    requestedCount: Math.abs(incrementsNeeded)
+                    requestedCount: Math.abs(incrementsNeeded),
+                    ratioBlocked: ratioBlockedCount
                 });
                 
                 return {
@@ -3152,7 +3258,14 @@
                     matchingPeriods: matching.map(p => p.period.name),
                     neutralPeriods: neutral.map(p => p.period.name),
                     skippedPeriods: opposite.map(p => p.period.name),
-                    incrementsSkipped: remaining
+                    incrementsSkipped: remaining,
+                    ratioProtection: {
+                        active: ratioBlockedCount > 0,
+                        blockedCount: ratioBlockedCount,
+                        currentRatio: currentRatio,
+                        minAllowedRate: this.roundToIncrement(minAllowedRate),
+                        maxAllowedRate: maxAllowedRate === Infinity ? null : this.roundToIncrement(maxAllowedRate)
+                    }
                 };
             }
         };
@@ -3529,6 +3642,10 @@
                     if (dist.incrementsSkipped > 0) {
                         output += `⚠️ ${dist.incrementsSkipped} increment(s) not applied - no suitable periods available.\n`;
                     }
+                    // Show ratio protection info
+                    if (dist.ratioProtection?.active) {
+                        output += `🛡️ **Ratio Protection:** ${dist.ratioProtection.blockedCount} change(s) blocked to maintain ≤2:1 ratio (min rate floor: ${dist.ratioProtection.minAllowedRate} U/hr)\n`;
+                    }
                     output += `\n`;
                 }
                 
@@ -3543,8 +3660,8 @@
                     if (primaryBundles.length > 0) {
                         primaryBundles.forEach(pb => {
                             pb.recommendations.forEach(rec => {
-                                if (rec.parameter.includes('basal')) {
-                                    output += `   - ${rec.parameter}: ${rec.current} → ${rec.recommended}\n`;
+                                if (rec.param === 'basal') {
+                                    output += `   - ${rec.scheduleTime} basal: ${rec.currentValue} → ${rec.newValue}\n`;
                                 }
                             });
                         });
@@ -3763,10 +3880,14 @@
             
             // Fetch data from Nightscout
             const fetchNightscoutData = async () => {
+                console.log('=== fetchNightscoutData called ===');
                 const { baseUrl, apiSecret, token } = nsConfig;
-                const headers = {};
+                console.log('NS Config:', { baseUrl, hasApiSecret: !!apiSecret, hasToken: !!token });
                 
-                if (apiSecret) {
+                // Only use api-secret header if NO token is provided
+                // When token is in URL, api-secret header causes CORS issues
+                const headers = {};
+                if (apiSecret && !token) {
                     headers['api-secret'] = apiSecret;
                 }
                 
@@ -3777,26 +3898,41 @@
                 try {
                     // Fetch glucose
                     const glucoseUrl = `${baseUrl}/api/v1/entries/sgv.json?count=${count}${authParam}`;
+                    console.log('Fetching glucose from:', glucoseUrl.replace(token || '', '[TOKEN]'));
                     const glucoseRes = await fetch(glucoseUrl, { headers });
-                    if (!glucoseRes.ok) throw new Error(`Glucose fetch failed: ${glucoseRes.status}`);
+                    if (!glucoseRes.ok) {
+                        console.error('Glucose fetch failed:', glucoseRes.status, glucoseRes.statusText);
+                        throw new Error(`Glucose fetch failed: ${glucoseRes.status} ${glucoseRes.statusText}`);
+                    }
                     const glucose = await glucoseRes.json();
+                    console.log('Glucose entries fetched:', glucose.length);
                     
                     // Fetch treatments
                     const treatmentsUrl = `${baseUrl}/api/v1/treatments.json?count=${count * 2}${authParam}`;
+                    console.log('Fetching treatments...');
                     const treatmentsRes = await fetch(treatmentsUrl, { headers });
-                    if (!treatmentsRes.ok) throw new Error(`Treatments fetch failed: ${treatmentsRes.status}`);
+                    if (!treatmentsRes.ok) {
+                        console.error('Treatments fetch failed:', treatmentsRes.status, treatmentsRes.statusText);
+                        throw new Error(`Treatments fetch failed: ${treatmentsRes.status} ${treatmentsRes.statusText}`);
+                    }
                     const treatments = await treatmentsRes.json();
+                    console.log('Treatments fetched:', treatments.length);
                     
                     // Fetch device status
                     const deviceStatusUrl = `${baseUrl}/api/v1/devicestatus.json?count=${count}${authParam}`;
+                    console.log('Fetching device status...');
                     const deviceStatusRes = await fetch(deviceStatusUrl, { headers });
                     let deviceStatus = [];
                     if (deviceStatusRes.ok) {
                         deviceStatus = await deviceStatusRes.json();
+                        console.log('Device status fetched:', deviceStatus.length);
+                    } else {
+                        console.warn('Device status fetch failed (non-fatal):', deviceStatusRes.status);
                     }
                     
                     // Fetch profile - CRITICAL for correct schedule data
-                    const profileUrl = `${baseUrl}/api/v1/profile.json?token=${token}`;
+                    const profileUrl = `${baseUrl}/api/v1/profile.json${token ? `?token=${token}` : ''}`;
+                    console.log('Fetching profile...');
                     const profileRes = await fetch(profileUrl, { headers });
                     let profile = null;
                     if (profileRes.ok) {
@@ -3804,7 +3940,10 @@
                         // Get the active profile (usually the first one)
                         if (profiles && profiles.length > 0) {
                             profile = profiles[0];
+                            console.log('Profile fetched:', profile.defaultProfile);
                         }
+                    } else {
+                        console.warn('Profile fetch failed (non-fatal):', profileRes.status);
                     }
                     
                     // Process treatments
@@ -3814,9 +3953,11 @@
                         }
                     });
                     
+                    console.log('=== fetchNightscoutData complete ===');
                     return { glucose, treatments, deviceStatus, profile };
                     
                 } catch (err) {
+                    console.error('Nightscout fetch error:', err);
                     throw new Error(`Nightscout fetch error: ${err.message}`);
                 }
             };
@@ -4243,17 +4384,21 @@
             
             // Run Analysis
             const runAnalysis = async () => {
+                console.log('=== runAnalysis started ===');
                 setStep('analyzing');
                 setError(null);
                 setTargetLoadError(null);
                 
                 try {
                     // Load dynamic basal target from history (BUG-018)
+                    console.log('Loading dynamic target...');
                     let effectiveBasalTarget = basalTDDPercent;
                     let effectiveTargetSource = 'configured';
                     let yesterdayFinal = null;
                     
                     const dynamicResult = await loadDynamicTarget();
+                    console.log('Dynamic target result:', dynamicResult);
+                    
                     if (dynamicResult && dynamicResult.value !== null && !dynamicResult.noRecentData) {
                         effectiveBasalTarget = dynamicResult.value;
                         effectiveTargetSource = 'dynamic';
@@ -4281,7 +4426,9 @@
                         console.log(`Dynamic target unavailable: ${reason} - will use today's signal as fallback`);
                     }
                     
+                    console.log('Fetching Nightscout data...');
                     const nightscoutData = await fetchNightscoutData();
+                    console.log('Nightscout data fetched successfully');
                     
                     // Parse and apply profile data (BUG-001 fix)
                     let activeSchedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule };
@@ -4698,33 +4845,72 @@
             
             // Copy for Claude review
             const copyForClaudeReview = async () => {
-                if (!analysisResults || !bodyState) return;
+                console.log('=== copyForClaudeReview called ===');
                 
-                const schedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule };
-                const output = OutputFormatter.formatForClaude(
-                    analysisResults,
-                    bodyState,
-                    bundles,
-                    schedules,
-                    CONFIG,
-                    dynamicTarget // BUG-023: Pass dynamic target info for gap/stale detection display
-                );
+                if (!analysisResults) {
+                    console.error('copyForClaudeReview: Missing analysisResults');
+                    alert('Analysis not complete. Please run analysis first.');
+                    return;
+                }
+                if (!bodyState) {
+                    console.error('copyForClaudeReview: Missing bodyState');
+                    alert('Body state not detected. Please run analysis first.');
+                    return;
+                }
+                if (!bundles) {
+                    console.error('copyForClaudeReview: Missing bundles');
+                    alert('Recommendations not generated. Please run analysis first.');
+                    return;
+                }
                 
                 try {
-                    await navigator.clipboard.writeText(output);
-                    setCopyStatus('copied');
-                    setTimeout(() => setCopyStatus('idle'), 2000);
+                    const schedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule };
+                    console.log('Calling OutputFormatter.formatForClaude with:', {
+                        hasAnalysisResults: !!analysisResults,
+                        hasBodyState: !!bodyState,
+                        bundlesCount: bundles?.length,
+                        hasSchedules: !!schedules,
+                        hasDynamicTarget: !!dynamicTarget
+                    });
+                    
+                    const output = OutputFormatter.formatForClaude(
+                        analysisResults,
+                        bodyState,
+                        bundles,
+                        schedules,
+                        CONFIG,
+                        dynamicTarget
+                    );
+                    
+                    if (!output) {
+                        console.error('copyForClaudeReview: formatForClaude returned empty');
+                        alert('Failed to generate report. Check console for details.');
+                        return;
+                    }
+                    
+                    console.log('Output generated, length:', output.length);
+                    
+                    try {
+                        await navigator.clipboard.writeText(output);
+                        setCopyStatus('copied');
+                        setTimeout(() => setCopyStatus('idle'), 2000);
+                    } catch (clipboardErr) {
+                        console.error('Clipboard API failed:', clipboardErr);
+                        // Fallback
+                        const textarea = document.createElement('textarea');
+                        textarea.value = output;
+                        document.body.appendChild(textarea);
+                        textarea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textarea);
+                        setCopyStatus('copied');
+                        setTimeout(() => setCopyStatus('idle'), 2000);
+                    }
                 } catch (err) {
-                    console.error('Copy failed:', err);
-                    // Fallback
-                    const textarea = document.createElement('textarea');
-                    textarea.value = output;
-                    document.body.appendChild(textarea);
-                    textarea.select();
-                    document.execCommand('copy');
-                    document.body.removeChild(textarea);
-                    setCopyStatus('copied');
-                    setTimeout(() => setCopyStatus('idle'), 2000);
+                    console.error('copyForClaudeReview error:', err);
+                    console.error('Error stack:', err.stack);
+                    setCopyStatus('idle');
+                    alert('Error generating report: ' + err.message + '\n\nCheck browser console for details.');
                 }
             };
             
