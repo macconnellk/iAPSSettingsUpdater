@@ -4262,56 +4262,43 @@
                 output += `| Low (54-70) | ${agp.tir.low.toFixed(0)}% | <${goals.low}% | ${agp.tir.low < goals.low ? '✓' : '⚠️'} |\n`;
                 output += `| Very Low (<54) | ${agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0)}% | <${goals.veryLow}% | ${agp.tir.veryLow < goals.veryLow ? '✓' : '⚠️'} |\n\n`;
                 
-                // Problem hours (TIR < 70%)
-                const problemHours = agp.hourlyStats.filter(h => h && h.tir.inRange < 70);
-                if (problemHours.length > 0) {
-                    output += `**Problem Hours (TIR <70%):**\n`;
-                    output += `| Hour | TIR | High% | VHigh% | Mean | SD | Pattern |\n`;
-                    output += `|------|-----|-------|--------|------|----|---------|\n`;
-                    
-                    problemHours.forEach(h => {
-                        const hourLabel = this.formatHourRange(h.hour);
-                        const pattern = this.identifyHourPattern(h.hour);
-                        output += `| ${hourLabel} | ${h.tir.inRange.toFixed(0)}% | ${h.tir.high.toFixed(0)}% | ${h.tir.veryHigh.toFixed(0)}% | ${h.mean.toFixed(0)} | ${h.sd.toFixed(0)} | ${pattern} |\n`;
-                    });
-                    output += `\n`;
-                }
+                // Full 24-hour breakdown
+                output += `**Hourly Breakdown:**\n`;
+                output += `| Hour | TIR | High | Low | Mean | SD | Status |\n`;
+                output += `|------|-----|------|-----|------|-----|--------|\n`;
                 
-                // Stable hours (TIR >= 85%) - limit to top 6
-                const stableHours = agp.hourlyStats
-                    .filter(h => h && h.tir.inRange >= 85)
-                    .sort((a, b) => b.tir.inRange - a.tir.inRange)
-                    .slice(0, 6);
-                if (stableHours.length > 0) {
-                    output += `**Stable Hours (TIR ≥85%, top ${stableHours.length}):**\n`;
-                    output += `| Hour | TIR | Mean | SD |\n`;
-                    output += `|------|-----|------|----|\n`;
+                for (let h = 0; h < 24; h++) {
+                    const stats = agp.hourlyStats[h];
+                    if (!stats) {
+                        const hourLabel = this.formatHourLabel(h);
+                        output += `| ${hourLabel} | - | - | - | - | - | No data |\n`;
+                        continue;
+                    }
                     
-                    // Sort back to chronological for display
-                    stableHours.sort((a, b) => a.hour - b.hour);
-                    stableHours.forEach(h => {
-                        const hourLabel = this.formatHourRange(h.hour);
-                        output += `| ${hourLabel} | ${h.tir.inRange.toFixed(0)}% | ${h.mean.toFixed(0)} | ${h.sd.toFixed(0)} |\n`;
-                    });
-                    output += `\n`;
-                }
-                
-                // Low risk hours
-                const lowRiskHours = agp.hourlyStats.filter(h => h && (h.tir.low + h.tir.veryLow) > 5);
-                if (lowRiskHours.length > 0) {
-                    output += `**Low Risk Hours (>5% time low):**\n`;
-                    output += `| Hour | Low% | VLow% | Min | Pattern |\n`;
-                    output += `|------|------|-------|-----|--------|\n`;
+                    const hourLabel = this.formatHourLabel(h);
+                    const tir = stats.tir.inRange.toFixed(0);
+                    const high = (stats.tir.high + stats.tir.veryHigh).toFixed(0);
+                    const low = (stats.tir.low + stats.tir.veryLow).toFixed(0);
+                    const mean = stats.mean.toFixed(0);
+                    const sd = stats.sd.toFixed(0);
                     
-                    lowRiskHours.forEach(h => {
-                        const hourLabel = this.formatHourRange(h.hour);
-                        const pattern = this.identifyHourPattern(h.hour);
-                        output += `| ${hourLabel} | ${h.tir.low.toFixed(0)}% | ${h.tir.veryLow.toFixed(0)}% | ${h.min} | ${pattern} |\n`;
-                    });
-                    output += `\n`;
+                    // Status indicator
+                    let status = '✓';
+                    if (stats.tir.inRange < 70) status = '⚠️ Low TIR';
+                    else if (stats.tir.low + stats.tir.veryLow > 5) status = '🔴 Lows';
+                    else if (stats.tir.inRange < 80) status = '○';
+                    
+                    output += `| ${hourLabel} | ${tir}% | ${high}% | ${low}% | ${mean} | ${sd} | ${status} |\n`;
                 }
+                output += `\n`;
                 
                 return output;
+            },
+            
+            formatHourLabel(hour) {
+                if (hour === 0) return '12am';
+                if (hour === 12) return '12pm';
+                return hour < 12 ? `${hour}am` : `${hour-12}pm`;
             },
             
             formatHourRange(hour) {
