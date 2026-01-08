@@ -166,6 +166,16 @@
             oscillationLookbackDays: 14
         };
         
+        // Helper to get local date in YYYY-MM-DD format
+        // Using toISOString().split('T')[0] returns UTC date, which can be wrong near midnight
+        // This returns the LOCAL date which is what users expect
+        const getLocalDateString = (date = new Date()) => {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        };
+        
         const CIRCADIAN_PERIODS = [
             { name: 'Deep Sleep', emoji: '🌙', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
             { name: 'Dawn', emoji: '🌅', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
@@ -222,7 +232,7 @@
                 const history = this.getHistory();
                 const newChange = {
                     id: `change_${Date.now()}`,
-                    date: new Date().toISOString().split('T')[0],
+                    date: getLocalDateString(),
                     timestamp: new Date().toISOString(),
                     ...change,
                     outcome: OutcomeType.PENDING,
@@ -238,7 +248,7 @@
                 const history = this.getHistory();
                 const newOverride = {
                     id: `override_${Date.now()}`,
-                    date: new Date().toISOString().split('T')[0],
+                    date: getLocalDateString(),
                     timestamp: new Date().toISOString(),
                     ...override
                 };
@@ -252,7 +262,7 @@
                 const change = history.changes.find(c => c.id === changeId);
                 if (change) {
                     change.outcome = outcome;
-                    change.outcomeDate = new Date().toISOString().split('T')[0];
+                    change.outcomeDate = getLocalDateString();
                     change.outcomeNotes = notes;
                     this.saveHistory(history);
                 }
@@ -285,7 +295,7 @@
                 const history = this.getHistory();
                 const override = history.overrides.find(o => o.id === overrideId);
                 if (override) {
-                    override.endDate = new Date().toISOString().split('T')[0];
+                    override.endDate = getLocalDateString();
                     this.saveHistory(history);
                 }
             },
@@ -2619,7 +2629,7 @@
                         date.setDate(date.getDate() - 1);
                     }
                     
-                    const nightOfDate = date.toISOString().split('T')[0];
+                    const nightOfDate = getLocalDateString(date);
                     return `${nightOfDate}_${segment.label}`;
                 };
                 
@@ -3675,6 +3685,15 @@
                     output += `\n---\n\n`;
                 }
                 
+                // Claude Review Prompts section
+                const reviewPrompts = this.generateClaudeReviewPrompts(
+                    analysisResults.findings,
+                    bundles,
+                    analysisResults.signalAnalysis,
+                    bodyState
+                );
+                output += this.formatClaudeReviewPrompts(reviewPrompts);
+                
                 // Full Analysis Data (collapsible)
                 output += `<details>\n`;
                 output += `<summary>Full Analysis Data</summary>\n\n`;
@@ -3725,6 +3744,294 @@
                 });
                 
                 output += `</details>\n`;
+                
+                return output;
+            },
+            
+            // Generate contextual prompts for Claude review
+            generateClaudeReviewPrompts(findings, bundles, signalAnalysis, bodyState) {
+                const prompts = {
+                    contextCheck: [],
+                    followUp: [],
+                    memoryCandidates: []
+                };
+                
+                // Helper to check if finding is recent
+                const isRecent = (f) => f.eventsLast24h > 0;
+                const isLast3Days = (f) => f.eventsLast3Days > 0;
+                
+                // Helper to extract actual event time and date from details string
+                const extractEventTimeAndDate = (details) => {
+                    // Match patterns like "at 12:47 PM yesterday" or "at 1:44 AM on Jan 5"
+                    const match = details?.match(/at (\d{1,2}:\d{2} [AP]M)\s+(yesterday|today|on [A-Za-z]+ \d+)/i);
+                    if (match) {
+                        return {
+                            time: match[1],
+                            dateRef: match[2],
+                            full: `${match[1]} ${match[2]}`
+                        };
+                    }
+                    return null;
+                };
+                
+                // Helper to get sortable timestamp from date reference
+                const getDateSortKey = (dateRef, timeStr) => {
+                    const now = new Date();
+                    let date = new Date(now);
+                    
+                    if (dateRef === 'today') {
+                        // Keep today's date
+                    } else if (dateRef === 'yesterday') {
+                        date.setDate(date.getDate() - 1);
+                    } else {
+                        // Parse "on Jan 5" style
+                        const monthMatch = dateRef.match(/on ([A-Za-z]+) (\d+)/i);
+                        if (monthMatch) {
+                            const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+                            const monthIdx = monthNames.indexOf(monthMatch[1].toLowerCase().substring(0, 3));
+                            if (monthIdx >= 0) {
+                                date.setMonth(monthIdx);
+                                date.setDate(parseInt(monthMatch[2]));
+                                // If this date is in the future, it's from last year
+                                if (date > now) {
+                                    date.setFullYear(date.getFullYear() - 1);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Parse time
+                    const timeMatch = timeStr?.match(/(\d{1,2}):(\d{2}) ([AP]M)/i);
+                    if (timeMatch) {
+                        let hours = parseInt(timeMatch[1]);
+                        const minutes = parseInt(timeMatch[2]);
+                        const isPM = timeMatch[3].toUpperCase() === 'PM';
+                        if (isPM && hours !== 12) hours += 12;
+                        if (!isPM && hours === 12) hours = 0;
+                        date.setHours(hours, minutes, 0, 0);
+                    }
+                    
+                    return date.getTime();
+                };
+                
+                // ============================================
+                // CONTEXT CHECK - Last 24h only (✓ events)
+                // ============================================
+                
+                // Unexplained lows → ask about activity (LAST 24H ONLY)
+                const unexplainedLows = findings.filter(f => 
+                    f.type === 'unexplained_low' && isRecent(f)
+                );
+                if (unexplainedLows.length > 0) {
+                    // Extract time/date info and sort chronologically
+                    const lowsWithTime = unexplainedLows.map(f => {
+                        const extracted = extractEventTimeAndDate(f.details);
+                        return {
+                            finding: f,
+                            timeInfo: extracted,
+                            sortKey: extracted ? getDateSortKey(extracted.dateRef, extracted.time) : 0
+                        };
+                    }).sort((a, b) => a.sortKey - b.sortKey);
+                    
+                    const times = lowsWithTime.map(l => 
+                        l.timeInfo ? l.timeInfo.full : l.finding.scheduleTime
+                    ).join(', ');
+                    
+                    prompts.contextCheck.push(
+                        `Any unusual activity or missed meals? (unexplained lows at ${times})`
+                    );
+                }
+                
+                // Post-meal highs → ask about food type/timing (LAST 24H ONLY)
+                const recentMealHighs = findings.filter(f => 
+                    f.type === 'post_meal_high' && isRecent(f)
+                );
+                if (recentMealHighs.length > 0) {
+                    for (const high of recentMealHighs.slice(0, 2)) {
+                        const carbMatch = high.details?.match(/(\d+)g/);
+                        const peakMatch = high.details?.match(/Peak (\d+)/);
+                        const timeMatch = high.details?.match(/Meal at ([^(]+)/);
+                        const carbs = carbMatch ? carbMatch[1] + 'g' : '?g';
+                        const peak = peakMatch ? peakMatch[1] : '?';
+                        const mealTime = timeMatch ? timeMatch[1].trim() : high.scheduleTime;
+                        prompts.contextCheck.push(
+                            `Food context for meal at ${mealTime}? (${carbs} → ${peak} peak)`
+                        );
+                    }
+                }
+                
+                // Transient high → low pattern → ask about pre-bolus timing (LAST 24H ONLY)
+                const transientHighLows = findings.filter(f => 
+                    f.type === 'transient_high_low' && isRecent(f)
+                );
+                if (transientHighLows.length > 0) {
+                    prompts.contextCheck.push(
+                        `Pre-bolus timing for meals? (spike-then-crash pattern detected)`
+                    );
+                }
+                
+                // Correction ineffectiveness overnight → ask about bedtime snacks (LAST 24H ONLY)
+                const overnightIneffective = findings.filter(f => 
+                    f.type === 'correction_ineffective' && 
+                    isRecent(f) &&
+                    ['00:00', '01:00', '02:00', '03:00', '04:00', '05:00'].includes(f.scheduleTime)
+                );
+                if (overnightIneffective.length >= 2) {
+                    prompts.contextCheck.push(
+                        `Any bedtime snacks or late meals? (overnight corrections not landing)`
+                    );
+                }
+                
+                // Many periods with same signal → ask about equipment
+                if (signalAnalysis?.periods) {
+                    const lowPeriods = signalAnalysis.periods.filter(p => p.signal === 'LOW').length;
+                    const highPeriods = signalAnalysis.periods.filter(p => p.signal === 'HIGH').length;
+                    if (lowPeriods >= 3 || highPeriods >= 3) {
+                        prompts.contextCheck.push(
+                            `Pod or sensor change in last 24-48h?`
+                        );
+                    }
+                }
+                
+                // State-specific questions
+                if (bodyState.state === BodyStateType.RECOVERY) {
+                    prompts.contextCheck.push(
+                        `How is recovery progressing? Any symptoms returning?`
+                    );
+                }
+                
+                // If no context checks generated, add generic
+                if (prompts.contextCheck.length === 0) {
+                    prompts.contextCheck.push(
+                        `Any notable context for today? (no unexplained patterns in last 24h)`
+                    );
+                }
+                
+                // ============================================
+                // FOLLOW-UP - Based on recent changes
+                // ============================================
+                
+                const history = ChangeTracker.getHistory();
+                const pendingChanges = history.changes.filter(c => c.outcome === 'pending');
+                const now = new Date();
+                
+                for (const change of pendingChanges.slice(0, 3)) {
+                    const changeDate = new Date(change.date);
+                    const daysAgo = Math.floor((now - changeDate) / (24 * 60 * 60 * 1000));
+                    if (daysAgo >= 1) {
+                        prompts.followUp.push(
+                            `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} (${change.date}): Applied? What happened?`
+                        );
+                    }
+                }
+                
+                // If no pending changes, check for recently resolved
+                if (pendingChanges.length === 0) {
+                    const recentResolved = history.changes.filter(c => {
+                        const changeDate = new Date(c.date);
+                        const daysAgo = Math.floor((now - changeDate) / (24 * 60 * 60 * 1000));
+                        return c.outcome !== 'pending' && daysAgo <= 5;
+                    });
+                    if (recentResolved.length > 0) {
+                        const recent = recentResolved[recentResolved.length - 1];
+                        prompts.followUp.push(
+                            `Any observations since the ${recent.scheduleTime} ${recent.param} change?`
+                        );
+                    }
+                }
+                
+                if (prompts.followUp.length === 0) {
+                    prompts.followUp.push(`No pending changes to follow up on`);
+                }
+                
+                // ============================================
+                // MEMORY CANDIDATES - Based on patterns (any timeframe)
+                // ============================================
+                
+                // Period order for chronological sorting
+                const periodOrder = ['Deep Sleep', 'Dawn', 'Morning', 'Afternoon', 'Evening', 'Sleep Onset'];
+                
+                // For memory candidates, include all recent unexplained lows (last 3 days)
+                // because learnings can come from historical patterns
+                const allUnexplainedLows = findings.filter(f => 
+                    f.type === 'unexplained_low' && (isRecent(f) || isLast3Days(f))
+                );
+                
+                if (allUnexplainedLows.length > 0) {
+                    const periods = [...new Set(allUnexplainedLows.map(f => f.period || 'unknown'))]
+                        .sort((a, b) => periodOrder.indexOf(a) - periodOrder.indexOf(b));
+                    prompts.memoryCandidates.push(
+                        `If activity explains lows → "Active days cause ${periods.join('/')} lows"`
+                    );
+                }
+                
+                // If a change caused problems
+                const problematicChanges = history.changes.filter(c => 
+                    ['caused_low', 'caused_high', 'reverted'].includes(c.outcome)
+                );
+                for (const change of problematicChanges.slice(0, 2)) {
+                    prompts.memoryCandidates.push(
+                        `${change.scheduleTime} ${change.param} ${change.newValue} was too aggressive → note baseline range`
+                    );
+                }
+                
+                // If a change worked
+                const effectiveChanges = history.changes.filter(c => c.outcome === 'effective');
+                for (const change of effectiveChanges.slice(0, 2)) {
+                    prompts.memoryCandidates.push(
+                        `${change.scheduleTime} ${change.param} ${change.newValue} is working → update known-good value`
+                    );
+                }
+                
+                // State transition learnings
+                if (bodyState.state === BodyStateType.STABLE && bodyState.daysInState <= 3) {
+                    prompts.memoryCandidates.push(
+                        `If stable after override → "Sensitivity returns within ${bodyState.daysInState} days post-override"`
+                    );
+                }
+                
+                // Conflict patterns
+                const conflictBundles = bundles.filter(b => b.isSlotConflict);
+                if (conflictBundles.length > 0) {
+                    prompts.memoryCandidates.push(
+                        `If conflicts resolve → note which direction was correct for this meal slot`
+                    );
+                }
+                
+                // Always add a decision capture line
+                prompts.memoryCandidates.push(
+                    `Tonight's decision: ________________________________`
+                );
+                
+                return prompts;
+            },
+            
+            formatClaudeReviewPrompts(prompts) {
+                let output = `---\n\n## Claude Review Prompts\n\n`;
+                
+                if (prompts.contextCheck.length > 0) {
+                    output += `**Context Check:**\n`;
+                    for (const prompt of prompts.contextCheck) {
+                        output += `- ${prompt}\n`;
+                    }
+                    output += `\n`;
+                }
+                
+                if (prompts.followUp.length > 0) {
+                    output += `**Follow-up on Previous:**\n`;
+                    for (const prompt of prompts.followUp) {
+                        output += `- ${prompt}\n`;
+                    }
+                    output += `\n`;
+                }
+                
+                if (prompts.memoryCandidates.length > 0) {
+                    output += `**Memory Candidates:**\n`;
+                    for (const prompt of prompts.memoryCandidates) {
+                        output += `- [ ] ${prompt}\n`;
+                    }
+                    output += `\n`;
+                }
                 
                 return output;
             },
@@ -4327,7 +4634,7 @@
                 
                 const payload = {
                     // Date for deduplication (Apps Script uses this to update existing rows)
-                    date: new Date().toISOString().split('T')[0],
+                    date: getLocalDateString(),
                     timestamp: new Date().toISOString(),
                     analysisWindow: basalSignalWindow,
                     tdd: tdd ? tdd.toFixed(1) : '',
@@ -5002,7 +5309,7 @@
                 
                 const payload = {
                     // Date for deduplication
-                    date: new Date().toISOString().split('T')[0],
+                    date: getLocalDateString(),
                     timestamp: new Date().toISOString(),
                     analysisWindow: basalSignalWindow,
                     tdd: tdd ? tdd.toFixed(1) : '',
