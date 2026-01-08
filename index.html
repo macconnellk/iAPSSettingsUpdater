@@ -3200,6 +3200,12 @@
                     output += `- Max: ${analysisResults.basalRatioInfo.maxRate} U/hr at ${analysisResults.basalRatioInfo.maxHour}\n`;
                     output += `- Min: ${analysisResults.basalRatioInfo.minRate} U/hr at ${analysisResults.basalRatioInfo.minHour}\n`;
                     output += `- CR/ISF recommendations have 20% confidence penalty applied.\n\n`;
+                    
+                    // Count blocked bundles
+                    const blockedBundles = bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio'));
+                    if (blockedBundles.length > 0) {
+                        output += `📋 **${blockedBundles.length} recommendation(s) blocked** until basal ratio is normalized. After applying basal changes, **rerun analysis immediately** to unlock CR/ISF optimizations.\n\n`;
+                    }
                 }
                 
                 output += `---\n\n`;
@@ -3527,6 +3533,30 @@
                 }
                 
                 output += `---\n\n`;
+                
+                // Next Steps section (when blocked items exist)
+                const blockedBundles = bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio'));
+                if (blockedBundles.length > 0 || analysisResults.basalRatioInfo?.exceedsCap) {
+                    output += `## Next Steps\n\n`;
+                    output += `**1. Apply basal changes:**\n`;
+                    const primaryBundles = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
+                    if (primaryBundles.length > 0) {
+                        primaryBundles.forEach(pb => {
+                            pb.recommendations.forEach(rec => {
+                                if (rec.parameter.includes('basal')) {
+                                    output += `   - ${rec.parameter}: ${rec.current} → ${rec.recommended}\n`;
+                                }
+                            });
+                        });
+                    }
+                    
+                    output += `\n**2. Rerun analysis immediately** after applying changes to your pump\n`;
+                    if (blockedBundles.length > 0) {
+                        output += `   - ${blockedBundles.length} blocked CR/ISF recommendation(s) will be re-evaluated\n`;
+                        output += `   - If basal ratio normalizes (≤2:1), full optimization unlocks\n`;
+                    }
+                    output += `\n---\n\n`;
+                }
                 
                 // Full Analysis Data (collapsible)
                 output += `<details>\n`;
@@ -5290,7 +5320,7 @@
                                     <div className="glass-card rounded-2xl p-6 border-l-4 border-l-orange-500 bg-orange-500/5">
                                         <div className="flex items-start gap-3">
                                             <span className="text-2xl">⚠️</span>
-                                            <div>
+                                            <div className="flex-1">
                                                 <h3 className="text-orange-400 font-bold mb-2">
                                                     Basal Ratio {analysisResults.basalRatioInfo.ratio.toFixed(1)}:1 Exceeds {analysisResults.basalRatioInfo.cap}:1 Cap
                                                 </h3>
@@ -5298,10 +5328,26 @@
                                                     Max {analysisResults.basalRatioInfo.maxRate} U/hr at {analysisResults.basalRatioInfo.maxHour} • 
                                                     Min {analysisResults.basalRatioInfo.minRate} U/hr at {analysisResults.basalRatioInfo.minHour}
                                                 </p>
-                                                <p className="text-gray-400 text-sm">
+                                                <p className="text-gray-400 text-sm mb-3">
                                                     Extreme basal ratios can mask CR/ISF issues. CR/ISF recommendations have 20% confidence penalty applied. 
                                                     Consider normalizing basal ratio first via TDD-neutral redistribution.
                                                 </p>
+                                                {(() => {
+                                                    const blockedCount = bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio')).length;
+                                                    if (blockedCount > 0) {
+                                                        return (
+                                                            <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 mt-2">
+                                                                <p className="text-blue-400 text-sm font-medium">
+                                                                    📋 {blockedCount} recommendation{blockedCount > 1 ? 's' : ''} blocked until basal ratio normalizes
+                                                                </p>
+                                                                <p className="text-blue-300 text-xs mt-1">
+                                                                    Apply basal changes to your pump, then <strong>rerun analysis immediately</strong> to unlock CR/ISF optimizations.
+                                                                </p>
+                                                            </div>
+                                                        );
+                                                    }
+                                                    return null;
+                                                })()}
                                             </div>
                                         </div>
                                     </div>
