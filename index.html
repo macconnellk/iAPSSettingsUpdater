@@ -3685,6 +3685,15 @@
                     output += `\n---\n\n`;
                 }
                 
+                // AGP Summary section (7 days + 48h trend)
+                if (analysisResults.nightscoutData?.glucose) {
+                    const agp7day = this.calculateAGP(analysisResults.nightscoutData.glucose, 7);
+                    const agp48h = this.calculateAGP(analysisResults.nightscoutData.glucose, 2);
+                    if (agp7day) {
+                        output += this.formatAGP(agp7day, agp48h);
+                    }
+                }
+                
                 // Claude Review Prompts section
                 const reviewPrompts = this.generateClaudeReviewPrompts(
                     analysisResults.findings,
@@ -4036,6 +4045,298 @@
                 return output;
             },
             
+            // Calculate AGP statistics from glucose data
+            calculateAGP(glucoseData, days = 7) {
+                if (!glucoseData || glucoseData.length === 0) {
+                    return null;
+                }
+                
+                // Use midnight-to-midnight boundaries like Clarity
+                // End at midnight tonight (start of today), go back N days
+                const now = new Date();
+                const endOfWindow = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+                const startOfWindow = new Date(endOfWindow);
+                startOfWindow.setDate(startOfWindow.getDate() - days + 1);
+                startOfWindow.setHours(0, 0, 0, 0);
+                
+                let readings = glucoseData.filter(r => {
+                    const readingDate = new Date(r.dateString);
+                    return readingDate >= startOfWindow && readingDate <= endOfWindow;
+                });
+                
+                // Deduplicate readings within the same minute (keep first)
+                const seenMinutes = new Set();
+                readings = readings.filter(r => {
+                    const minuteKey = r.dateString.substring(0, 16); // YYYY-MM-DDTHH:MM
+                    if (seenMinutes.has(minuteKey)) {
+                        return false;
+                    }
+                    seenMinutes.add(minuteKey);
+                    return true;
+                });
+                
+                if (readings.length < 100) {
+                    return null; // Not enough data
+                }
+                
+                // Extract BG values
+                const values = readings.map(r => r.sgv).filter(v => v && v > 20 && v < 500);
+                
+                // Overall statistics
+                const mean = values.reduce((a, b) => a + b, 0) / values.length;
+                const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / values.length;
+                const sd = Math.sqrt(variance);
+                const cv = (sd / mean) * 100;
+                const gmi = 3.31 + (0.02392 * mean); // GMI formula
+                
+                // Clarity uses different thresholds for day vs night:
+                // Daytime (6am-11pm): In Range = 70-160
+                // Nighttime (11pm-6am): In Range = 70-140
+                const getHighThresholdForReading = (dateString) => {
+                    const hour = new Date(dateString).getHours();
+                    // Nighttime: 11pm (23) to 6am (5) = hours 23, 0, 1, 2, 3, 4, 5
+                    if (hour >= 23 || hour <= 5) {
+                        return 140; // Tighter nighttime threshold
+                    }
+                    return 160; // Daytime threshold
+                };
+                
+                // Time in Range calculations with day/night thresholds
+                let veryLow = 0, low = 0, inRange = 0, high = 0, veryHigh = 0;
+                readings.forEach(r => {
+                    if (!r.sgv || r.sgv <= 20 || r.sgv >= 500) return;
+                    const v = r.sgv;
+                    const highThreshold = getHighThresholdForReading(r.dateString);
+                    
+                    if (v < 54) veryLow++;
+                    else if (v < 70) low++;
+                    else if (v <= highThreshold) inRange++;
+                    else if (v <= 250) high++;
+                    else veryHigh++;
+                });
+                const total = veryLow + low + inRange + high + veryHigh;
+                
+                const tir = {
+                    veryLow: (veryLow / total * 100),
+                    low: (low / total * 100),
+                    inRange: (inRange / total * 100),
+                    high: (high / total * 100),
+                    veryHigh: (veryHigh / total * 100)
+                };
+                
+                // Hourly statistics
+                const hourlyBuckets = {};
+                for (let h = 0; h < 24; h++) {
+                    hourlyBuckets[h] = [];
+                }
+                
+                readings.forEach(r => {
+                    const hour = new Date(r.dateString).getHours();
+                    if (r.sgv && r.sgv > 20 && r.sgv < 500) {
+                        hourlyBuckets[hour].push(r.sgv);
+                    }
+                });
+                
+                // Clarity uses different thresholds for day vs night:
+                // Daytime (6am-11pm): In Range = 70-160
+                // Nighttime (11pm-6am): In Range = 70-140
+                const getHighThreshold = (hour) => {
+                    // Nighttime: 11pm (23) to 6am (5) = hours 23, 0, 1, 2, 3, 4, 5
+                    if (hour >= 23 || hour <= 5) {
+                        return 140; // Tighter nighttime threshold
+                    }
+                    return 160; // Daytime threshold
+                };
+                
+                const hourlyStats = [];
+                for (let h = 0; h < 24; h++) {
+                    const vals = hourlyBuckets[h];
+                    if (vals.length === 0) {
+                        hourlyStats.push(null);
+                        continue;
+                    }
+                    
+                    const hMean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                    const hVariance = vals.reduce((sum, v) => sum + Math.pow(v - hMean, 2), 0) / vals.length;
+                    const hSd = Math.sqrt(hVariance);
+                    
+                    // TIR for this hour - use day/night threshold
+                    const highThreshold = getHighThreshold(h);
+                    const hVeryLow = vals.filter(v => v < 54).length;
+                    const hLow = vals.filter(v => v >= 54 && v < 70).length;
+                    const hInRange = vals.filter(v => v >= 70 && v <= highThreshold).length;
+                    const hHigh = vals.filter(v => v > highThreshold && v <= 250).length;
+                    const hVeryHigh = vals.filter(v => v > 250).length;
+                    
+                    // Percentiles
+                    const sorted = [...vals].sort((a, b) => a - b);
+                    const p5 = sorted[Math.floor(sorted.length * 0.05)] || sorted[0];
+                    const p25 = sorted[Math.floor(sorted.length * 0.25)] || sorted[0];
+                    const p50 = sorted[Math.floor(sorted.length * 0.50)] || sorted[0];
+                    const p75 = sorted[Math.floor(sorted.length * 0.75)] || sorted[0];
+                    const p95 = sorted[Math.floor(sorted.length * 0.95)] || sorted[sorted.length - 1];
+                    
+                    hourlyStats.push({
+                        hour: h,
+                        count: vals.length,
+                        min: Math.min(...vals),
+                        max: Math.max(...vals),
+                        mean: hMean,
+                        sd: hSd,
+                        p5, p25, p50, p75, p95,
+                        tir: {
+                            veryLow: (hVeryLow / vals.length * 100),
+                            low: (hLow / vals.length * 100),
+                            inRange: (hInRange / vals.length * 100),
+                            high: (hHigh / vals.length * 100),
+                            veryHigh: (hVeryHigh / vals.length * 100)
+                        }
+                    });
+                }
+                
+                return {
+                    days,
+                    readingCount: total,
+                    mean,
+                    sd,
+                    cv,
+                    gmi,
+                    tir,
+                    hourlyStats
+                };
+            },
+            
+            // Format AGP for Claude output
+            formatAGP(agp, agp48h = null) {
+                if (!agp) {
+                    return '';
+                }
+                
+                // Customizable goals
+                const goals = {
+                    tir: 80,        // Target: >=80%
+                    gmi: 7,         // Target: <7%
+                    cv: 36,         // Target: <36%
+                    low: 3,         // Target: <3%
+                    veryLow: 1,     // Target: <1%
+                    high: 25,       // Target: <25%
+                    veryHigh: 5     // Target: <5%
+                };
+                
+                let output = `## AGP Summary (7 Days)\n\n`;
+                
+                // Overall summary line with goals
+                const tirStatus = agp.tir.inRange >= goals.tir ? '✓' : '⚠️';
+                const gmiStatus = agp.gmi < goals.gmi ? '✓' : '⚠️';
+                const cvStatus = agp.cv < goals.cv ? '✓' : '⚠️';
+                output += `**Overall:** ${agp.tir.inRange.toFixed(0)}% TIR (≥${goals.tir}% ${tirStatus}) | GMI ${agp.gmi.toFixed(1)}% (<${goals.gmi}% ${gmiStatus}) | CV ${agp.cv.toFixed(0)}% (<${goals.cv}% ${cvStatus})\n`;
+                
+                // Safety line with goals
+                const lowStatus = agp.tir.low < goals.low ? '✓' : '⚠️';
+                const veryLowStatus = agp.tir.veryLow < goals.veryLow ? '✓' : '⚠️';
+                const veryLowDisplay = agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0);
+                output += `**Safety:** ${agp.tir.low.toFixed(0)}% Low (<${goals.low}% ${lowStatus}) | ${veryLowDisplay}% Very Low (<${goals.veryLow}% ${veryLowStatus})\n`;
+                
+                // 48h Trend comparison
+                if (agp48h) {
+                    const tirDiff = agp48h.tir.inRange - agp.tir.inRange;
+                    const tirArrow = tirDiff > 2 ? '↑' : tirDiff < -2 ? '↓' : '→';
+                    const tirDiffStr = tirDiff > 0 ? `+${tirDiff.toFixed(0)}%` : `${tirDiff.toFixed(0)}%`;
+                    
+                    const problemHours7d = agp.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
+                    const problemHours48h = agp48h.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
+                    const problemArrow = problemHours48h < problemHours7d ? '↓' : problemHours48h > problemHours7d ? '↑' : '→';
+                    
+                    output += `**48h Trend:** ${agp48h.tir.inRange.toFixed(0)}% TIR (${tirDiffStr} ${tirArrow}) | Problem hours: ${problemHours7d}→${problemHours48h} ${problemArrow}\n`;
+                }
+                
+                output += `\n`;
+                
+                // Time in Range table
+                output += `**Time in Range** *(Day 70-160, Night 70-140)*:\n`;
+                output += `| Range | % | Goal | Status |\n`;
+                output += `|-------|---|------|--------|\n`;
+                output += `| Very High (>250) | ${agp.tir.veryHigh.toFixed(0)}% | <${goals.veryHigh}% | ${agp.tir.veryHigh < goals.veryHigh ? '✓' : '⚠️'} |\n`;
+                output += `| High (160-250) | ${agp.tir.high.toFixed(0)}% | <${goals.high}% | ${agp.tir.high < goals.high ? '✓' : '⚠️'} |\n`;
+                output += `| In Range (70-160) | ${agp.tir.inRange.toFixed(0)}% | ≥${goals.tir}% | ${agp.tir.inRange >= goals.tir ? '✓' : '⚠️'} |\n`;
+                output += `| Low (54-70) | ${agp.tir.low.toFixed(0)}% | <${goals.low}% | ${agp.tir.low < goals.low ? '✓' : '⚠️'} |\n`;
+                output += `| Very Low (<54) | ${agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0)}% | <${goals.veryLow}% | ${agp.tir.veryLow < goals.veryLow ? '✓' : '⚠️'} |\n\n`;
+                
+                // Problem hours (TIR < 70%)
+                const problemHours = agp.hourlyStats.filter(h => h && h.tir.inRange < 70);
+                if (problemHours.length > 0) {
+                    output += `**Problem Hours (TIR <70%):**\n`;
+                    output += `| Hour | TIR | High% | VHigh% | Mean | SD | Pattern |\n`;
+                    output += `|------|-----|-------|--------|------|----|---------|\n`;
+                    
+                    problemHours.forEach(h => {
+                        const hourLabel = this.formatHourRange(h.hour);
+                        const pattern = this.identifyHourPattern(h.hour);
+                        output += `| ${hourLabel} | ${h.tir.inRange.toFixed(0)}% | ${h.tir.high.toFixed(0)}% | ${h.tir.veryHigh.toFixed(0)}% | ${h.mean.toFixed(0)} | ${h.sd.toFixed(0)} | ${pattern} |\n`;
+                    });
+                    output += `\n`;
+                }
+                
+                // Stable hours (TIR >= 85%) - limit to top 6
+                const stableHours = agp.hourlyStats
+                    .filter(h => h && h.tir.inRange >= 85)
+                    .sort((a, b) => b.tir.inRange - a.tir.inRange)
+                    .slice(0, 6);
+                if (stableHours.length > 0) {
+                    output += `**Stable Hours (TIR ≥85%, top ${stableHours.length}):**\n`;
+                    output += `| Hour | TIR | Mean | SD |\n`;
+                    output += `|------|-----|------|----|\n`;
+                    
+                    // Sort back to chronological for display
+                    stableHours.sort((a, b) => a.hour - b.hour);
+                    stableHours.forEach(h => {
+                        const hourLabel = this.formatHourRange(h.hour);
+                        output += `| ${hourLabel} | ${h.tir.inRange.toFixed(0)}% | ${h.mean.toFixed(0)} | ${h.sd.toFixed(0)} |\n`;
+                    });
+                    output += `\n`;
+                }
+                
+                // Low risk hours
+                const lowRiskHours = agp.hourlyStats.filter(h => h && (h.tir.low + h.tir.veryLow) > 5);
+                if (lowRiskHours.length > 0) {
+                    output += `**Low Risk Hours (>5% time low):**\n`;
+                    output += `| Hour | Low% | VLow% | Min | Pattern |\n`;
+                    output += `|------|------|-------|-----|--------|\n`;
+                    
+                    lowRiskHours.forEach(h => {
+                        const hourLabel = this.formatHourRange(h.hour);
+                        const pattern = this.identifyHourPattern(h.hour);
+                        output += `| ${hourLabel} | ${h.tir.low.toFixed(0)}% | ${h.tir.veryLow.toFixed(0)}% | ${h.min} | ${pattern} |\n`;
+                    });
+                    output += `\n`;
+                }
+                
+                return output;
+            },
+            
+            formatHourRange(hour) {
+                const nextHour = (hour + 1) % 24;
+                const formatHour = (h) => {
+                    if (h === 0) return '12am';
+                    if (h === 12) return '12pm';
+                    return h < 12 ? `${h}am` : `${h-12}pm`;
+                };
+                return `${formatHour(hour)}-${formatHour(nextHour)}`;
+            },
+            
+            identifyHourPattern(hour) {
+                if (hour >= 0 && hour < 5) return 'Overnight';
+                if (hour >= 5 && hour < 7) return 'Dawn';
+                if (hour >= 7 && hour < 9) return 'Breakfast';
+                if (hour >= 9 && hour < 12) return 'Post-breakfast';
+                if (hour >= 12 && hour < 14) return 'Lunch';
+                if (hour >= 14 && hour < 17) return 'Post-lunch';
+                if (hour >= 17 && hour < 19) return 'Dinner';
+                if (hour >= 19 && hour < 22) return 'Post-dinner';
+                if (hour >= 22 && hour < 24) return 'Late evening';
+                return '';
+            },
+            
             formatStateName(state) {
                 const names = {
                     [BodyStateType.STABLE]: 'Stable',
@@ -4200,11 +4501,18 @@
                 
                 const authParam = token ? `&token=${token}` : '';
                 const maxDays = Math.max(analysisWindow, basalSignalWindow);
-                const count = maxDays * 288; // 5-min intervals
+                // Use large count as fallback
+                const count = maxDays * 800;
+                
+                // Calculate date range for glucose (need full AGP window)
+                const agpDays = 7;
+                const glucoseStartDate = new Date();
+                glucoseStartDate.setDate(glucoseStartDate.getDate() - Math.max(maxDays, agpDays) - 1);
+                const glucoseDateFilter = `&find[dateString][$gte]=${glucoseStartDate.toISOString()}`;
                 
                 try {
-                    // Fetch glucose
-                    const glucoseUrl = `${baseUrl}/api/v1/entries/sgv.json?count=${count}${authParam}`;
+                    // Fetch glucose with date filter to ensure full history
+                    const glucoseUrl = `${baseUrl}/api/v1/entries/sgv.json?count=${count}${glucoseDateFilter}${authParam}`;
                     console.log('Fetching glucose from:', glucoseUrl.replace(token || '', '[TOKEN]'));
                     const glucoseRes = await fetch(glucoseUrl, { headers });
                     if (!glucoseRes.ok) {
