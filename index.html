@@ -3291,6 +3291,14 @@
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
                 
+                // Calculate AGP early so it's available for Signal/AGP reconciliation
+                const agp7day = analysisResults.nightscoutData?.glucose 
+                    ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7) 
+                    : null;
+                const agp48h = analysisResults.nightscoutData?.glucose
+                    ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
+                    : null;
+                
                 let output = `# Daily Insulin Settings Review\n`;
                 output += `**Date:** ${dateStr}\n`;
                 
@@ -3585,19 +3593,98 @@
                         output += `\n`;
                     }
                     
+                    // Helper function to get AGP check for a period
+                    const getAGPCheckForPeriod = (periodName) => {
+                        if (!agp7day || !agp7day.hourlyStats) return { status: 'NO DATA', icon: '?', detail: 'No data' };
+                        
+                        // Map period to hours
+                        const periodHours = {
+                            'Deep Sleep': [0, 1, 2, 3],
+                            'Dawn': [4, 5, 6, 7],
+                            'Morning': [8, 9, 10, 11],
+                            'Afternoon': [12, 13, 14, 15, 16],
+                            'Evening': [17, 18, 19, 20],
+                            'Sleep Onset': [21, 22, 23]
+                        };
+                        
+                        const hours = periodHours[periodName];
+                        if (!hours) return { status: 'UNKNOWN', icon: '?', detail: 'Unknown' };
+                        
+                        // Calculate average HIGH and LOW percentages for this period
+                        const periodStats = hours
+                            .map(h => agp7day.hourlyStats[h])
+                            .filter(s => s !== null);
+                        
+                        if (periodStats.length === 0) return { status: 'NO DATA', icon: '?', detail: 'No data' };
+                        
+                        const avgHigh = periodStats.reduce((sum, s) => 
+                            sum + s.tir.high + s.tir.veryHigh, 0) / periodStats.length;
+                        const avgLow = periodStats.reduce((sum, s) => 
+                            sum + s.tir.low + s.tir.veryLow, 0) / periodStats.length;
+                        
+                        // Determine AGP problem
+                        if (avgHigh > 25) {
+                            return { status: 'HIGH', icon: '⚠️', detail: `${avgHigh.toFixed(0)}% HIGH` };
+                        }
+                        if (avgLow > 5) {
+                            return { status: 'LOW', icon: '⚠️', detail: `${avgLow.toFixed(0)}% LOW` };
+                        }
+                        return { status: 'OK', icon: '✓', detail: 'OK' };
+                    };
+                    
+                    // Check for Signal/AGP divergence
+                    const divergences = [];
+                    analysisResults.signalAnalysis.periods.forEach(period => {
+                        const agpCheck = getAGPCheckForPeriod(period.name);
+                        const signalDirection = period.medianDeviation < -10 ? 'LOW' : 
+                                               period.medianDeviation > 10 ? 'HIGH' : 'NEUTRAL';
+                        
+                        // CRITICAL: Signal says LOW but AGP says HIGH
+                        if (signalDirection === 'LOW' && agpCheck.status === 'HIGH') {
+                            divergences.push({
+                                period: period.name,
+                                emoji: period.emoji,
+                                type: 'SIGNAL_LOW_AGP_HIGH',
+                                message: `Signal LOW (${period.medianDeviation.toFixed(0)}) but AGP shows ${agpCheck.detail}`,
+                                recommendation: 'Fasting OK, meals spiking → CR/timing issue, NOT basal'
+                            });
+                        }
+                        
+                        // Signal says HIGH but AGP says LOW
+                        if (signalDirection === 'HIGH' && agpCheck.status === 'LOW') {
+                            divergences.push({
+                                period: period.name,
+                                emoji: period.emoji,
+                                type: 'SIGNAL_HIGH_AGP_LOW',
+                                message: `Signal HIGH (+${period.medianDeviation.toFixed(0)}) but AGP shows ${agpCheck.detail}`,
+                                recommendation: 'Check for overcorrection cycles or aggressive ISF'
+                            });
+                        }
+                    });
+                    
                     output += `**Period Signals:**\n`;
-                    output += `| Period | Deviation | Signal | Protection |\n`;
-                    output += `|--------|-----------|--------|------------|\n`;
+                    output += `| Period | Deviation | Signal | AGP Check | Protection |\n`;
+                    output += `|--------|-----------|--------|-----------|------------|\n`;
                     
                     analysisResults.signalAnalysis.periods.forEach(period => {
                         const dev = period.medianDeviation !== null 
                             ? `${period.medianDeviation >= 0 ? '+' : ''}${period.medianDeviation.toFixed(1)} mg/dL`
                             : 'N/A';
                         const signal = period.signal || 'INSUFFICIENT';
-                        const protection = ProtectionSystem.getProtectionIcon(ProtectionLevel.CLEAR); // TODO: Calculate actual protection
-                        output += `| ${period.emoji} ${period.name} | ${dev} | ${signal} | ${protection} |\n`;
+                        const protection = ProtectionSystem.getProtectionIcon(ProtectionLevel.CLEAR);
+                        const agpCheck = getAGPCheckForPeriod(period.name);
+                        output += `| ${period.emoji} ${period.name} | ${dev} | ${signal} | ${agpCheck.icon} ${agpCheck.detail} | ${protection} |\n`;
                     });
                     output += `\n`;
+                    
+                    // Show divergence warnings if any
+                    if (divergences.length > 0) {
+                        output += `**⚠️ Signal/AGP Divergence Detected:**\n`;
+                        divergences.forEach(d => {
+                            output += `- **${d.emoji} ${d.period}:** ${d.message} → *${d.recommendation}*\n`;
+                        });
+                        output += `\n*Basal changes will not fix meal-driven highs. Consider CR or pre-bolus timing instead.*\n\n`;
+                    }
                 }
                 
                 output += `---\n\n`;
@@ -3685,13 +3772,9 @@
                     output += `\n---\n\n`;
                 }
                 
-                // AGP Summary section (7 days + 48h trend)
-                if (analysisResults.nightscoutData?.glucose) {
-                    const agp7day = this.calculateAGP(analysisResults.nightscoutData.glucose, 7);
-                    const agp48h = this.calculateAGP(analysisResults.nightscoutData.glucose, 2);
-                    if (agp7day) {
-                        output += this.formatAGP(agp7day, agp48h);
-                    }
+                // AGP Summary section (7 days + 48h trend) - uses pre-calculated values
+                if (agp7day) {
+                    output += this.formatAGP(agp7day, agp48h);
                 }
                 
                 // Claude Review Prompts section
