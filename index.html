@@ -2826,7 +2826,8 @@
             analyzeCleanWindows(nightscoutData, basalWindow, targetBG = 110, basalSchedule = null, isfSchedule = null, tdd = null) {
                 const analysisStart = new Date(Date.now() - basalWindow * 24 * 60 * 60 * 1000);
                 
-                // Find clean windows (IOB < 0.2, COB = 0)
+                // Find clean windows (IOB < 0.1, COB = 0)
+                // Tighter threshold = cleaner signal (0.1 U × ISF 100 = max 10 mg/dL pending impact)
                 const cleanWindows = [];
                 
                 nightscoutData.glucose.forEach(reading => {
@@ -2846,7 +2847,7 @@
                     const iob = closestStatus.iob || closestStatus.openaps?.iob?.iob || 0;
                     const cob = closestStatus.cob || closestStatus.openaps?.cob?.cob || 0;
                     
-                    if (iob < 0.2 && cob === 0) {
+                    if (iob < 0.1 && cob === 0) {
                         cleanWindows.push({
                             time: readingTime,
                             bg: reading.sgv,
@@ -2889,39 +2890,48 @@
                       validPeriods.reduce((sum, p) => sum + p.cleanWindowCount, 0)
                     : 0;
                 
-                // Calculate signalOnlyAnchor using principled ISF/TDD-based conversion
+                // Calculate signalOnlyAnchor using tiered nudge approach
+                // More intuitive and produces physiologically meaningful pump changes
                 let signalOnlyAnchor = null;
                 let currentBasalPercent = null;
-                let avgISF = null;
+                let adjustmentPercent = null;
                 
-                if (basalSchedule && isfSchedule && tdd && tdd > 0) {
+                // Tiered nudge table: 1% per 10 mg/dL band, capped at ±5%
+                const getTieredAdjustment = (deviation) => {
+                    if (deviation < -50) return -5;
+                    if (deviation < -40) return -4;
+                    if (deviation < -30) return -3;
+                    if (deviation < -20) return -2;
+                    if (deviation < -10) return -1;
+                    if (deviation <= 10) return 0;  // Dead zone: -10 to +10
+                    if (deviation <= 20) return 1;
+                    if (deviation <= 30) return 2;
+                    if (deviation <= 40) return 3;
+                    if (deviation <= 50) return 4;
+                    return 5;  // > +50
+                };
+                
+                if (basalSchedule && tdd && tdd > 0) {
                     // Calculate current basal % of TDD
                     const totalDailyBasal = basalSchedule.reduce((sum, entry) => sum + entry.value, 0);
                     currentBasalPercent = (totalDailyBasal / tdd) * 100;
                     
-                    // Calculate average ISF (weighted by time would be better, but simple average works)
-                    avgISF = isfSchedule.reduce((sum, entry) => sum + entry.value, 0) / isfSchedule.length;
-                    
-                    // Principled conversion:
-                    // adjustmentPercent = (deviation * 100) / (avgISF * tdd)
-                    // This gives: how much % of TDD would correct this deviation
-                    const adjustmentPercent = (weightedDeviation * 100) / (avgISF * tdd);
+                    // Get tiered adjustment based on weighted deviation
+                    adjustmentPercent = getTieredAdjustment(weightedDeviation);
                     
                     // Signal suggests: current basal % + adjustment needed
                     signalOnlyAnchor = currentBasalPercent + adjustmentPercent;
                     
-                    console.log('=== Signal Analysis Debug (Principled) ===');
+                    console.log('=== Signal Analysis Debug (Tiered) ===');
                     console.log('Current basal % of TDD:', currentBasalPercent.toFixed(2));
-                    console.log('Average ISF:', avgISF.toFixed(1));
                     console.log('TDD:', tdd.toFixed(1));
                     console.log('Weighted deviation:', weightedDeviation.toFixed(2), 'mg/dL');
-                    console.log('Adjustment %:', adjustmentPercent.toFixed(2));
+                    console.log('Tiered adjustment %:', adjustmentPercent);
                     console.log('Signal only anchor:', signalOnlyAnchor.toFixed(2));
                 } else {
                     console.log('=== Signal Analysis Debug ===');
-                    console.log('Missing data for principled calculation:');
+                    console.log('Missing data for tiered calculation:');
                     console.log('  basalSchedule:', !!basalSchedule);
-                    console.log('  isfSchedule:', !!isfSchedule);
                     console.log('  tdd:', tdd);
                     console.log('Weighted deviation:', weightedDeviation.toFixed(2), 'mg/dL');
                 }
@@ -2935,7 +2945,7 @@
                     signalOnlyAnchor,
                     weightedDeviation,
                     currentBasalPercent,
-                    avgISF
+                    adjustmentPercent
                 };
             }
         };
@@ -3294,7 +3304,7 @@
         // =========================================================================
         
         const OutputFormatter = {
-            formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null) {
+            formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = []) {
                 const now = new Date();
                 const dateStr = now.toLocaleDateString('en-US', { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
@@ -3509,11 +3519,29 @@
                 
                 output += `---\n\n`;
                 
-                // Recent Changes Section
-                const recentChanges = ChangeTracker.getRecentChanges(7);
+                // Recent Changes Section (auto-detected + manually logged)
                 output += `## Recent Changes\n\n`;
                 
+                // Auto-detected changes from schedule comparison (FEATURE-004)
+                if (detectedChanges && detectedChanges.length > 0) {
+                    output += `### Auto-Detected (vs yesterday)\n\n`;
+                    output += `| Time | Parameter | Change |\n`;
+                    output += `|------|-----------|--------|\n`;
+                    
+                    detectedChanges.forEach(change => {
+                        const paramLabel = change.type.toUpperCase();
+                        const direction = change.changePercent > 0 ? '↑' : '↓';
+                        const changeStr = `${change.from}→${change.to} (${change.changePercent > 0 ? '+' : ''}${change.changePercent}%)`;
+                        output += `| ${change.time} | ${paramLabel} | ${changeStr} ${direction} |\n`;
+                    });
+                    output += `\n`;
+                }
+                
+                // Manually logged changes from ChangeTracker
+                const recentChanges = ChangeTracker.getRecentChanges(7);
+                
                 if (recentChanges.length > 0) {
+                    output += `### Manually Logged\n\n`;
                     output += `| Date | Change | Outcome |\n`;
                     output += `|------|--------|--------|\n`;
                     
@@ -3529,8 +3557,11 @@
                         output += `| ${change.date} | ${change.scheduleTime} ${change.param}: ${change.oldValue}→${change.newValue} | ${outcomeEmoji[change.outcome] || '?'} |\n`;
                     });
                     output += `\n`;
-                } else {
-                    output += `No recent changes logged.\n\n`;
+                }
+                
+                // Show message if no changes at all
+                if ((!detectedChanges || detectedChanges.length === 0) && recentChanges.length === 0) {
+                    output += `No recent changes detected or logged.\n\n`;
                 }
                 
                 output += `---\n\n`;
@@ -4982,14 +5013,51 @@
                 }
             };
             
+            // Fetch yesterday's schedule for change detection (FEATURE-004)
+            const loadYesterdaySchedule = async () => {
+                console.log('=== loadYesterdaySchedule called ===');
+                
+                if (!sheetsWebAppUrl) {
+                    console.log('Yesterday schedule: No Sheets URL configured');
+                    return null;
+                }
+                
+                try {
+                    const response = await fetch(`${sheetsWebAppUrl}?action=yesterday_schedule`);
+                    
+                    if (!response.ok) {
+                        console.log('Yesterday schedule: Fetch failed', response.status);
+                        return null;
+                    }
+                    
+                    const data = await response.json();
+                    console.log('Yesterday schedule: Received', data);
+                    
+                    if (!data.success || !data.hasYesterday) {
+                        console.log('Yesterday schedule: No previous data');
+                        return null;
+                    }
+                    
+                    return {
+                        date: data.date,
+                        schedules: data.schedules
+                    };
+                    
+                } catch (error) {
+                    console.error('Yesterday schedule: Error loading', error);
+                    return null;
+                }
+            };
+            
             // Auto-log to Google Sheets after analysis
-            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal) => {
+            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules) => {
                 console.log('=== attemptAutoLog called ===');
                 console.log('Sheets URL:', sheetsWebAppUrl);
                 console.log('State:', state.state);
                 console.log('Override active:', state.state === BodyStateType.OVERRIDE_ACTIVE);
                 console.log('Effective target:', effectiveTarget);
                 console.log('Yesterday Final:', yesterdayFinal);
+                console.log('Active schedules received:', !!activeSchedules);
                 
                 // Use passed target or fall back to configured
                 const targetPercent = effectiveTarget || basalTDDPercent;
@@ -5106,7 +5174,14 @@
                     incrementsApplied: incrementsNeeded,
                     direction: direction,
                     isOverride: isOverrideActive,
-                    notes: isOverrideActive ? 'Auto-logged (override)' : 'Auto-logged'
+                    notes: isOverrideActive ? 'Auto-logged (override)' : 'Auto-logged',
+                    // Schedule snapshots for change detection (FEATURE-004)
+                    // Use activeSchedules (fresh from Nightscout) not React state (stale)
+                    schedules: {
+                        basal: scheduleToObject(activeSchedules?.basal || basalSchedule),
+                        cr: scheduleToObject(activeSchedules?.cr || crSchedule),
+                        isf: scheduleToObject(activeSchedules?.isf || isfSchedule)
+                    }
                 };
                 
                 console.log('Auto-log payload:', payload);
@@ -5159,6 +5234,16 @@
                     
                     const dynamicResult = await loadDynamicTarget();
                     console.log('Dynamic target result:', dynamicResult);
+                    
+                    // Load yesterday's schedule for change detection (FEATURE-004)
+                    console.log('Loading yesterday schedule for change detection...');
+                    const yesterdayScheduleResult = await loadYesterdaySchedule();
+                    if (yesterdayScheduleResult) {
+                        setYesterdayScheduleDate(yesterdayScheduleResult.date);
+                        console.log('Yesterday schedule loaded from:', yesterdayScheduleResult.date);
+                    } else {
+                        console.log('No yesterday schedule available (first run or no schedule columns)');
+                    }
                     
                     if (dynamicResult && dynamicResult.value !== null && !dynamicResult.noRecentData) {
                         effectiveBasalTarget = dynamicResult.value;
@@ -5215,6 +5300,23 @@
                         }
                     } else {
                         console.warn('No profile found in Nightscout, using default schedules');
+                    }
+                    
+                    // Detect schedule changes (FEATURE-004)
+                    if (yesterdayScheduleResult?.schedules) {
+                        const todaySchedules = {
+                            basal: scheduleToObject(activeSchedules.basal),
+                            cr: scheduleToObject(activeSchedules.cr),
+                            isf: scheduleToObject(activeSchedules.isf)
+                        };
+                        const changes = detectScheduleChanges(todaySchedules, yesterdayScheduleResult.schedules);
+                        if (changes.length > 0) {
+                            console.log('Detected schedule changes:', changes);
+                            setDetectedChanges(changes);
+                        } else {
+                            console.log('No schedule changes detected');
+                            setDetectedChanges([]);
+                        }
                     }
                     
                     // Calculate basal ratio (BUG-003 fix)
@@ -5485,7 +5587,7 @@
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
-                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal);
+                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules);
                     
                 } catch (err) {
                     console.error('Analysis error:', err);
@@ -5631,7 +5733,8 @@
                         hasBodyState: !!bodyState,
                         bundlesCount: bundles?.length,
                         hasSchedules: !!schedules,
-                        hasDynamicTarget: !!dynamicTarget
+                        hasDynamicTarget: !!dynamicTarget,
+                        detectedChangesCount: detectedChanges?.length || 0
                     });
                     
                     const output = OutputFormatter.formatForClaude(
@@ -5640,7 +5743,8 @@
                         bundles,
                         schedules,
                         CONFIG,
-                        dynamicTarget
+                        dynamicTarget,
+                        detectedChanges
                     );
                     
                     if (!output) {
@@ -5674,6 +5778,54 @@
                     alert('Error generating report: ' + err.message + '\n\nCheck browser console for details.');
                 }
             };
+            
+            // Helper: Convert schedule array to object for JSON storage
+            const scheduleToObject = (scheduleArray) => {
+                if (!scheduleArray || !Array.isArray(scheduleArray)) return null;
+                const obj = {};
+                scheduleArray.forEach(entry => {
+                    obj[entry.time] = entry.value;
+                });
+                return obj;
+            };
+            
+            // Helper: Compare schedules and detect changes
+            const detectScheduleChanges = (todaySchedules, yesterdaySchedules) => {
+                if (!yesterdaySchedules) return [];
+                
+                const changes = [];
+                const paramTypes = ['basal', 'cr', 'isf'];
+                
+                paramTypes.forEach(paramType => {
+                    const today = todaySchedules[paramType];
+                    const yesterday = yesterdaySchedules[paramType];
+                    
+                    if (!today || !yesterday) return;
+                    
+                    // Compare each time slot
+                    Object.keys(today).forEach(time => {
+                        const todayVal = today[time];
+                        const yesterdayVal = yesterday[time];
+                        
+                        if (yesterdayVal !== undefined && todayVal !== yesterdayVal) {
+                            const changePercent = ((todayVal - yesterdayVal) / yesterdayVal * 100).toFixed(1);
+                            changes.push({
+                                type: paramType,
+                                time: time,
+                                from: yesterdayVal,
+                                to: todayVal,
+                                changePercent: parseFloat(changePercent)
+                            });
+                        }
+                    });
+                });
+                
+                return changes;
+            };
+            
+            // State for detected changes
+            const [detectedChanges, setDetectedChanges] = useState([]);
+            const [yesterdayScheduleDate, setYesterdayScheduleDate] = useState(null);
             
             // Log to Google Sheets
             const logToGoogleSheets = async () => {
@@ -5781,7 +5933,13 @@
                     incrementsApplied: incrementsNeeded,
                     direction: direction,
                     isOverride: bodyState?.state === BodyStateType.OVERRIDE_ACTIVE,
-                    notes: loggingNotes || 'Manual'
+                    notes: loggingNotes || 'Manual',
+                    // Schedule snapshots for change detection (FEATURE-004)
+                    schedules: {
+                        basal: scheduleToObject(basalSchedule),
+                        cr: scheduleToObject(crSchedule),
+                        isf: scheduleToObject(isfSchedule)
+                    }
                 };
                 
                 try {
