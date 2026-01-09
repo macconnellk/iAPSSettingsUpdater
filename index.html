@@ -1583,6 +1583,7 @@
                 // Step 4: Multi-action PRIMARY selection
                 // - All URGENT bundles become PRIMARY (regardless of time block)
                 // - Then one non-urgent PRIMARY per time block
+                // - BUT: Bundles with only 3-day events (no 24h events) go to REFERENCE
                 const primaryByBlock = {};
                 
                 bundles.forEach(bundle => {
@@ -1596,6 +1597,14 @@
                     // URGENT always becomes PRIMARY
                     if (bundle.isUrgent) {
                         bundle.priority = 'PRIMARY';
+                        return;
+                    }
+                    
+                    // Option 1 fix: Only 3-day events (no 24h events) → REFERENCE
+                    // Exception: Structural findings (basal signal) are always current
+                    if (!bundle.hasRecentEvents && bundle.hasLast3DayEvents && !bundle.hasStructuralFinding) {
+                        bundle.priority = 'REFERENCE';
+                        bundle.demotedReason = 'No recurrence in 48h';
                         return;
                     }
                     
@@ -3446,7 +3455,9 @@
                         
                         // Generate appropriate status message
                         let status;
-                        if (bundle.blockedBy) {
+                        if (bundle.demotedReason) {
+                            status = `${bundle.demotedReason} - monitoring`;
+                        } else if (bundle.blockedBy) {
                             status = bundle.blockedBy;
                         } else if (bundle.compoundEffect?.warning === 'HIGH') {
                             status = `⚠️ Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`;
@@ -3684,6 +3695,71 @@
                             output += `- **${d.emoji} ${d.period}:** ${d.message} → *${d.recommendation}*\n`;
                         });
                         output += `\n*Basal changes will not fix meal-driven highs. Consider CR or pre-bolus timing instead.*\n\n`;
+                    }
+                    
+                    // AGP Priority by Period table (FEATURE-003)
+                    if (agp7day && agp7day.hourlyStats) {
+                        const periodHours = {
+                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: '🌙' },
+                            'Dawn': { hours: [4, 5, 6, 7], emoji: '🌅' },
+                            'Morning': { hours: [8, 9, 10, 11], emoji: '☀️' },
+                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: '🌤️' },
+                            'Evening': { hours: [17, 18, 19, 20], emoji: '🌆' },
+                            'Sleep Onset': { hours: [21, 22, 23], emoji: '😴' }
+                        };
+                        
+                        const periodStats = [];
+                        
+                        Object.entries(periodHours).forEach(([periodName, config]) => {
+                            const { hours, emoji } = config;
+                            const hourData = hours
+                                .map(h => ({ hour: h, stats: agp7day.hourlyStats[h] }))
+                                .filter(item => item.stats !== null);
+                            
+                            if (hourData.length === 0) return;
+                            
+                            const avgTIR = hourData.reduce((sum, item) => sum + item.stats.tir.inRange, 0) / hourData.length;
+                            
+                            // Find worst hour (correctly tracking original hour)
+                            let worstHour = hours[0];
+                            let worstTIR = 100;
+                            hourData.forEach(item => {
+                                if (item.stats.tir.inRange < worstTIR) {
+                                    worstTIR = item.stats.tir.inRange;
+                                    worstHour = item.hour;
+                                }
+                            });
+                            
+                            // Determine focus level
+                            let focus;
+                            if (avgTIR < 60) focus = '🔴 HIGH';
+                            else if (avgTIR < 70) focus = '🟡 MEDIUM';
+                            else if (avgTIR < 80) focus = '○ Normal';
+                            else if (avgTIR >= 90) focus = '✓ Excellent';
+                            else focus = '✓ Good';
+                            
+                            periodStats.push({
+                                period: periodName,
+                                emoji: emoji,
+                                avgTIR: avgTIR,
+                                worstHour: worstHour,
+                                worstTIR: worstTIR,
+                                focus: focus
+                            });
+                        });
+                        
+                        // Sort by avgTIR ascending (worst first)
+                        periodStats.sort((a, b) => a.avgTIR - b.avgTIR);
+                        
+                        output += `**AGP Priority by Period:**\n`;
+                        output += `| Period | Avg TIR | Worst Hour | Focus |\n`;
+                        output += `|--------|---------|------------|-------|\n`;
+                        
+                        periodStats.forEach(p => {
+                            const hourLabel = this.formatHourLabel(p.worstHour);
+                            output += `| ${p.emoji} ${p.period} | ${p.avgTIR.toFixed(0)}% | ${hourLabel} (${p.worstTIR.toFixed(0)}%) | ${p.focus} |\n`;
+                        });
+                        output += `\n`;
                     }
                 }
                 
