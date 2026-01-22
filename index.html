@@ -1,55 +1,4 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.0</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
-        
-        :root {
-            --font-mono: 'JetBrains Mono', monospace;
-            --font-sans: 'Plus Jakarta Sans', system-ui, sans-serif;
-        }
-        
-        body {
-            font-family: var(--font-sans);
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
-            min-height: 100vh;
-        }
-        
-        .font-mono { font-family: var(--font-mono); }
-        
-        .glass-card {
-            background: rgba(255, 255, 255, 0.03);
-            backdrop-filter: blur(20px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-        }
-        
-        .state-badge {
-            animation: pulse-glow 2s ease-in-out infinite;
-        }
-        
-        @keyframes pulse-glow {
-            0%, 100% { box-shadow: 0 0 5px currentColor; }
-            50% { box-shadow: 0 0 20px currentColor; }
-        }
-        
-        .protection-locked { color: #ef4444; }
-        .protection-protected { color: #f97316; }
-        .protection-caution { color: #eab308; }
-        .protection-clear { color: #22c55e; }
-        
-        .tier-1 { border-left-color: #ef4444; }
-        .tier-2 { border-left-color: #f97316; }
-        .tier-3 { border-left-color: #3b82f6; }
-        .tier-4 { border-left-color: #22c55e; }
-        
-        .scroll-fade {
+
             mask-image: linear-gradient(to bottom, black 90%, transparent 100%);
         }
     </style>
@@ -138,7 +87,7 @@
             maxISFStrengthen: 0.03,
             
             // Basal constraints
-            basalRatioCap: 2.0,
+            basalRatioCap: 2.5,
             pumpIncrement: 0.05,
             
             // State detection
