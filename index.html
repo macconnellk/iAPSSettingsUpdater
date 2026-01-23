@@ -76,7 +76,7 @@
         const FindingType = {
             DIRECT_MEAL_LOW: 'direct_meal_low',
             TRANSIENT_HIGH_CRASH: 'transient_high_crash',
-            TRANSIENT_HIGH_LOW: 'transient_high_low', // Meal → Brief spike → Crash (no corrections)
+            TRANSIENT_HIGH_LOW: 'transient_high_low', // Meal â†’ Brief spike â†’ Crash (no corrections)
             ISF_INDUCED_LOW: 'isf_induced_low',
             UNEXPLAINED_LOW: 'unexplained_low',
             RESISTANT_LOW: 'resistant_low',
@@ -177,12 +177,12 @@
         };
         
         const CIRCADIAN_PERIODS = [
-            { name: 'Deep Sleep', emoji: '🌙', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
-            { name: 'Dawn', emoji: '🌅', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
-            { name: 'Morning', emoji: '☀️', startHour: 8, endHour: 12, description: 'Peak insulin sensitivity' },
-            { name: 'Afternoon', emoji: '🌤️', startHour: 12, endHour: 17, description: 'Stable, declining sensitivity' },
-            { name: 'Evening', emoji: '🌆', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
-            { name: 'Sleep Onset', emoji: '😴', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
+            { name: 'Deep Sleep', emoji: 'ðŸŒ™', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
+            { name: 'Dawn', emoji: 'ðŸŒ…', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
+            { name: 'Morning', emoji: 'â˜€ï¸', startHour: 8, endHour: 12, description: 'Peak insulin sensitivity' },
+            { name: 'Afternoon', emoji: 'ðŸŒ¤ï¸', startHour: 12, endHour: 17, description: 'Stable, declining sensitivity' },
+            { name: 'Evening', emoji: 'ðŸŒ†', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
+            { name: 'Sleep Onset', emoji: 'ðŸ˜´', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
         ];
         
         // Independent time blocks for multi-action support
@@ -657,11 +657,11 @@
             
             getProtectionIcon(level) {
                 switch (level) {
-                    case ProtectionLevel.LOCKED: return '⛔';
-                    case ProtectionLevel.PROTECTED: return '🔴';
-                    case ProtectionLevel.CAUTION: return '🟡';
-                    case ProtectionLevel.CLEAR: return '🟢';
-                    default: return '⚪';
+                    case ProtectionLevel.LOCKED: return 'â›”';
+                    case ProtectionLevel.PROTECTED: return 'ðŸ”´';
+                    case ProtectionLevel.CAUTION: return 'ðŸŸ¡';
+                    case ProtectionLevel.CLEAR: return 'ðŸŸ¢';
+                    default: return 'âšª';
                 }
             }
         };
@@ -691,7 +691,7 @@
                 slotConflicts.forEach(conflict => {
                     bundles.push({
                         id: `conflict_${conflict.slot}`,
-                        name: `⚠️ Conflict: ${conflict.slot}`,
+                        name: `âš ï¸ Conflict: ${conflict.slot}`,
                         tier: Tier.ROUTINE, // Low priority since conflicted
                         priority: 'REFERENCE',
                         recommendations: [],
@@ -699,8 +699,8 @@
                         rootCause: 'Conflicting findings at same schedule slot',
                         evidenceSummary: `Both strengthening (${conflict.strengthenCount}) and weakening (${conflict.weakenCount}) patterns detected`,
                         evidenceDetails: [
-                            { icon: '↑', detail: `Strengthen: ${conflict.strengthenTypes}`, type: 'conflict' },
-                            { icon: '↓', detail: `Weaken: ${conflict.weakenTypes}`, type: 'conflict' }
+                            { icon: 'â†‘', detail: `Strengthen: ${conflict.strengthenTypes}`, type: 'conflict' },
+                            { icon: 'â†“', detail: `Weaken: ${conflict.weakenTypes}`, type: 'conflict' }
                         ],
                         conflictsWith: [],
                         blockedBy: `High variability - ${conflict.details}. Hold changes until patterns stabilize.`,
@@ -719,14 +719,14 @@
                 if (basalRatioInfo && basalRatioInfo.exceedsCap) {
                     bundles.unshift({
                         id: 'basal_ratio_warning',
-                        name: `⚠️ Basal Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 Exceeds Cap`,
+                        name: `âš ï¸ Basal Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 Exceeds Cap`,
                         tier: Tier.FOUNDATIONAL,
                         priority: 'REFERENCE',
                         recommendations: [{
                             param: 'basal',
                             scheduleTime: 'Multiple',
                             currentValue: `${basalRatioInfo.ratio.toFixed(1)}:1`,
-                            newValue: `≤${basalRatioInfo.cap}:1`,
+                            newValue: `â‰¤${basalRatioInfo.cap}:1`,
                             changePercent: 0,
                             protectionLevel: ProtectionLevel.CAUTION,
                             protectionReason: 'Normalize basal ratio before CR/ISF changes'
@@ -735,9 +735,9 @@
                         rootCause: `Basal ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`,
                         evidenceSummary: `Max ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}, Min ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}. Extreme ratios can mask CR/ISF issues.`,
                         evidenceDetails: [
-                            { icon: '●', detail: `Maximum rate: ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}`, type: 'structural' },
-                            { icon: '●', detail: `Minimum rate: ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}`, type: 'structural' },
-                            { icon: '⚠️', detail: `Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`, type: 'structural' }
+                            { icon: 'â—', detail: `Maximum rate: ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}`, type: 'structural' },
+                            { icon: 'â—', detail: `Minimum rate: ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}`, type: 'structural' },
+                            { icon: 'âš ï¸', detail: `Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`, type: 'structural' }
                         ],
                         conflictsWith: [],
                         blockedBy: null,
@@ -1305,7 +1305,7 @@
                 // Check if any findings are structural (always current)
                 const hasStructural = findings.some(f => f.isStructural);
                 if (hasStructural) {
-                    return `Current analysis ✓`;
+                    return `Current analysis âœ“`;
                 }
                 
                 // Find most recent event across all findings
@@ -1322,7 +1322,7 @@
                 // Build summary with recency info
                 if (recentEvents > 0) {
                     if (recentEvents === totalEvents) {
-                        return `${totalEvents} event(s) in last 24h ✓`;
+                        return `${totalEvents} event(s) in last 24h âœ“`;
                     } else {
                         return `${recentEvents} recent + ${totalEvents - recentEvents} older event(s)`;
                     }
@@ -1330,7 +1330,7 @@
                     return `${last3DayEvents} event(s) in last 3 days (${totalEvents - last3DayEvents} older)`;
                 } else if (mostRecentHours !== null && !isNaN(mostRecentHours)) {
                     const daysAgo = Math.round(mostRecentHours / 24);
-                    return `⚠️ ${totalEvents} event(s) - most recent ${daysAgo} day(s) ago`;
+                    return `âš ï¸ ${totalEvents} event(s) - most recent ${daysAgo} day(s) ago`;
                 } else {
                     // Fallback when we can't determine recency
                     const days = findings.reduce((sum, f) => sum + (f.daysWithPattern || 1), 0) / findings.length;
@@ -1352,9 +1352,9 @@
                 // Extract the details from each finding
                 return sorted.map(f => {
                     // Add recency indicator
-                    const icon = f.eventsLast24h > 0 ? '✓' : 
-                                f.eventsLast3Days > 0 ? '○' : 
-                                f.isStructural ? '●' : '⚠️';
+                    const icon = f.eventsLast24h > 0 ? 'âœ“' : 
+                                f.eventsLast3Days > 0 ? 'â—‹' : 
+                                f.isStructural ? 'â—' : 'âš ï¸';
                     return {
                         icon,
                         detail: f.details || 'No details available',
@@ -1600,7 +1600,7 @@
                         return;
                     }
                     
-                    // Option 1 fix: Only 3-day events (no 24h events) → REFERENCE
+                    // Option 1 fix: Only 3-day events (no 24h events) â†’ REFERENCE
                     // Exception: Structural findings (basal signal) are always current
                     if (!bundle.hasRecentEvents && bundle.hasLast3DayEvents && !bundle.hasStructuralFinding) {
                         bundle.priority = 'REFERENCE';
@@ -1939,7 +1939,7 @@
                         claimedEventIds: [bestMatch.mealId, lowId, ...bestMatch.highReadings.map(getEventId)],
                         conflictsWith: [],
                         recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
-                        details: `Meal at ${formatTimeForDisplay(bestMatch.meal.created_at)} (${bestMatch.meal.carbs}g) → Brief spike to ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min) → Crash to ${low.bg} mg/dL (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later). Peak-to-crash pattern indicates excessive upfront insulin.`
+                        details: `Meal at ${formatTimeForDisplay(bestMatch.meal.created_at)} (${bestMatch.meal.carbs}g) â†’ Brief spike to ${bestMatch.peakBG} mg/dL (${bestMatch.highDurationMinutes.toFixed(0)} min) â†’ Crash to ${low.bg} mg/dL (${bestMatch.timeFromHighToLowHours.toFixed(1)}h later). Peak-to-crash pattern indicates excessive upfront insulin.`
                     });
                 });
                 
@@ -2038,7 +2038,7 @@
                         claimedEventIds: [mealId, lowId],
                         conflictsWith: [],
                         recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
-                        details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g) → Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}. BG stayed <180 between meal and low.`
+                        details: `Meal at ${formatTimeForDisplay(relevantMeal.created_at)} (${relevantMeal.carbs}g) â†’ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}. BG stayed <180 between meal and low.`
                     });
                 });
                 
@@ -2150,7 +2150,7 @@
                     });
                     
                     // Build details with stacking note if applicable
-                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)} → ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) → Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}.`;
+                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)} â†’ ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) â†’ Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}.`;
                     
                     if (hasStacking) {
                         details += ` Note: ${mealsBetweenCorrectionAndLow.length} meal(s) between corrections and low may have contributed (insulin stacking).`;
@@ -2327,7 +2327,7 @@
                                 claimedEventIds: [mealId],
                                 conflictsWith: [],
                                 recencyWeight: calculateRecencyWeight(meal.created_at, analysisWindow),
-                                details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} → Severe low ${lowestReading.sgv} mg/dL → Rebound spike to ${peakBG} mg/dL. This is physiological rebound from hypoglycemia, not weak CR.`
+                                details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) ${mealDuringLow ? `during low (${bgAtMealTime.sgv} mg/dL)` : 'with safety underdosing'} â†’ Severe low ${lowestReading.sgv} mg/dL â†’ Rebound spike to ${peakBG} mg/dL. This is physiological rebound from hypoglycemia, not weak CR.`
                             });
                             claimedEvents.meals.add(mealId);
                             return; // Skip CR strengthening
@@ -2360,7 +2360,7 @@
                             claimedEventIds: [mealId],
                             conflictsWith: [],
                             recencyWeight: calculateRecencyWeight(meal.created_at, analysisWindow),
-                            details: `Meal during low (${bgAtMealTime.sgv} mg/dL) → Rebound high ${peakBG} mg/dL. This is physiological rebound, not weak CR.`
+                            details: `Meal during low (${bgAtMealTime.sgv} mg/dL) â†’ Rebound high ${peakBG} mg/dL. This is physiological rebound, not weak CR.`
                         });
                         claimedEvents.meals.add(mealId);
                         return;
@@ -2402,7 +2402,7 @@
                         claimedEventIds: [mealId, ...highReadings.map(getEventId), ...correctionsAfterMeal.map(getEventId)],
                         conflictsWith: [],
                         recencyWeight: calculateRecencyWeight(meal.created_at, analysisWindow),
-                        details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) → Peak ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}${correctionsAfterMeal.length > 0 ? ` → ${correctionsAfterMeal.length} correction(s)` : ''}.`
+                        details: `Meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) â†’ Peak ${peakBG} mg/dL at ${formatTimeForDisplay(peakReading.dateString)}${correctionsAfterMeal.length > 0 ? ` â†’ ${correctionsAfterMeal.length} correction(s)` : ''}.`
                     });
                 });
                 
@@ -2428,11 +2428,11 @@
                     
                     const type = deviation > 0 ? FindingType.BASAL_SIGNAL_HIGH : FindingType.BASAL_SIGNAL_LOW;
                     // BUG FIX: Correct the sign
-                    // BG HIGH (deviation > 0) → need MORE basal → POSITIVE adjustment
-                    // BG LOW (deviation < 0) → need LESS basal → NEGATIVE adjustment
+                    // BG HIGH (deviation > 0) â†’ need MORE basal â†’ POSITIVE adjustment
+                    // BG LOW (deviation < 0) â†’ need LESS basal â†’ NEGATIVE adjustment
                     const adjustmentPercent = deviation > 0 
-                        ? Math.min(Math.abs(deviation) * 0.5, 5)     // BG high → increase basal
-                        : -Math.min(Math.abs(deviation) * 0.5, 7.5); // BG low → decrease basal
+                        ? Math.min(Math.abs(deviation) * 0.5, 5)     // BG high â†’ increase basal
+                        : -Math.min(Math.abs(deviation) * 0.5, 7.5); // BG low â†’ decrease basal
                     
                     // Find schedule time in this period
                     const periodStart = period.startHour || CIRCADIAN_PERIODS.find(p => p.name === period.name)?.startHour || 0;
@@ -2827,7 +2827,7 @@
                 const analysisStart = new Date(Date.now() - basalWindow * 24 * 60 * 60 * 1000);
                 
                 // Find clean windows (IOB < 0.1, COB = 0)
-                // Tighter threshold = cleaner signal (0.1 U × ISF 100 = max 10 mg/dL pending impact)
+                // Tighter threshold = cleaner signal (0.1 U Ã— ISF 100 = max 10 mg/dL pending impact)
                 const cleanWindows = [];
                 
                 nightscoutData.glucose.forEach(reading => {
@@ -2896,7 +2896,7 @@
                 let currentBasalPercent = null;
                 let adjustmentPercent = null;
                 
-                // Tiered nudge table: 1% per 10 mg/dL band, capped at ±5%
+                // Tiered nudge table: 1% per 10 mg/dL band, capped at Â±5%
                 const getTieredAdjustment = (deviation) => {
                     if (deviation < -50) return -5;
                     if (deviation < -40) return -4;
@@ -3346,7 +3346,7 @@
                 
                 // Basal Ratio Warning
                 if (analysisResults.basalRatioInfo?.exceedsCap) {
-                    output += `⚠️ **Basal Ratio Warning:** ${analysisResults.basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${analysisResults.basalRatioInfo.cap}:1 cap\n`;
+                    output += `âš ï¸ **Basal Ratio Warning:** ${analysisResults.basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${analysisResults.basalRatioInfo.cap}:1 cap\n`;
                     output += `- Max: ${analysisResults.basalRatioInfo.maxRate} U/hr at ${analysisResults.basalRatioInfo.maxHour}\n`;
                     output += `- Min: ${analysisResults.basalRatioInfo.minRate} U/hr at ${analysisResults.basalRatioInfo.minHour}\n`;
                     output += `- CR/ISF recommendations have 20% confidence penalty applied.\n\n`;
@@ -3354,7 +3354,7 @@
                     // Count blocked bundles
                     const blockedBundles = bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio'));
                     if (blockedBundles.length > 0) {
-                        output += `📋 **${blockedBundles.length} recommendation(s) blocked** until basal ratio is normalized. After applying basal changes, **rerun analysis immediately** to unlock CR/ISF optimizations.\n\n`;
+                        output += `ðŸ“‹ **${blockedBundles.length} recommendation(s) blocked** until basal ratio is normalized. After applying basal changes, **rerun analysis immediately** to unlock CR/ISF optimizations.\n\n`;
                     }
                 }
                 
@@ -3377,15 +3377,15 @@
                     
                     primaryBundles.forEach((primaryBundle, idx) => {
                         // Add recency indicator
-                        const recencyIcon = primaryBundle.hasRecentEvents ? '✓' : 
-                                           primaryBundle.hasLast3DayEvents ? '○' : '⚠️';
-                        const urgentTag = primaryBundle.isUrgent ? ' 🚨 URGENT' : '';
+                        const recencyIcon = primaryBundle.hasRecentEvents ? 'âœ“' : 
+                                           primaryBundle.hasLast3DayEvents ? 'â—‹' : 'âš ï¸';
+                        const urgentTag = primaryBundle.isUrgent ? ' ðŸš¨ URGENT' : '';
                         const blockTag = primaryBundles.length > 1 ? ` [${primaryBundle.timeBlock}]` : '';
                         
                         output += `### ${primaryBundle.name} ${recencyIcon}${urgentTag}${blockTag}\n\n`;
                         
                         if (primaryBundle.urgentReason) {
-                            output += `⚠️ **${primaryBundle.urgentReason}** - requires immediate attention\n\n`;
+                            output += `âš ï¸ **${primaryBundle.urgentReason}** - requires immediate attention\n\n`;
                         }
                         
                         output += `**Why:** ${primaryBundle.rootCause}\n\n`;
@@ -3419,21 +3419,21 @@
                         } else if (primaryBundle.isBasalRatioWarning) {
                             output += `**Recency:** Current - structural\n`;
                         } else if (primaryBundle.hasStructuralFinding && primaryBundle.findings?.some(f => f.isStructural)) {
-                            output += `**Recency:** Current analysis ✓\n`;
+                            output += `**Recency:** Current analysis âœ“\n`;
                         } else if (primaryBundle.hasRecentEvents) {
                             const recentCount = primaryBundle.findings?.reduce((sum, f) => sum + (f.eventsLast24h || 0), 0) || 0;
-                            output += `**Recency:** ${recentCount} event(s) in last 24h ✓\n`;
+                            output += `**Recency:** ${recentCount} event(s) in last 24h âœ“\n`;
                         } else if (primaryBundle.hasLast3DayEvents) {
                             const last3Count = primaryBundle.findings?.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0) || 0;
                             output += `**Recency:** ${last3Count} event(s) in last 3 days\n`;
                         } else {
-                            output += `**Recency:** ⚠️ Caution - no events in last 3 days\n`;
+                            output += `**Recency:** âš ï¸ Caution - no events in last 3 days\n`;
                         }
                         
                         if (primaryBundle.compoundEffect && primaryBundle.compoundEffect.description) {
                             output += `**Compound Effect:** ${primaryBundle.compoundEffect.description}`;
                             if (primaryBundle.compoundEffect.warning) {
-                                output += ` ⚠️ ${primaryBundle.compoundEffect.warning}`;
+                                output += ` âš ï¸ ${primaryBundle.compoundEffect.warning}`;
                             }
                             output += `\n`;
                         }
@@ -3459,8 +3459,8 @@
                 if (referenceBundles.length > 0) {
                     referenceBundles.forEach(bundle => {
                         // Add recency indicator to name
-                        const recencyIcon = bundle.hasRecentEvents ? '✓' : 
-                                           bundle.hasLast3DayEvents ? '○' : '⚠️';
+                        const recencyIcon = bundle.hasRecentEvents ? 'âœ“' : 
+                                           bundle.hasLast3DayEvents ? 'â—‹' : 'âš ï¸';
                         output += `### ${recencyIcon} ${bundle.name} (Tier ${bundle.tier})\n`;
                         
                         // Generate appropriate status message
@@ -3470,7 +3470,7 @@
                         } else if (bundle.blockedBy) {
                             status = bundle.blockedBy;
                         } else if (bundle.compoundEffect?.warning === 'HIGH') {
-                            status = `⚠️ Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`;
+                            status = `âš ï¸ Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`;
                         } else if (bundle.isSlotConflict) {
                             status = 'Hold - conflicting patterns detected';
                         } else if (bundle.isBasalRatioWarning) {
@@ -3488,15 +3488,15 @@
                         } else if (bundle.isBasalRatioWarning) {
                             output += `- **Recency:** Current - structural\n`;
                         } else if (bundle.hasStructuralFinding && bundle.findings?.some(f => f.isStructural)) {
-                            output += `- **Recency:** Current analysis ✓\n`;
+                            output += `- **Recency:** Current analysis âœ“\n`;
                         } else if (bundle.hasRecentEvents) {
                             const recentCount = bundle.findings?.reduce((sum, f) => sum + (f.eventsLast24h || 0), 0) || 0;
-                            output += `- **Recency:** ${recentCount} event(s) in last 24h ✓\n`;
+                            output += `- **Recency:** ${recentCount} event(s) in last 24h âœ“\n`;
                         } else if (bundle.hasLast3DayEvents) {
                             const last3Count = bundle.findings?.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0) || 0;
                             output += `- **Recency:** ${last3Count} event(s) in last 3 days\n`;
                         } else {
-                            output += `- **Recency:** ⚠️ No recent events - pattern may have resolved\n`;
+                            output += `- **Recency:** âš ï¸ No recent events - pattern may have resolved\n`;
                         }
                         
                         // Show brief evidence details (first 2)
@@ -3530,8 +3530,8 @@
                     
                     detectedChanges.forEach(change => {
                         const paramLabel = change.type.toUpperCase();
-                        const direction = change.changePercent > 0 ? '↑' : '↓';
-                        const changeStr = `${change.from}→${change.to} (${change.changePercent > 0 ? '+' : ''}${change.changePercent}%)`;
+                        const direction = change.changePercent > 0 ? 'â†‘' : 'â†“';
+                        const changeStr = `${change.from}â†’${change.to} (${change.changePercent > 0 ? '+' : ''}${change.changePercent}%)`;
                         output += `| ${change.time} | ${paramLabel} | ${changeStr} ${direction} |\n`;
                     });
                     output += `\n`;
@@ -3547,14 +3547,14 @@
                     
                     recentChanges.forEach(change => {
                         const outcomeEmoji = {
-                            [OutcomeType.EFFECTIVE]: '✓',
-                            [OutcomeType.CAUSED_LOW]: '⚠️ Low',
-                            [OutcomeType.CAUSED_HIGH]: '⚠️ High',
-                            [OutcomeType.REVERTED]: '↩️',
-                            [OutcomeType.PENDING]: '⏳',
+                            [OutcomeType.EFFECTIVE]: 'âœ“',
+                            [OutcomeType.CAUSED_LOW]: 'âš ï¸ Low',
+                            [OutcomeType.CAUSED_HIGH]: 'âš ï¸ High',
+                            [OutcomeType.REVERTED]: 'â†©ï¸',
+                            [OutcomeType.PENDING]: 'â³',
                             [OutcomeType.INDETERMINATE]: '?'
                         };
-                        output += `| ${change.date} | ${change.scheduleTime} ${change.param}: ${change.oldValue}→${change.newValue} | ${outcomeEmoji[change.outcome] || '?'} |\n`;
+                        output += `| ${change.date} | ${change.scheduleTime} ${change.param}: ${change.oldValue}â†’${change.newValue} | ${outcomeEmoji[change.outcome] || '?'} |\n`;
                     });
                     output += `\n`;
                 }
@@ -3570,22 +3570,55 @@
                 if (analysisResults.signalAnalysis) {
                     output += `## Signals Summary\n\n`;
                     
-                    // Add TDD and clean windows
-                    if (analysisResults.nightscoutData?.deviceStatus) {
-                        // Extract TDD
-                        for (let i = 0; i < Math.min(5, analysisResults.nightscoutData.deviceStatus.length); i++) {
-                            const status = analysisResults.nightscoutData.deviceStatus[i];
-                            if (status.openaps?.enacted?.reason) {
-                                const reason = status.openaps.enacted.reason;
-                                const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                                const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
-                                if (twoWeekMatch || currentMatch) {
-                                    output += `**TDD:** ${twoWeekMatch ? twoWeekMatch[1] : currentMatch[1]} U\n`;
-                                    break;
-                                }
-                            }
+                    // Display TDD with 24h vs 2-week comparison
+                    if (analysisResults.tdd24h && analysisResults.tdd2Week) {
+                        const diff = analysisResults.tdd24h - analysisResults.tdd2Week;
+                        const diffPct = (diff / analysisResults.tdd2Week) * 100;
+                        const diffStr = diff >= 0 ? `+${diff.toFixed(1)}` : diff.toFixed(1);
+                        const diffPctStr = diffPct >= 0 ? `+${diffPct.toFixed(1)}` : diffPct.toFixed(1);
+                        
+                        output += `**TDD:**\n`;
+                        output += `- 24-hour: ${analysisResults.tdd24h.toFixed(1)} U\n`;
+                        output += `- 2-week avg: ${analysisResults.tdd2Week.toFixed(1)} U\n`;
+                        
+                        if (Math.abs(diffPct) >= 10) {
+                            output += `- **Difference:** ${diffStr} U (${diffPctStr}%) ${diff > 0 ? 'â†‘' : 'â†“'}\n`;
+                        } else {
+                            output += `- Difference: ${diffStr} U (${diffPctStr}%)\n`;
+                        }
+                        output += `\n`;
+                    } else if (analysisResults.tdd2Week) {
+                        output += `**TDD:** ${analysisResults.tdd2Week.toFixed(1)} U (2-week avg)\n`;
+                    } else if (analysisResults.tdd24h) {
+                        output += `**TDD:** ${analysisResults.tdd24h.toFixed(1)} U (24-hour)\n`;
+                    } else if (analysisResults.tdd) {
+                        output += `**TDD:** ${analysisResults.tdd.toFixed(1)} U\n`;
+                    }
+                    
+                    // Display 24h carbs
+                    if (analysisResults.totalCarbs24h !== undefined && analysisResults.totalCarbs24h !== null) {
+                        output += `**Carbs (24h):** ${analysisResults.totalCarbs24h.toFixed(0)}g\n`;
+                        
+                        // Calculate and display insulin per carb ratio
+                        if (analysisResults.tdd24h && analysisResults.totalCarbs24h > 0) {
+                            const ratio = analysisResults.tdd24h / analysisResults.totalCarbs24h;
+                            output += `**Insulin per Carb:** ${ratio.toFixed(3)} U/g (TDD ÷ Carbs)\n`;
                         }
                     }
+                    
+                    // Display sensitivity index
+                    if (analysisResults.sensitivityIndex) {
+                        const idx = parseFloat(analysisResults.sensitivityIndex);
+                        let interpretation = 'Normal range';
+                        if (idx > 1.15) interpretation = 'Significantly more sensitive';
+                        else if (idx > 1.05) interpretation = 'Moderately more sensitive';
+                        else if (idx < 0.85) interpretation = 'Significantly less sensitive';
+                        else if (idx < 0.95) interpretation = 'Moderately less sensitive';
+                        
+                        output += `**Sensitivity Index:** ${analysisResults.sensitivityIndex} (${interpretation})\n`;
+                        output += `  _Formula: 2wk TDD ÷ 24h TDD. >1.0 = more sensitive, <1.0 = less sensitive_\n`;
+                    }
+                    output += `\n`;
                     
                     output += `**Clean Windows:** ${analysisResults.signalAnalysis.cleanWindows?.total || 0} readings analyzed\n`;
                     output += `**Weighted Deviation:** ${analysisResults.signalAnalysis.weightedDeviation >= 0 ? '+' : ''}${analysisResults.signalAnalysis.weightedDeviation?.toFixed(1) || 0} mg/dL from target\n\n`;
@@ -3599,7 +3632,7 @@
                         const isSignalFallback = analysisResults.effectiveTargetSource === 'signal-fallback';
                         
                         output += `**Basal % of TDD:**\n`;
-                        if (currentPct) output += `- Current: ${currentPct.toFixed(1)}% (actual basal schedule ÷ TDD)\n`;
+                        if (currentPct) output += `- Current: ${currentPct.toFixed(1)}% (actual basal schedule Ã· TDD)\n`;
                         if (signalPct) output += `- Signal: ${signalPct.toFixed(1)}% (today's clean windows suggest)\n`;
                         
                         // BUG-023: Show different message for signal fallback
@@ -3616,10 +3649,10 @@
                             
                             // BUG-023: Add info about excluded stale data or gaps
                             if (dynamicTarget?.excludedStaleRows > 0) {
-                                output += ` ⚠️ (${dynamicTarget.excludedStaleRows} stale rows excluded)`;
+                                output += ` âš ï¸ (${dynamicTarget.excludedStaleRows} stale rows excluded)`;
                             }
                             if (dynamicTarget?.hasGap) {
-                                output += ` ⚠️ (gap detected - post-override transition)`;
+                                output += ` âš ï¸ (gap detected - post-override transition)`;
                             }
                             output += `\n`;
                         }
@@ -3629,7 +3662,7 @@
                         // BUG-023: Show conflict warning if target diverges from signal (only for non-fallback)
                         if (!isSignalFallback && signalPct && Math.abs(targetPct - signalPct) > 1.5) {
                             const direction = targetPct > signalPct ? 'increase' : 'decrease';
-                            output += `\n⚠️ **Target/Signal Divergence:** Target (${targetPct.toFixed(1)}%) suggests ${direction}, but today's signal (${signalPct.toFixed(1)}%) differs by ${Math.abs(targetPct - signalPct).toFixed(1)}%.\n`;
+                            output += `\nâš ï¸ **Target/Signal Divergence:** Target (${targetPct.toFixed(1)}%) suggests ${direction}, but today's signal (${signalPct.toFixed(1)}%) differs by ${Math.abs(targetPct - signalPct).toFixed(1)}%.\n`;
                         }
                         
                         output += `\n`;
@@ -3666,12 +3699,12 @@
                         
                         // Determine AGP problem
                         if (avgHigh > 25) {
-                            return { status: 'HIGH', icon: '⚠️', detail: `${avgHigh.toFixed(0)}% HIGH` };
+                            return { status: 'HIGH', icon: 'âš ï¸', detail: `${avgHigh.toFixed(0)}% HIGH` };
                         }
                         if (avgLow > 5) {
-                            return { status: 'LOW', icon: '⚠️', detail: `${avgLow.toFixed(0)}% LOW` };
+                            return { status: 'LOW', icon: 'âš ï¸', detail: `${avgLow.toFixed(0)}% LOW` };
                         }
-                        return { status: 'OK', icon: '✓', detail: 'OK' };
+                        return { status: 'OK', icon: 'âœ“', detail: 'OK' };
                     };
                     
                     // Check for Signal/AGP divergence
@@ -3688,7 +3721,7 @@
                                 emoji: period.emoji,
                                 type: 'SIGNAL_LOW_AGP_HIGH',
                                 message: `Signal LOW (${period.medianDeviation.toFixed(0)}) but AGP shows ${agpCheck.detail}`,
-                                recommendation: 'Fasting OK, meals spiking → CR/timing issue, NOT basal'
+                                recommendation: 'Fasting OK, meals spiking â†’ CR/timing issue, NOT basal'
                             });
                         }
                         
@@ -3721,9 +3754,9 @@
                     
                     // Show divergence warnings if any
                     if (divergences.length > 0) {
-                        output += `**⚠️ Signal/AGP Divergence Detected:**\n`;
+                        output += `**âš ï¸ Signal/AGP Divergence Detected:**\n`;
                         divergences.forEach(d => {
-                            output += `- **${d.emoji} ${d.period}:** ${d.message} → *${d.recommendation}*\n`;
+                            output += `- **${d.emoji} ${d.period}:** ${d.message} â†’ *${d.recommendation}*\n`;
                         });
                         output += `\n*Basal changes will not fix meal-driven highs. Consider CR or pre-bolus timing instead.*\n\n`;
                     }
@@ -3731,12 +3764,12 @@
                     // AGP Priority by Period table (FEATURE-003)
                     if (agp7day && agp7day.hourlyStats) {
                         const periodHours = {
-                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: '🌙' },
-                            'Dawn': { hours: [4, 5, 6, 7], emoji: '🌅' },
-                            'Morning': { hours: [8, 9, 10, 11], emoji: '☀️' },
-                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: '🌤️' },
-                            'Evening': { hours: [17, 18, 19, 20], emoji: '🌆' },
-                            'Sleep Onset': { hours: [21, 22, 23], emoji: '😴' }
+                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: 'ðŸŒ™' },
+                            'Dawn': { hours: [4, 5, 6, 7], emoji: 'ðŸŒ…' },
+                            'Morning': { hours: [8, 9, 10, 11], emoji: 'â˜€ï¸' },
+                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: 'ðŸŒ¤ï¸' },
+                            'Evening': { hours: [17, 18, 19, 20], emoji: 'ðŸŒ†' },
+                            'Sleep Onset': { hours: [21, 22, 23], emoji: 'ðŸ˜´' }
                         };
                         
                         const periodStats = [];
@@ -3763,11 +3796,11 @@
                             
                             // Determine focus level
                             let focus;
-                            if (avgTIR < 60) focus = '🔴 HIGH';
-                            else if (avgTIR < 70) focus = '🟡 MEDIUM';
-                            else if (avgTIR < 80) focus = '○ Normal';
-                            else if (avgTIR >= 90) focus = '✓ Excellent';
-                            else focus = '✓ Good';
+                            if (avgTIR < 60) focus = 'ðŸ”´ HIGH';
+                            else if (avgTIR < 70) focus = 'ðŸŸ¡ MEDIUM';
+                            else if (avgTIR < 80) focus = 'â—‹ Normal';
+                            else if (avgTIR >= 90) focus = 'âœ“ Excellent';
+                            else focus = 'âœ“ Good';
                             
                             periodStats.push({
                                 period: periodName,
@@ -3802,7 +3835,7 @@
                     
                     // BUG-023: Show safety override warning if active
                     if (analysisResults.basalOptimization.safetyOverride) {
-                        output += `⚠️ **Safety Override Active:** ${analysisResults.basalOptimization.safetyOverrideReason}\n\n`;
+                        output += `âš ï¸ **Safety Override Active:** ${analysisResults.basalOptimization.safetyOverrideReason}\n\n`;
                     }
                     
                     const dist = analysisResults.basalOptimization.distribution;
@@ -3816,7 +3849,7 @@
                         output += `**Target:** ${finalPercent.toFixed(1)}% of ${tdd.toFixed(1)} U TDD = ${targetBasal.toFixed(2)} U/day basal\n\n`;
                     }
                     
-                    output += `**Summary:** ${dist.currentTotal.toFixed(2)} U/day → ${dist.proposedTotal.toFixed(2)} U/day (${change >= 0 ? '+' : ''}${change.toFixed(2)} U, ${dist.incrementsNeeded} increments)\n\n`;
+                    output += `**Summary:** ${dist.currentTotal.toFixed(2)} U/day â†’ ${dist.proposedTotal.toFixed(2)} U/day (${change >= 0 ? '+' : ''}${change.toFixed(2)} U, ${dist.incrementsNeeded} increments)\n\n`;
                     
                     output += `| Hour | Current | Proposed | Change |\n`;
                     output += `|------|---------|----------|--------|\n`;
@@ -3844,11 +3877,11 @@
                         output += `**Distribution:** ${parts.join(' | ')}\n`;
                     }
                     if (dist.incrementsSkipped > 0) {
-                        output += `⚠️ ${dist.incrementsSkipped} increment(s) not applied - no suitable periods available.\n`;
+                        output += `âš ï¸ ${dist.incrementsSkipped} increment(s) not applied - no suitable periods available.\n`;
                     }
                     // Show ratio protection info
                     if (dist.ratioProtection?.active) {
-                        output += `🛡️ **Ratio Protection:** ${dist.ratioProtection.blockedCount} change(s) blocked to maintain ≤2:1 ratio (min rate floor: ${dist.ratioProtection.minAllowedRate} U/hr)\n`;
+                        output += `ðŸ›¡ï¸ **Ratio Protection:** ${dist.ratioProtection.blockedCount} change(s) blocked to maintain â‰¤2:1 ratio (min rate floor: ${dist.ratioProtection.minAllowedRate} U/hr)\n`;
                     }
                     output += `\n`;
                 }
@@ -3865,7 +3898,7 @@
                         primaryBundles.forEach(pb => {
                             pb.recommendations.forEach(rec => {
                                 if (rec.param === 'basal') {
-                                    output += `   - ${rec.scheduleTime} basal: ${rec.currentValue} → ${rec.newValue}\n`;
+                                    output += `   - ${rec.scheduleTime} basal: ${rec.currentValue} â†’ ${rec.newValue}\n`;
                                 }
                             });
                         });
@@ -3874,7 +3907,7 @@
                     output += `\n**2. Rerun analysis immediately** after applying changes to your pump\n`;
                     if (blockedBundles.length > 0) {
                         output += `   - ${blockedBundles.length} blocked CR/ISF recommendation(s) will be re-evaluated\n`;
-                        output += `   - If basal ratio normalizes (≤2:1), full optimization unlocks\n`;
+                        output += `   - If basal ratio normalizes (â‰¤2:1), full optimization unlocks\n`;
                     }
                     output += `\n---\n\n`;
                 }
@@ -3934,9 +3967,9 @@
                 
                 sortedFindings.forEach((finding, idx) => {
                     // Recency indicator
-                    const recencyIcon = finding.eventsLast24h > 0 ? '✓' : 
-                                       finding.eventsLast3Days > 0 ? '○' : 
-                                       finding.isStructural ? '●' : '⚠️';
+                    const recencyIcon = finding.eventsLast24h > 0 ? 'âœ“' : 
+                                       finding.eventsLast3Days > 0 ? 'â—‹' : 
+                                       finding.isStructural ? 'â—' : 'âš ï¸';
                     output += `${idx + 1}. ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
                     output += `   - Severity: ${(finding.severity * 100).toFixed(0)}%\n`;
                     output += `   - ${finding.details}\n\n`;
@@ -4014,10 +4047,10 @@
                 };
                 
                 // ============================================
-                // CONTEXT CHECK - Last 24h only (✓ events)
+                // CONTEXT CHECK - Last 24h only (âœ“ events)
                 // ============================================
                 
-                // Unexplained lows → ask about activity (LAST 24H ONLY)
+                // Unexplained lows â†’ ask about activity (LAST 24H ONLY)
                 const unexplainedLows = findings.filter(f => 
                     f.type === 'unexplained_low' && isRecent(f)
                 );
@@ -4041,7 +4074,7 @@
                     );
                 }
                 
-                // Post-meal highs → ask about food type/timing (LAST 24H ONLY)
+                // Post-meal highs â†’ ask about food type/timing (LAST 24H ONLY)
                 const recentMealHighs = findings.filter(f => 
                     f.type === 'post_meal_high' && isRecent(f)
                 );
@@ -4054,12 +4087,12 @@
                         const peak = peakMatch ? peakMatch[1] : '?';
                         const mealTime = timeMatch ? timeMatch[1].trim() : high.scheduleTime;
                         prompts.contextCheck.push(
-                            `Food context for meal at ${mealTime}? (${carbs} → ${peak} peak)`
+                            `Food context for meal at ${mealTime}? (${carbs} â†’ ${peak} peak)`
                         );
                     }
                 }
                 
-                // Transient high → low pattern → ask about pre-bolus timing (LAST 24H ONLY)
+                // Transient high â†’ low pattern â†’ ask about pre-bolus timing (LAST 24H ONLY)
                 const transientHighLows = findings.filter(f => 
                     f.type === 'transient_high_low' && isRecent(f)
                 );
@@ -4069,7 +4102,7 @@
                     );
                 }
                 
-                // Correction ineffectiveness overnight → ask about bedtime snacks (LAST 24H ONLY)
+                // Correction ineffectiveness overnight â†’ ask about bedtime snacks (LAST 24H ONLY)
                 const overnightIneffective = findings.filter(f => 
                     f.type === 'correction_ineffective' && 
                     isRecent(f) &&
@@ -4081,7 +4114,7 @@
                     );
                 }
                 
-                // Many periods with same signal → ask about equipment
+                // Many periods with same signal â†’ ask about equipment
                 if (signalAnalysis?.periods) {
                     const lowPeriods = signalAnalysis.periods.filter(p => p.signal === 'LOW').length;
                     const highPeriods = signalAnalysis.periods.filter(p => p.signal === 'HIGH').length;
@@ -4119,7 +4152,7 @@
                     const daysAgo = Math.floor((now - changeDate) / (24 * 60 * 60 * 1000));
                     if (daysAgo >= 1) {
                         prompts.followUp.push(
-                            `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} (${change.date}): Applied? What happened?`
+                            `${change.scheduleTime} ${change.param} ${change.oldValue}â†’${change.newValue} (${change.date}): Applied? What happened?`
                         );
                     }
                 }
@@ -4160,7 +4193,7 @@
                     const periods = [...new Set(allUnexplainedLows.map(f => f.period || 'unknown'))]
                         .sort((a, b) => periodOrder.indexOf(a) - periodOrder.indexOf(b));
                     prompts.memoryCandidates.push(
-                        `If activity explains lows → "Active days cause ${periods.join('/')} lows"`
+                        `If activity explains lows â†’ "Active days cause ${periods.join('/')} lows"`
                     );
                 }
                 
@@ -4170,7 +4203,7 @@
                 );
                 for (const change of problematicChanges.slice(0, 2)) {
                     prompts.memoryCandidates.push(
-                        `${change.scheduleTime} ${change.param} ${change.newValue} was too aggressive → note baseline range`
+                        `${change.scheduleTime} ${change.param} ${change.newValue} was too aggressive â†’ note baseline range`
                     );
                 }
                 
@@ -4178,14 +4211,14 @@
                 const effectiveChanges = history.changes.filter(c => c.outcome === 'effective');
                 for (const change of effectiveChanges.slice(0, 2)) {
                     prompts.memoryCandidates.push(
-                        `${change.scheduleTime} ${change.param} ${change.newValue} is working → update known-good value`
+                        `${change.scheduleTime} ${change.param} ${change.newValue} is working â†’ update known-good value`
                     );
                 }
                 
                 // State transition learnings
                 if (bodyState.state === BodyStateType.STABLE && bodyState.daysInState <= 3) {
                     prompts.memoryCandidates.push(
-                        `If stable after override → "Sensitivity returns within ${bodyState.daysInState} days post-override"`
+                        `If stable after override â†’ "Sensitivity returns within ${bodyState.daysInState} days post-override"`
                     );
                 }
                 
@@ -4193,7 +4226,7 @@
                 const conflictBundles = bundles.filter(b => b.isSlotConflict);
                 if (conflictBundles.length > 0) {
                     prompts.memoryCandidates.push(
-                        `If conflicts resolve → note which direction was correct for this meal slot`
+                        `If conflicts resolve â†’ note which direction was correct for this meal slot`
                     );
                 }
                 
@@ -4416,28 +4449,28 @@
                 let output = `## AGP Summary (7 Days)\n\n`;
                 
                 // Overall summary line with goals
-                const tirStatus = agp.tir.inRange >= goals.tir ? '✓' : '⚠️';
-                const gmiStatus = agp.gmi < goals.gmi ? '✓' : '⚠️';
-                const cvStatus = agp.cv < goals.cv ? '✓' : '⚠️';
-                output += `**Overall:** ${agp.tir.inRange.toFixed(0)}% TIR (≥${goals.tir}% ${tirStatus}) | GMI ${agp.gmi.toFixed(1)}% (<${goals.gmi}% ${gmiStatus}) | CV ${agp.cv.toFixed(0)}% (<${goals.cv}% ${cvStatus})\n`;
+                const tirStatus = agp.tir.inRange >= goals.tir ? 'âœ“' : 'âš ï¸';
+                const gmiStatus = agp.gmi < goals.gmi ? 'âœ“' : 'âš ï¸';
+                const cvStatus = agp.cv < goals.cv ? 'âœ“' : 'âš ï¸';
+                output += `**Overall:** ${agp.tir.inRange.toFixed(0)}% TIR (â‰¥${goals.tir}% ${tirStatus}) | GMI ${agp.gmi.toFixed(1)}% (<${goals.gmi}% ${gmiStatus}) | CV ${agp.cv.toFixed(0)}% (<${goals.cv}% ${cvStatus})\n`;
                 
                 // Safety line with goals
-                const lowStatus = agp.tir.low < goals.low ? '✓' : '⚠️';
-                const veryLowStatus = agp.tir.veryLow < goals.veryLow ? '✓' : '⚠️';
+                const lowStatus = agp.tir.low < goals.low ? 'âœ“' : 'âš ï¸';
+                const veryLowStatus = agp.tir.veryLow < goals.veryLow ? 'âœ“' : 'âš ï¸';
                 const veryLowDisplay = agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0);
                 output += `**Safety:** ${agp.tir.low.toFixed(0)}% Low (<${goals.low}% ${lowStatus}) | ${veryLowDisplay}% Very Low (<${goals.veryLow}% ${veryLowStatus})\n`;
                 
                 // 48h Trend comparison
                 if (agp48h) {
                     const tirDiff = agp48h.tir.inRange - agp.tir.inRange;
-                    const tirArrow = tirDiff > 2 ? '↑' : tirDiff < -2 ? '↓' : '→';
+                    const tirArrow = tirDiff > 2 ? 'â†‘' : tirDiff < -2 ? 'â†“' : 'â†’';
                     const tirDiffStr = tirDiff > 0 ? `+${tirDiff.toFixed(0)}%` : `${tirDiff.toFixed(0)}%`;
                     
                     const problemHours7d = agp.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
                     const problemHours48h = agp48h.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
-                    const problemArrow = problemHours48h < problemHours7d ? '↓' : problemHours48h > problemHours7d ? '↑' : '→';
+                    const problemArrow = problemHours48h < problemHours7d ? 'â†“' : problemHours48h > problemHours7d ? 'â†‘' : 'â†’';
                     
-                    output += `**48h Trend:** ${agp48h.tir.inRange.toFixed(0)}% TIR (${tirDiffStr} ${tirArrow}) | Problem hours: ${problemHours7d}→${problemHours48h} ${problemArrow}\n`;
+                    output += `**48h Trend:** ${agp48h.tir.inRange.toFixed(0)}% TIR (${tirDiffStr} ${tirArrow}) | Problem hours: ${problemHours7d}â†’${problemHours48h} ${problemArrow}\n`;
                 }
                 
                 output += `\n`;
@@ -4446,11 +4479,11 @@
                 output += `**Time in Range** *(Day 70-160, Night 70-140)*:\n`;
                 output += `| Range | % | Goal | Status |\n`;
                 output += `|-------|---|------|--------|\n`;
-                output += `| Very High (>250) | ${agp.tir.veryHigh.toFixed(0)}% | <${goals.veryHigh}% | ${agp.tir.veryHigh < goals.veryHigh ? '✓' : '⚠️'} |\n`;
-                output += `| High (160-250) | ${agp.tir.high.toFixed(0)}% | <${goals.high}% | ${agp.tir.high < goals.high ? '✓' : '⚠️'} |\n`;
-                output += `| In Range (70-160) | ${agp.tir.inRange.toFixed(0)}% | ≥${goals.tir}% | ${agp.tir.inRange >= goals.tir ? '✓' : '⚠️'} |\n`;
-                output += `| Low (54-70) | ${agp.tir.low.toFixed(0)}% | <${goals.low}% | ${agp.tir.low < goals.low ? '✓' : '⚠️'} |\n`;
-                output += `| Very Low (<54) | ${agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0)}% | <${goals.veryLow}% | ${agp.tir.veryLow < goals.veryLow ? '✓' : '⚠️'} |\n\n`;
+                output += `| Very High (>250) | ${agp.tir.veryHigh.toFixed(0)}% | <${goals.veryHigh}% | ${agp.tir.veryHigh < goals.veryHigh ? 'âœ“' : 'âš ï¸'} |\n`;
+                output += `| High (160-250) | ${agp.tir.high.toFixed(0)}% | <${goals.high}% | ${agp.tir.high < goals.high ? 'âœ“' : 'âš ï¸'} |\n`;
+                output += `| In Range (70-160) | ${agp.tir.inRange.toFixed(0)}% | â‰¥${goals.tir}% | ${agp.tir.inRange >= goals.tir ? 'âœ“' : 'âš ï¸'} |\n`;
+                output += `| Low (54-70) | ${agp.tir.low.toFixed(0)}% | <${goals.low}% | ${agp.tir.low < goals.low ? 'âœ“' : 'âš ï¸'} |\n`;
+                output += `| Very Low (<54) | ${agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0)}% | <${goals.veryLow}% | ${agp.tir.veryLow < goals.veryLow ? 'âœ“' : 'âš ï¸'} |\n\n`;
                 
                 // Full 24-hour breakdown
                 output += `**Hourly Breakdown:**\n`;
@@ -4473,10 +4506,10 @@
                     const sd = stats.sd.toFixed(0);
                     
                     // Status indicator
-                    let status = '✓';
-                    if (stats.tir.inRange < 70) status = '⚠️ Low TIR';
-                    else if (stats.tir.low + stats.tir.veryLow > 5) status = '🔴 Lows';
-                    else if (stats.tir.inRange < 80) status = '○';
+                    let status = 'âœ“';
+                    if (stats.tir.inRange < 70) status = 'âš ï¸ Low TIR';
+                    else if (stats.tir.low + stats.tir.veryLow > 5) status = 'ðŸ”´ Lows';
+                    else if (stats.tir.inRange < 80) status = 'â—‹';
                     
                     output += `| ${hourLabel} | ${tir}% | ${high}% | ${low}% | ${mean} | ${sd} | ${status} |\n`;
                 }
@@ -4530,15 +4563,15 @@
                 const dateStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 
                 let output = `# Daily Review - ${dateStr}\n`;
-                output += `**State:** ${this.formatStateName(bodyState.state)} ${bodyState.state === BodyStateType.STABLE ? '✓' : '⚠️'}\n\n`;
+                output += `**State:** ${this.formatStateName(bodyState.state)} ${bodyState.state === BodyStateType.STABLE ? 'âœ“' : 'âš ï¸'}\n\n`;
                 
                 const primaryBundles = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
                 if (primaryBundles.length > 0) {
                     output += `**Tonight:** `;
                     const summaries = primaryBundles.map(primary => {
                         const rec = primary.recommendations[0];
-                        const urgentTag = primary.isUrgent ? '🚨 ' : '';
-                        return `${urgentTag}${rec.scheduleTime} ${rec.param} ${rec.currentValue} → ${rec.newValue}`;
+                        const urgentTag = primary.isUrgent ? 'ðŸš¨ ' : '';
+                        return `${urgentTag}${rec.scheduleTime} ${rec.param} ${rec.currentValue} â†’ ${rec.newValue}`;
                     });
                     output += summaries.join(' | ') + '\n\n';
                 } else {
@@ -5088,28 +5121,50 @@
                     (sum, p) => sum + (p.cleanWindowCount || 0), 0
                 ) || 0;
                 
-                // Calculate TDD from iAPS deviceStatus (matches v25 logic)
+                // Calculate TDD from iAPS deviceStatus (extract both 24h and 2-week)
                 let tdd = null;
+                let tdd24h = null;
+                let tdd2Week = null;
                 if (nightscoutData?.deviceStatus) {
                     for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
                         const status = nightscoutData.deviceStatus[i];
                         if (status.openaps?.enacted?.reason) {
                             const reason = status.openaps.enacted.reason;
-                            // Try 2-week TDD first (preferred)
+                            // Extract both TDD values
                             const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                            if (twoWeekMatch) {
-                                tdd = parseFloat(twoWeekMatch[1]);
-                                break;
-                            }
-                            // Fall back to current TDD
                             const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
-                            if (currentMatch && !tdd) {
-                                tdd = parseFloat(currentMatch[1]);
+                            
+                            if (twoWeekMatch) {
+                                tdd2Week = parseFloat(twoWeekMatch[1]);
+                                tdd = tdd2Week; // Prefer 2-week for calculations
                             }
+                            if (currentMatch) {
+                                tdd24h = parseFloat(currentMatch[1]);
+                                if (!tdd) tdd = tdd24h; // Fallback to 24h
+                            }
+                            
+                            if (tdd2Week || tdd24h) break;
                         }
                     }
                 }
-                console.log('TDD from iAPS:', tdd);
+                
+                // Calculate total carbs in last 24 hours
+                let totalCarbs24h = 0;
+                if (nightscoutData?.treatments) {
+                    const now = new Date();
+                    const yesterday = new Date(now - 24 * 60 * 60 * 1000);
+                    
+                    nightscoutData.treatments.forEach(t => {
+                        if (t.carbs && t.carbs > 0 && t.created_at) {
+                            const treatmentTime = new Date(t.created_at);
+                            if (treatmentTime >= yesterday && treatmentTime <= now) {
+                                totalCarbs24h += t.carbs;
+                            }
+                        }
+                    });
+                }
+                
+                console.log('TDD from iAPS:', { tdd, tdd24h, tdd2Week, totalCarbs24h });
                 
                 // Debug: check signalOnlyAnchor
                 console.log('=== Signal % Debug in attemptAutoLog ===');
@@ -5121,13 +5176,13 @@
                 const gap = signalPercent ? (signalPercent - targetPercent) : 0;
                 
                 // Calculate final % 
-                // Logic: Final % = Target % rate-limited to Yesterday's Final % ± 2%
+                // Logic: Final % = Target % rate-limited to Yesterday's Final % Â± 2%
                 let finalPercent = targetPercent;
                 
                 // Apply guardrails (30-50%)
                 finalPercent = Math.max(30, Math.min(50, finalPercent));
                 
-                // Rate limit: max ±2% per day from yesterday's final
+                // Rate limit: max Â±2% per day from yesterday's final
                 const maxDailyChange = 2.0;
                 if (yesterdayFinal !== null && yesterdayFinal !== undefined) {
                     if (finalPercent > yesterdayFinal + maxDailyChange) {
@@ -5175,6 +5230,10 @@
                     direction: direction,
                     isOverride: isOverrideActive,
                     notes: isOverrideActive ? 'Auto-logged (override)' : 'Auto-logged',
+                    // NEW: TDD and Carb tracking  
+                    tdd24h: tdd24h ? tdd24h.toFixed(1) : '',
+                    tdd2wk: tdd2Week ? tdd2Week.toFixed(1) : '',
+                    carbs24h: totalCarbs24h ? totalCarbs24h.toFixed(0) : '',
                     // Schedule snapshots for change detection (FEATURE-004)
                     // Use activeSchedules (fresh from Nightscout) not React state (stale)
                     schedules: {
@@ -5202,8 +5261,8 @@
                     console.log('Auto-log: Request sent (no-cors, assuming success)');
                     setLogStatus('success');
                     setLogMessage(isOverrideActive 
-                        ? 'Auto-logged (override - excluded from baseline) ✓' 
-                        : 'Auto-logged to Sheets ✓'
+                        ? 'Auto-logged (override - excluded from baseline) âœ“' 
+                        : 'Auto-logged to Sheets âœ“'
                     );
                     
                     setTimeout(() => {
@@ -5254,10 +5313,10 @@
                         console.log(`Using dynamic target: ${effectiveBasalTarget}% (${dynamicResult.daysOfData} days of data)`);
                         console.log(`Yesterday Final %: ${yesterdayFinal}`);
                         if (dynamicResult.hasGap) {
-                            console.log(`⚠️ Gap detected: ${dynamicResult.gapDays} days - post-override transition`);
+                            console.log(`âš ï¸ Gap detected: ${dynamicResult.gapDays} days - post-override transition`);
                         }
                         if (dynamicResult.excludedStaleRows > 0) {
-                            console.log(`⚠️ Excluded ${dynamicResult.excludedStaleRows} stale rows (>5 days old)`);
+                            console.log(`âš ï¸ Excluded ${dynamicResult.excludedStaleRows} stale rows (>5 days old)`);
                         }
                     } else {
                         // BUG-023: Mark that we need to fall back to today's signal
@@ -5337,24 +5396,60 @@
                     
                     // Extract TDD from iAPS deviceStatus for signal analysis
                     let tddForSignal = null;
+                    let tdd24h = null;
+                    let tdd2Week = null;
+                    
                     if (nightscoutData.deviceStatus) {
                         for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
                             const status = nightscoutData.deviceStatus[i];
                             if (status.openaps?.enacted?.reason) {
                                 const reason = status.openaps.enacted.reason;
+                                
+                                // Extract both TDD values from reason string
                                 const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                                if (twoWeekMatch) {
-                                    tddForSignal = parseFloat(twoWeekMatch[1]);
-                                    break;
-                                }
                                 const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
-                                if (currentMatch && !tddForSignal) {
-                                    tddForSignal = parseFloat(currentMatch[1]);
+                                
+                                if (twoWeekMatch) {
+                                    tdd2Week = parseFloat(twoWeekMatch[1]);
+                                }
+                                if (currentMatch) {
+                                    tdd24h = parseFloat(currentMatch[1]);
+                                }
+                                
+                                // If we found either value, we're done
+                                if (tdd2Week || tdd24h) {
+                                    break;
                                 }
                             }
                         }
                     }
-                    console.log('TDD for signal analysis:', tddForSignal);
+                    
+                    // Prefer 2-week TDD for signal analysis (more stable)
+                    tddForSignal = tdd2Week || tdd24h;
+                    
+                    console.log('TDD extracted:', {
+                        tdd24h: tdd24h,
+                        tdd2Week: tdd2Week,
+                        usingForSignal: tddForSignal
+                    });
+                    
+                    // Calculate total carbs in last 24 hours
+                    let totalCarbs24h = 0;
+                    if (nightscoutData.treatments) {
+                        const now = new Date();
+                        const yesterday = new Date(now - 24 * 60 * 60 * 1000);
+                        
+                        nightscoutData.treatments.forEach(t => {
+                            if (t.carbs && t.carbs > 0 && t.created_at) {
+                                const treatmentTime = new Date(t.created_at);
+                                if (treatmentTime >= yesterday && treatmentTime <= now) {
+                                    totalCarbs24h += t.carbs;
+                                }
+                            }
+                        });
+                    }
+                    
+                    console.log('Total carbs (24h):', totalCarbs24h);
                     
                     // Run signal analysis with principled ISF/TDD-based calculation
                     const signalAnalysis = SignalAnalysis.analyzeCleanWindows(
@@ -5580,7 +5675,11 @@
                         effectiveTargetSource,
                         finalPercent,
                         basalOptimization,
-                        tdd: tddForSignal  // BUG-022: Include TDD for output context
+                        tdd: tddForSignal,  // For calculations (2-week preferred)
+                        tdd24h: tdd24h,     // 24-hour TDD for trend comparison
+                        tdd2Week: tdd2Week, // 2-week TDD for stable baseline
+                        totalCarbs24h: totalCarbs24h,  // Total carbs in last 24h
+                        sensitivityIndex: (tdd24h && tdd2Week) ? (tdd2Week / tdd24h).toFixed(3) : null  // Sensitivity index
                     });
                     setBodyState(detectedState);
                     setBundles(processedBundles);
@@ -5886,13 +5985,13 @@
                 const gap = signalPercent ? (signalPercent - targetPercent) : 0;
                 
                 // Calculate final %
-                // Logic: Final % = Target % rate-limited to Yesterday's Final % ± 2%
+                // Logic: Final % = Target % rate-limited to Yesterday's Final % Â± 2%
                 let finalPercent = targetPercent;
                 
                 // Apply guardrails (30-50%)
                 finalPercent = Math.max(30, Math.min(50, finalPercent));
                 
-                // Rate limit: max ±2% per day from yesterday's final
+                // Rate limit: max Â±2% per day from yesterday's final
                 const maxDailyChange = 2.0;
                 const yesterdayFinal = dynamicTarget?.yesterdayFinal;
                 if (yesterdayFinal !== null && yesterdayFinal !== undefined) {
@@ -6032,7 +6131,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v2.0 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v2.0 â€” State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -6245,9 +6344,9 @@
                                         {logStatus === 'logging' && (
                                             <div className="animate-spin w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full"></div>
                                         )}
-                                        {logStatus === 'success' && <span>✓</span>}
-                                        {logStatus === 'error' && <span>✗</span>}
-                                        {logStatus === 'info' && <span>ℹ️</span>}
+                                        {logStatus === 'success' && <span>âœ“</span>}
+                                        {logStatus === 'error' && <span>âœ—</span>}
+                                        {logStatus === 'info' && <span>â„¹ï¸</span>}
                                         <span>{logMessage}</span>
                                     </div>
                                 )}
@@ -6268,9 +6367,9 @@
                                                     analysisResults.effectiveTargetSource === 'signal-fallback' ? 'text-amber-400' :
                                                     'text-gray-400'
                                                 }`}>
-                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? '🎯 Dynamic Target' : 
-                                                     analysisResults.effectiveTargetSource === 'signal-fallback' ? '📡 Signal Fallback' :
-                                                     '📌 Configured Target'}
+                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? 'ðŸŽ¯ Dynamic Target' : 
+                                                     analysisResults.effectiveTargetSource === 'signal-fallback' ? 'ðŸ“¡ Signal Fallback' :
+                                                     'ðŸ“Œ Configured Target'}
                                                 </span>
                                                 <span className="text-white font-bold">
                                                     {analysisResults.effectiveBasalTarget?.toFixed(1) || basalTDDPercent}%
@@ -6295,7 +6394,7 @@
                                                     last {dynamicTarget.daysOfData} day{dynamicTarget.daysOfData !== 1 ? 's' : ''} avg
                                                     {dynamicTarget.totalDaysAvailable > dynamicTarget.daysOfData && 
                                                         ` (${dynamicTarget.totalDaysAvailable} total)`}
-                                                    {dynamicTarget.wasGuardrailed && ' • guardrailed'}
+                                                    {dynamicTarget.wasGuardrailed && ' â€¢ guardrailed'}
                                                 </span>
                                             )}
                                         </div>
@@ -6342,11 +6441,11 @@
                                     <div className="glass-card rounded-2xl p-6">
                                         <div className="flex items-center justify-between mb-2">
                                             <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                                                📊 Proposed Basal Schedule
+                                                ðŸ“Š Proposed Basal Schedule
                                             </h2>
                                             <div className="flex items-center gap-3 text-sm">
                                                 <span className="text-gray-400">
-                                                    {analysisResults.basalOptimization.distribution.currentTotal.toFixed(2)} U →{' '}
+                                                    {analysisResults.basalOptimization.distribution.currentTotal.toFixed(2)} U â†’{' '}
                                                     <span className="text-white font-bold">
                                                         {analysisResults.basalOptimization.distribution.proposedTotal.toFixed(2)} U
                                                     </span>
@@ -6365,7 +6464,7 @@
                                         {/* Target calculation context */}
                                         {analysisResults.tdd && analysisResults.finalPercent && (
                                             <div className="text-xs text-gray-500 mb-4">
-                                                Target: {analysisResults.finalPercent.toFixed(1)}% × {analysisResults.tdd.toFixed(1)} U TDD = {((analysisResults.finalPercent / 100) * analysisResults.tdd).toFixed(2)} U/day
+                                                Target: {analysisResults.finalPercent.toFixed(1)}% Ã— {analysisResults.tdd.toFixed(1)} U TDD = {((analysisResults.finalPercent / 100) * analysisResults.tdd).toFixed(2)} U/day
                                             </div>
                                         )}
                                         
@@ -6414,7 +6513,7 @@
                                         )}
                                         {analysisResults.basalOptimization.distribution?.incrementsSkipped > 0 && (
                                             <div className="mt-2 text-xs text-orange-400">
-                                                ⚠️ {analysisResults.basalOptimization.distribution.incrementsSkipped} increment(s) not applied - avoiding opposite-signal periods
+                                                âš ï¸ {analysisResults.basalOptimization.distribution.incrementsSkipped} increment(s) not applied - avoiding opposite-signal periods
                                             </div>
                                         )}
                                     </div>
@@ -6424,13 +6523,13 @@
                                 {analysisResults.basalRatioInfo?.exceedsCap && (
                                     <div className="glass-card rounded-2xl p-6 border-l-4 border-l-orange-500 bg-orange-500/5">
                                         <div className="flex items-start gap-3">
-                                            <span className="text-2xl">⚠️</span>
+                                            <span className="text-2xl">âš ï¸</span>
                                             <div className="flex-1">
                                                 <h3 className="text-orange-400 font-bold mb-2">
                                                     Basal Ratio {analysisResults.basalRatioInfo.ratio.toFixed(1)}:1 Exceeds {analysisResults.basalRatioInfo.cap}:1 Cap
                                                 </h3>
                                                 <p className="text-gray-300 text-sm mb-2">
-                                                    Max {analysisResults.basalRatioInfo.maxRate} U/hr at {analysisResults.basalRatioInfo.maxHour} • 
+                                                    Max {analysisResults.basalRatioInfo.maxRate} U/hr at {analysisResults.basalRatioInfo.maxHour} â€¢ 
                                                     Min {analysisResults.basalRatioInfo.minRate} U/hr at {analysisResults.basalRatioInfo.minHour}
                                                 </p>
                                                 <p className="text-gray-400 text-sm mb-3">
@@ -6443,7 +6542,7 @@
                                                         return (
                                                             <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 mt-2">
                                                                 <p className="text-blue-400 text-sm font-medium">
-                                                                    📋 {blockedCount} recommendation{blockedCount > 1 ? 's' : ''} blocked until basal ratio normalizes
+                                                                    ðŸ“‹ {blockedCount} recommendation{blockedCount > 1 ? 's' : ''} blocked until basal ratio normalizes
                                                                 </p>
                                                                 <p className="text-blue-300 text-xs mt-1">
                                                                     Apply basal changes to your pump, then <strong>rerun analysis immediately</strong> to unlock CR/ISF optimizations.
@@ -6476,7 +6575,7 @@
                                                 <div className="space-y-4">
                                                     <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4">
                                                         <p className="text-yellow-400 font-medium mb-2">
-                                                            ⚠️ Safety findings detected but all exceed safe compound effect threshold
+                                                            âš ï¸ Safety findings detected but all exceed safe compound effect threshold
                                                         </p>
                                                         <p className="text-gray-400 text-sm">
                                                             Address ONE of the following individually instead of applying multiple changes:
@@ -6492,7 +6591,7 @@
                                                                 </div>
                                                                 {bundle.recommendations.map((rec, recIdx) => (
                                                                     <div key={recIdx} className="text-sm text-gray-400 font-mono">
-                                                                        {rec.scheduleTime} {rec.param}: {rec.currentValue} → {rec.newValue}
+                                                                        {rec.scheduleTime} {rec.param}: {rec.currentValue} â†’ {rec.newValue}
                                                                         <span className={rec.changePercent < 0 ? 'text-red-400' : 'text-green-400'}>
                                                                             {' '}({rec.changePercent >= 0 ? '+' : ''}{rec.changePercent.toFixed(1)}%)
                                                                         </span>
@@ -6518,7 +6617,7 @@
                                         if (primaryBundles.length === 0) {
                                             return (
                                                 <div className="text-center py-8 text-gray-400">
-                                                    <span className="text-4xl mb-2 block">✓</span>
+                                                    <span className="text-4xl mb-2 block">âœ“</span>
                                                     No action recommended tonight. Continue monitoring.
                                                 </div>
                                             );
@@ -6531,7 +6630,7 @@
                                                 {primaryBundles.length > 1 && (
                                                     <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
                                                         <p className="text-blue-400 font-medium">
-                                                            📋 {primaryBundles.length} actions recommended
+                                                            ðŸ“‹ {primaryBundles.length} actions recommended
                                                             {primaryBundles.some(b => b.isUrgent) && (
                                                                 <span className="ml-2 text-red-400">
                                                                     ({primaryBundles.filter(b => b.isUrgent).length} urgent)
@@ -6553,14 +6652,14 @@
                                                                 primary.hasLast3DayEvents ? 'text-yellow-400' :
                                                                 'text-gray-500'
                                                             }`}>
-                                                                {primary.hasRecentEvents ? '●' :
-                                                                 primary.hasLast3DayEvents ? '○' : '◌'}
+                                                                {primary.hasRecentEvents ? 'â—' :
+                                                                 primary.hasLast3DayEvents ? 'â—‹' : 'â—Œ'}
                                                             </span>
                                                             <h3 className="text-lg font-semibold text-white">{primary.name}</h3>
                                                             <TierBadge tier={primary.tier} />
                                                             {primary.isUrgent && (
                                                                 <span className="px-2 py-0.5 bg-red-500/20 text-red-400 text-xs rounded-full animate-pulse">
-                                                                    🚨 URGENT
+                                                                    ðŸš¨ URGENT
                                                                 </span>
                                                             )}
                                                             {primaryBundles.length > 1 && (
@@ -6577,7 +6676,7 @@
                                                         
                                                         {primary.urgentReason && (
                                                             <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 mb-4">
-                                                                <p className="text-red-400 text-sm font-medium">⚠️ {primary.urgentReason}</p>
+                                                                <p className="text-red-400 text-sm font-medium">âš ï¸ {primary.urgentReason}</p>
                                                             </div>
                                                         )}
                                                         
@@ -6628,9 +6727,9 @@
                                                                     {primary.evidenceDetails.map((ev, evIdx) => (
                                                                         <div key={evIdx} className="flex items-start gap-2 text-sm">
                                                                             <span className={`flex-shrink-0 ${
-                                                                                ev.icon === '✓' ? 'text-green-400' :
-                                                                                ev.icon === '○' ? 'text-yellow-400' :
-                                                                                ev.icon === '●' ? 'text-blue-400' :
+                                                                                ev.icon === 'âœ“' ? 'text-green-400' :
+                                                                                ev.icon === 'â—‹' ? 'text-yellow-400' :
+                                                                                ev.icon === 'â—' ? 'text-blue-400' :
                                                                                 'text-gray-500'
                                                                             }`}>{ev.icon}</span>
                                                                             <span className="text-gray-300">{ev.detail}</span>
@@ -6692,8 +6791,8 @@
                                                                     bundle.hasLast3DayEvents ? 'text-yellow-400' :
                                                                     'text-gray-500'
                                                                 }`}>
-                                                                    {bundle.hasRecentEvents ? '●' :
-                                                                     bundle.hasLast3DayEvents ? '○' : '◌'}
+                                                                    {bundle.hasRecentEvents ? 'â—' :
+                                                                     bundle.hasLast3DayEvents ? 'â—‹' : 'â—Œ'}
                                                                 </span>
                                                                 <span className="text-white font-medium">{bundle.name}</span>
                                                                 {!bundle.isSlotConflict && !bundle.isBasalRatioWarning && (
@@ -6719,15 +6818,15 @@
                                                         </p>
                                                         {bundle.signalConflict && !bundle.blockedBy?.includes('Signal conflict') && (
                                                             <p className="text-orange-400 text-xs mt-1">
-                                                                ⚠️ {bundle.signalConflict}
+                                                                âš ï¸ {bundle.signalConflict}
                                                             </p>
                                                         )}
                                                         {bundle.recommendations.length > 0 && !bundle.isBasalRatioWarning && (
                                                             <div className="text-xs text-gray-500 font-mono mt-1">
                                                                 {bundle.recommendations.map((rec, idx) => (
                                                                     <span key={idx}>
-                                                                        {idx > 0 && ' • '}
-                                                                        {rec.scheduleTime} {rec.param}: {rec.currentValue}→{rec.newValue}
+                                                                        {idx > 0 && ' â€¢ '}
+                                                                        {rec.scheduleTime} {rec.param}: {rec.currentValue}â†’{rec.newValue}
                                                                     </span>
                                                                 ))}
                                                             </div>
@@ -6743,6 +6842,72 @@
                                 {analysisResults.signalAnalysis && (
                                     <div className="glass-card rounded-2xl p-6">
                                         <h2 className="text-xl font-bold text-white mb-4">Signals Summary</h2>
+                                        
+                                        {/* TDD and Metrics Display */}
+                                        {(analysisResults.tdd24h || analysisResults.totalCarbs24h) && (
+                                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 pb-4 border-b border-gray-700">
+                                                {analysisResults.tdd24h && (
+                                                    <div className="bg-gray-800/50 rounded-lg p-3">
+                                                        <div className="text-gray-400 text-xs mb-1">TDD (24h)</div>
+                                                        <div className="text-white font-bold text-lg">
+                                                            {analysisResults.tdd24h.toFixed(1)} U
+                                                        </div>
+                                                        {analysisResults.tdd2Week && (() => {
+                                                            const diff = analysisResults.tdd24h - analysisResults.tdd2Week;
+                                                            const pct = (diff / analysisResults.tdd2Week * 100);
+                                                            return (
+                                                                <div className={`text-xs mt-1 ${Math.abs(pct) > 15 ? 'text-yellow-400' : 'text-gray-500'}`}>
+                                                                    {diff >= 0 ? '+' : ''}{diff.toFixed(1)} U ({pct >= 0 ? '+' : ''}{pct.toFixed(0)}%)
+                                                                </div>
+                                                            );
+                                                        })()}
+                                                    </div>
+                                                )}
+                                                
+                                                {analysisResults.tdd2Week && (
+                                                    <div className="bg-gray-800/50 rounded-lg p-3">
+                                                        <div className="text-gray-400 text-xs mb-1">TDD (2wk avg)</div>
+                                                        <div className="text-white font-bold text-lg">
+                                                            {analysisResults.tdd2Week.toFixed(1)} U
+                                                        </div>
+                                                        <div className="text-gray-500 text-xs mt-1">Baseline</div>
+                                                    </div>
+                                                )}
+                                                
+                                                {analysisResults.totalCarbs24h !== undefined && analysisResults.totalCarbs24h !== null && (
+                                                    <div className="bg-gray-800/50 rounded-lg p-3">
+                                                        <div className="text-gray-400 text-xs mb-1">Carbs (24h)</div>
+                                                        <div className="text-white font-bold text-lg">
+                                                            {analysisResults.totalCarbs24h.toFixed(0)} g
+                                                        </div>
+                                                        {analysisResults.tdd24h && analysisResults.totalCarbs24h > 0 && (
+                                                            <div className="text-gray-500 text-xs mt-1">
+                                                                {(analysisResults.tdd24h / analysisResults.totalCarbs24h).toFixed(3)} U/g
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                                
+                                                {analysisResults.sensitivityIndex && (
+                                                    <div className="bg-gray-800/50 rounded-lg p-3">
+                                                        <div className="text-gray-400 text-xs mb-1">Sensitivity Index</div>
+                                                        <div className="text-white font-bold text-lg">
+                                                            {analysisResults.sensitivityIndex}
+                                                        </div>
+                                                        <div className="text-xs mt-1">
+                                                            {parseFloat(analysisResults.sensitivityIndex) > 1.1 ? (
+                                                                <span className="text-blue-400">↑ More sensitive</span>
+                                                            ) : parseFloat(analysisResults.sensitivityIndex) < 0.9 ? (
+                                                                <span className="text-red-400">↓ Less sensitive</span>
+                                                            ) : (
+                                                                <span className="text-green-400">→ Normal</span>
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                        
                                         <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                                             {analysisResults.signalAnalysis.periods.map(period => (
                                                 <div key={period.name} className="bg-gray-800/50 rounded-lg p-3">
@@ -6781,13 +6946,13 @@
                                                     : 'bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/30'
                                             }`}
                                         >
-                                            {copyStatus === 'copied' ? '✓ Copied!' : '📋 Copy for Claude Review'}
+                                            {copyStatus === 'copied' ? 'âœ“ Copied!' : 'ðŸ“‹ Copy for Claude Review'}
                                         </button>
                                         <button
                                             onClick={() => setStep('config')}
                                             className="px-4 py-3 bg-gray-700/50 hover:bg-gray-700 text-gray-300 rounded-xl transition-colors"
                                         >
-                                            ← Back
+                                            â† Back
                                         </button>
                                     </div>
                                     
@@ -6815,10 +6980,10 @@
                                                             : 'bg-purple-600/20 hover:bg-purple-600/30 text-purple-400 border border-purple-500/30'
                                                     }`}
                                                 >
-                                                    {logStatus === 'logging' ? '⏳ Logging...' :
-                                                     logStatus === 'success' ? '✓ Logged!' :
-                                                     logStatus === 'error' ? '✗ Failed' :
-                                                     '📊 Log to Sheets'}
+                                                    {logStatus === 'logging' ? 'â³ Logging...' :
+                                                     logStatus === 'success' ? 'âœ“ Logged!' :
+                                                     logStatus === 'error' ? 'âœ— Failed' :
+                                                     'ðŸ“Š Log to Sheets'}
                                                 </button>
                                             </div>
                                             {logMessage && logStatus === 'error' && (
