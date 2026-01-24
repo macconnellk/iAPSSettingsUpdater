@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.1.7 - JSONP (No CORS!)</title>
+    <title>Daily Insulin Settings Review v3.1.8 - All Emojis Removed</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -735,8 +735,8 @@
                         rootCause: `Basal ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`,
                         evidenceSummary: `Max ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}, Min ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}. Extreme ratios can mask CR/ISF issues.`,
                         evidenceDetails: [
-                            { icon: 'â—', detail: `Maximum rate: ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}`, type: 'structural' },
-                            { icon: 'â—', detail: `Minimum rate: ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}`, type: 'structural' },
+                            { icon: '[STRUCTURAL]', detail: `Maximum rate: ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}`, type: 'structural' },
+                            { icon: '[STRUCTURAL]', detail: `Minimum rate: ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}`, type: 'structural' },
                             { icon: 'âš ï¸', detail: `Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`, type: 'structural' }
                         ],
                         conflictsWith: [],
@@ -1353,8 +1353,8 @@
                 return sorted.map(f => {
                     // Add recency indicator
                     const icon = f.eventsLast24h > 0 ? 'âœ“' : 
-                                f.eventsLast3Days > 0 ? 'â—‹' : 
-                                f.isStructural ? 'â—' : 'âš ï¸';
+                                f.eventsLast3Days > 0 ? '[OLD]' : 
+                                f.isStructural ? '[STRUCTURAL]' : 'âš ï¸';
                     return {
                         icon,
                         detail: f.details || 'No details available',
@@ -3378,7 +3378,7 @@
                     primaryBundles.forEach((primaryBundle, idx) => {
                         // Add recency indicator
                         const recencyIcon = primaryBundle.hasRecentEvents ? '[NEW]' : '[OLD]';
-                                           primaryBundle.hasLast3DayEvents ? 'â—‹' : 'âš ï¸';
+                                           primaryBundle.hasLast3DayEvents ? '[OLD]' : 'âš ï¸';
                         const urgentTag = primaryBundle.isUrgent ? ' [URGENT]' : '';
                         const blockTag = primaryBundles.length > 1 ? ` [${primaryBundle.timeBlock}]` : '';
                         
@@ -3460,7 +3460,7 @@
                     referenceBundles.forEach(bundle => {
                         // Add recency indicator to name
                         const recencyIcon = bundle.hasRecentEvents ? '[NEW]' : '[OLD]';
-                                           bundle.hasLast3DayEvents ? 'â—‹' : 'âš ï¸';
+                                           bundle.hasLast3DayEvents ? '[OLD]' : 'âš ï¸';
                         output += `### ${recencyIcon} ${bundle.name} (Tier ${bundle.tier})\n`;
                         
                         // Generate appropriate status message
@@ -3580,7 +3580,7 @@
                         output += `**TDD:**\n`;
                         output += `- 24-hour: ${analysisResults.tdd24h.toFixed(1)} U\n`;
                         output += `- 2-week avg: ${analysisResults.tdd2Week.toFixed(1)} U\n`;
-                        output += `- **Difference:** ${diffStr} U (${diffPctStr}%) ${diff > 0 ? '↑' : '↓'}\n\n`;
+                        output += `- **Difference:** ${diffStr} U (${diffPctStr}%) ${diff > 0 ? 'UP' : 'DOWN'}\n\n`;
                     } else if (analysisResults.tdd2Week) {
                         output += `**TDD:** ${analysisResults.tdd2Week.toFixed(1)} U (2-week avg)\n\n`;
                     } else if (analysisResults.tdd24h) {
@@ -3810,7 +3810,7 @@
                             let focus;
                             if (avgTIR < 60) focus = 'ðŸ”´ HIGH';
                             else if (avgTIR < 70) focus = 'ðŸŸ¡ MEDIUM';
-                            else if (avgTIR < 80) focus = 'â—‹ Normal';
+                            else if (avgTIR < 80) focus = '[OLD] Normal';
                             else if (avgTIR >= 90) focus = 'âœ“ Excellent';
                             else focus = 'âœ“ Good';
                             
@@ -3980,8 +3980,8 @@
                 sortedFindings.forEach((finding, idx) => {
                     // Recency indicator
                     const recencyIcon = finding.eventsLast24h > 0 ? '[NEW]' : '[OLD]';
-                                       finding.eventsLast3Days > 0 ? 'â—‹' : 
-                                       finding.isStructural ? 'â—' : 'âš ï¸';
+                                       finding.eventsLast3Days > 0 ? '[OLD]' : 
+                                       finding.isStructural ? '[STRUCTURAL]' : 'âš ï¸';
                     output += `${idx + 1}. ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
                     output += `   - Severity: ${(finding.severity * 100).toFixed(0)}%\n`;
                     output += `   - ${finding.details}\n\n`;
@@ -4521,7 +4521,7 @@
                     let status = 'âœ“';
                     if (stats.tir.inRange < 70) status = 'âš ï¸ Low TIR';
                     else if (stats.tir.low + stats.tir.veryLow > 5) status = 'ðŸ”´ Lows';
-                    else if (stats.tir.inRange < 80) status = 'â—‹';
+                    else if (stats.tir.inRange < 80) status = '[OLD]';
                     
                     output += `| ${hourLabel} | ${tir}% | ${high}% | ${low}% | ${mean} | ${sd} | ${status} |\n`;
                 }
@@ -6276,7 +6276,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.1.7 - JSONP (No CORS!)</p>
+                                    <p className="text-gray-400 text-sm">v3.1.8 - All Emojis Removed</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -6797,8 +6797,8 @@
                                                                 primary.hasLast3DayEvents ? 'text-yellow-400' :
                                                                 'text-gray-500'
                                                             }`}>
-                                                                {primary.hasRecentEvents ? 'â—' :
-                                                                 primary.hasLast3DayEvents ? 'â—‹' : 'â—Œ'}
+                                                                {primary.hasRecentEvents ? '[STRUCTURAL]' :
+                                                                 primary.hasLast3DayEvents ? '[OLD]' : '[STRUCTURAL]Œ'}
                                                             </span>
                                                             <h3 className="text-lg font-semibold text-white">{primary.name}</h3>
                                                             <TierBadge tier={primary.tier} />
@@ -6873,8 +6873,8 @@
                                                                         <div key={evIdx} className="flex items-start gap-2 text-sm">
                                                                             <span className={`flex-shrink-0 ${
                                                                                 ev.icon === 'âœ“' ? 'text-green-400' :
-                                                                                ev.icon === 'â—‹' ? 'text-yellow-400' :
-                                                                                ev.icon === 'â—' ? 'text-blue-400' :
+                                                                                ev.icon === '[OLD]' ? 'text-yellow-400' :
+                                                                                ev.icon === '[STRUCTURAL]' ? 'text-blue-400' :
                                                                                 'text-gray-500'
                                                                             }`}>{ev.icon}</span>
                                                                             <span className="text-gray-300">{ev.detail}</span>
@@ -6936,8 +6936,8 @@
                                                                     bundle.hasLast3DayEvents ? 'text-yellow-400' :
                                                                     'text-gray-500'
                                                                 }`}>
-                                                                    {bundle.hasRecentEvents ? 'â—' :
-                                                                     bundle.hasLast3DayEvents ? 'â—‹' : 'â—Œ'}
+                                                                    {bundle.hasRecentEvents ? '[STRUCTURAL]' :
+                                                                     bundle.hasLast3DayEvents ? '[OLD]' : '[STRUCTURAL]Œ'}
                                                                 </span>
                                                                 <span className="text-white font-medium">{bundle.name}</span>
                                                                 {!bundle.isSlotConflict && !bundle.isBasalRatioWarning && (
@@ -7025,8 +7025,8 @@
                                                                 const val = parseFloat(analysisResults.carbAdjSensitivity);
                                                                 const pct = ((val - 1.0) * 100).toFixed(0);
                                                                 return val >= 1.0 
-                                                                    ? `↑ ${pct}% more sensitive`
-                                                                    : `↓ ${Math.abs(pct)}% less sensitive`;
+                                                                    ? `UP ${pct}% more sensitive`
+                                                                    : `DOWN ${Math.abs(pct)}% less sensitive`;
                                                             })()
                                                             : 'Needs 3+ days history'}
                                                     </div>
