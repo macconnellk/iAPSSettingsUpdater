@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.0</title>
+    <title>Daily Insulin Settings Review v3.1.2 - All TDD Extractions Fixed</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -177,12 +177,12 @@
         };
         
         const CIRCADIAN_PERIODS = [
-            { name: 'Deep Sleep', emoji: 'ðŸŒ™', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
-            { name: 'Dawn', emoji: 'ðŸŒ…', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
-            { name: 'Morning', emoji: 'â˜€ï¸', startHour: 8, endHour: 12, description: 'Peak insulin sensitivity' },
-            { name: 'Afternoon', emoji: 'ðŸŒ¤ï¸', startHour: 12, endHour: 17, description: 'Stable, declining sensitivity' },
-            { name: 'Evening', emoji: 'ðŸŒ†', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
-            { name: 'Sleep Onset', emoji: 'ðŸ˜´', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
+            { name: 'Deep Sleep', emoji: '🌙', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
+            { name: 'Dawn', emoji: '🌅', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
+            { name: 'Morning', emoji: '☀️', startHour: 8, endHour: 12, description: 'Peak insulin sensitivity' },
+            { name: 'Afternoon', emoji: '🌤️', startHour: 12, endHour: 17, description: 'Stable, declining sensitivity' },
+            { name: 'Evening', emoji: '🌆', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
+            { name: 'Sleep Onset', emoji: '😴', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
         ];
         
         // Independent time blocks for multi-action support
@@ -3580,44 +3580,64 @@
                         output += `**TDD:**\n`;
                         output += `- 24-hour: ${analysisResults.tdd24h.toFixed(1)} U\n`;
                         output += `- 2-week avg: ${analysisResults.tdd2Week.toFixed(1)} U\n`;
-                        
-                        if (Math.abs(diffPct) >= 10) {
-                            output += `- **Difference:** ${diffStr} U (${diffPctStr}%) ${diff > 0 ? 'â†‘' : 'â†“'}\n`;
-                        } else {
-                            output += `- Difference: ${diffStr} U (${diffPctStr}%)\n`;
-                        }
-                        output += `\n`;
+                        output += `- **Difference:** ${diffStr} U (${diffPctStr}%) ${diff > 0 ? '↑' : '↓'}\n\n`;
                     } else if (analysisResults.tdd2Week) {
-                        output += `**TDD:** ${analysisResults.tdd2Week.toFixed(1)} U (2-week avg)\n`;
+                        output += `**TDD:** ${analysisResults.tdd2Week.toFixed(1)} U (2-week avg)\n\n`;
                     } else if (analysisResults.tdd24h) {
-                        output += `**TDD:** ${analysisResults.tdd24h.toFixed(1)} U (24-hour)\n`;
+                        output += `**TDD:** ${analysisResults.tdd24h.toFixed(1)} U (24-hour)\n\n`;
                     } else if (analysisResults.tdd) {
-                        output += `**TDD:** ${analysisResults.tdd.toFixed(1)} U\n`;
+                        output += `**TDD:** ${analysisResults.tdd.toFixed(1)} U\n\n`;
                     }
                     
-                    // Display 24h carbs
+                    // Display 24h carbs and key metrics
                     if (analysisResults.totalCarbs24h !== undefined && analysisResults.totalCarbs24h !== null) {
                         output += `**Carbs (24h):** ${analysisResults.totalCarbs24h.toFixed(0)}g\n`;
+                    }
+                    if (analysisResults.insulinPerCarb) {
+                        output += `**Insulin per Carb:** ${analysisResults.insulinPerCarb} U/g\n`;
+                    }
+                    // Display Carb-Adjusted Sensitivity with interpretation
+                    if (analysisResults.carbAdjSensitivity) {
+                        const sensitivity = parseFloat(analysisResults.carbAdjSensitivity);
+                        let interpretation = '';
+                        let emoji = '';
                         
-                        // Calculate and display insulin per carb ratio
-                        if (analysisResults.tdd24h && analysisResults.totalCarbs24h > 0) {
-                            const ratio = analysisResults.tdd24h / analysisResults.totalCarbs24h;
-                            output += `**Insulin per Carb:** ${ratio.toFixed(3)} U/g (TDD ÷ Carbs)\n`;
+                        if (sensitivity >= 1.20) {
+                            interpretation = 'Very High Sensitivity';
+                            emoji = '🔵🔵';
+                        } else if (sensitivity >= 1.10) {
+                            interpretation = 'Significantly More Sensitive';
+                            emoji = '🔵';
+                        } else if (sensitivity >= 1.05) {
+                            interpretation = 'Moderately More Sensitive';
+                            emoji = '↗️';
+                        } else if (sensitivity >= 0.95) {
+                            interpretation = 'Normal Range';
+                            emoji = '✓';
+                        } else if (sensitivity >= 0.90) {
+                            interpretation = 'Moderately Less Sensitive';
+                            emoji = '↘️';
+                        } else if (sensitivity >= 0.80) {
+                            interpretation = 'Significantly Less Sensitive';
+                            emoji = '🔴';
+                        } else {
+                            interpretation = 'Very Low Sensitivity/Resistant';
+                            emoji = '🔴🔴';
                         }
-                    }
-                    
-                    // Display sensitivity index
-                    if (analysisResults.sensitivityIndex) {
-                        const idx = parseFloat(analysisResults.sensitivityIndex);
-                        let interpretation = 'Normal range';
-                        if (idx > 1.15) interpretation = 'Significantly more sensitive';
-                        else if (idx > 1.05) interpretation = 'Moderately more sensitive';
-                        else if (idx < 0.85) interpretation = 'Significantly less sensitive';
-                        else if (idx < 0.95) interpretation = 'Moderately less sensitive';
                         
-                        output += `**Sensitivity Index:** ${analysisResults.sensitivityIndex} (${interpretation})\n`;
-                        output += `  _Formula: 2wk TDD ÷ 24h TDD. >1.0 = more sensitive, <1.0 = less sensitive_\n`;
+                        const percentChange = ((sensitivity - 1.0) * 100).toFixed(0);
+                        const changeStr = sensitivity >= 1.0 
+                            ? `${percentChange}% more sensitive` 
+                            : `${Math.abs(percentChange)}% less sensitive`;
+                        
+                        output += `**Carb-Adjusted Sensitivity:** ${sensitivity.toFixed(2)} ${emoji}\n`;
+                        output += `  _${interpretation} (${changeStr})_\n`;
+                        output += `  _Formula: Expected TDD for today's carbs ÷ Actual TDD_\n`;
+                    } else {
+                        output += `**Carb-Adjusted Sensitivity:** _Insufficient history (needs 7+ days)_\n`;
+                        output += `  _Will calculate automatically once you have 3+ days logged_\n`;
                     }
+                    output += `\n`;
                     output += `\n`;
                     
                     output += `**Clean Windows:** ${analysisResults.signalAnalysis.cleanWindows?.total || 0} readings analyzed\n`;
@@ -3764,12 +3784,12 @@
                     // AGP Priority by Period table (FEATURE-003)
                     if (agp7day && agp7day.hourlyStats) {
                         const periodHours = {
-                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: 'ðŸŒ™' },
-                            'Dawn': { hours: [4, 5, 6, 7], emoji: 'ðŸŒ…' },
-                            'Morning': { hours: [8, 9, 10, 11], emoji: 'â˜€ï¸' },
-                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: 'ðŸŒ¤ï¸' },
-                            'Evening': { hours: [17, 18, 19, 20], emoji: 'ðŸŒ†' },
-                            'Sleep Onset': { hours: [21, 22, 23], emoji: 'ðŸ˜´' }
+                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: '🌙' },
+                            'Dawn': { hours: [4, 5, 6, 7], emoji: '🌅' },
+                            'Morning': { hours: [8, 9, 10, 11], emoji: '☀️' },
+                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: '🌤️' },
+                            'Evening': { hours: [17, 18, 19, 20], emoji: '🌆' },
+                            'Sleep Onset': { hours: [21, 22, 23], emoji: '😴' }
                         };
                         
                         const periodStats = [];
@@ -5121,6 +5141,16 @@
                     (sum, p) => sum + (p.cleanWindowCount || 0), 0
                 ) || 0;
                 
+                // Calculate basal total from active schedule
+                let basalTotal = 0;
+                if (activeSchedules?.basal && Array.isArray(activeSchedules.basal)) {
+                    // Use the basal array directly, not converted to object
+                    basalTotal = activeSchedules.basal.reduce((sum, entry) => sum + entry.value, 0);
+                } else if (basalSchedule) {
+                    basalTotal = basalSchedule.reduce((sum, entry) => sum + entry.value, 0);
+                }
+                console.log('Basal total for sensitivity calculation:', basalTotal.toFixed(2));
+                
                 // Calculate TDD from iAPS deviceStatus (extract both 24h and 2-week)
                 let tdd = null;
                 let tdd24h = null;
@@ -5130,9 +5160,11 @@
                         const status = nightscoutData.deviceStatus[i];
                         if (status.openaps?.enacted?.reason) {
                             const reason = status.openaps.enacted.reason;
-                            // Extract both TDD values
+                            // Extract TDD values from reason string
+                            // "Insulin 24h" = Rolling 24-hour insulin delivery (what we want)
+                            // "TDD" = Today's total since midnight (calendar day)
                             const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                            const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
+                            const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
                             
                             if (twoWeekMatch) {
                                 tdd2Week = parseFloat(twoWeekMatch[1]);
@@ -5405,9 +5437,11 @@
                             if (status.openaps?.enacted?.reason) {
                                 const reason = status.openaps.enacted.reason;
                                 
-                                // Extract both TDD values from reason string
+                                // Extract TDD values from reason string
+                                // "Insulin 24h" = Rolling 24-hour insulin delivery (what we want)
+                                // "TDD" = Today's total since midnight (calendar day)
                                 const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                                const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
+                                const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
                                 
                                 if (twoWeekMatch) {
                                     tdd2Week = parseFloat(twoWeekMatch[1]);
@@ -5430,7 +5464,8 @@
                     console.log('TDD extracted:', {
                         tdd24h: tdd24h,
                         tdd2Week: tdd2Week,
-                        usingForSignal: tddForSignal
+                        usingForSignal: tddForSignal,
+                        source: 'Insulin 24h from iAPS enacted string (rolling 24-hour)'
                     });
                     
                     // Calculate total carbs in last 24 hours
@@ -5450,6 +5485,70 @@
                     }
                     
                     console.log('Total carbs (24h):', totalCarbs24h);
+                    
+                    // Calculate Carb-Adjusted Sensitivity from Sheets history
+                    let carbAdjSensitivity = null;
+                    if (sheetsWebAppUrl && tdd24h && totalCarbs24h > 0) {
+                        try {
+                            console.log('Fetching Sheets history for Carb-Adjusted calculation...');
+                            const historyUrl = `${sheetsWebAppUrl}?action=read&days=14`;
+                            const historyResponse = await fetch(historyUrl, {
+                                method: 'GET',
+                                headers: { 'Content-Type': 'application/json' }
+                            });
+                            const historyData = await historyResponse.json();
+                            
+                            if (historyData.success && historyData.entries && historyData.entries.length > 0) {
+                                console.log(`Fetched ${historyData.entries.length} history entries`);
+                                
+                                // Filter valid entries (non-override, has TDD and carbs)
+                                const validEntries = historyData.entries.filter(e => 
+                                    !e.isOverride && 
+                                    e.tdd24h && parseFloat(e.tdd24h) > 0 &&
+                                    e.carbs24h && parseFloat(e.carbs24h) > 0
+                                );
+                                
+                                if (validEntries.length >= 3) {
+                                    // Calculate baseline averages
+                                    const avgTDD = validEntries.reduce((sum, e) => sum + parseFloat(e.tdd24h), 0) / validEntries.length;
+                                    const avgCarbs = validEntries.reduce((sum, e) => sum + parseFloat(e.carbs24h), 0) / validEntries.length;
+                                    
+                                    // Calculate baseline basal
+                                    let baselineBasal = basalTotal; // From earlier calculation
+                                    
+                                    // Calculate baseline bolus per carb
+                                    const avgBolus = avgTDD - baselineBasal;
+                                    const baselineBolusPerCarb = avgBolus / avgCarbs;
+                                    
+                                    // Calculate expected TDD for today's carbs
+                                    const expectedBolus = baselineBolusPerCarb * totalCarbs24h;
+                                    const expectedTDD = expectedBolus + baselineBasal;
+                                    
+                                    // Carb-Adjusted Sensitivity = Expected / Actual
+                                    carbAdjSensitivity = expectedTDD / tdd24h;
+                                    
+                                    console.log('Carb-Adjusted calculation:', {
+                                        validEntries: validEntries.length,
+                                        avgTDD: avgTDD.toFixed(1),
+                                        avgCarbs: avgCarbs.toFixed(0),
+                                        baselineBasal: baselineBasal.toFixed(1),
+                                        baselineBolusPerCarb: baselineBolusPerCarb.toFixed(3),
+                                        todayCarbs: totalCarbs24h,
+                                        expectedTDD: expectedTDD.toFixed(1),
+                                        actualTDD: tdd24h,
+                                        carbAdjSensitivity: carbAdjSensitivity.toFixed(2)
+                                    });
+                                } else {
+                                    console.log(`Insufficient history for Carb-Adjusted calculation (${validEntries.length} entries, need 3+)`);
+                                }
+                            } else {
+                                console.log('No history available from Sheets');
+                            }
+                        } catch (err) {
+                            console.warn('Failed to fetch history for Carb-Adjusted calculation:', err);
+                        }
+                    }
+                    
                     
                     // Run signal analysis with principled ISF/TDD-based calculation
                     const signalAnalysis = SignalAnalysis.analyzeCleanWindows(
@@ -5555,14 +5654,23 @@
                     const aggregatedFindings = aggregateFindings(allFindings);
                     
                     // Calculate current basal percent for comparison
-                    const currentBasalTotal = activeSchedules.basal.reduce((sum, entry, idx, arr) => {
-                        const nextIdx = (idx + 1) % arr.length;
-                        const currentHour = parseInt(entry.time.split(':')[0]);
-                        const nextHour = nextIdx === 0 ? 24 : parseInt(arr[nextIdx].time.split(':')[0]);
-                        const hours = nextHour - currentHour;
-                        return sum + (entry.value * hours);
-                    }, 0);
-                    const currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
+                    let currentBasalTotal = 0;
+                    let currentBasalPercent = null;
+                    
+                    if (activeSchedules?.basal && Array.isArray(activeSchedules.basal)) {
+                        currentBasalTotal = activeSchedules.basal.reduce((sum, entry, idx, arr) => {
+                            const nextIdx = (idx + 1) % arr.length;
+                            const currentHour = parseInt(entry.time.split(':')[0]);
+                            const nextHour = nextIdx === 0 ? 24 : parseInt(arr[nextIdx].time.split(':')[0]);
+                            const hours = nextHour - currentHour;
+                            return sum + (entry.value * hours);
+                        }, 0);
+                        currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
+                    } else {
+                        console.warn('activeSchedules.basal not available, using basalSchedule fallback');
+                        currentBasalTotal = basalSchedule.reduce((sum, entry) => sum + entry.value, 0);
+                        currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
+                    }
                     
                     // BUG-023 FIX 2: Safety override when LOW signals dominate
                     // Count period signals
@@ -5679,7 +5787,8 @@
                         tdd24h: tdd24h,     // 24-hour TDD for trend comparison
                         tdd2Week: tdd2Week, // 2-week TDD for stable baseline
                         totalCarbs24h: totalCarbs24h,  // Total carbs in last 24h
-                        sensitivityIndex: (tdd24h && tdd2Week) ? (tdd2Week / tdd24h).toFixed(3) : null  // Sensitivity index
+                        insulinPerCarb: (tdd24h && totalCarbs24h > 0) ? (tdd24h / totalCarbs24h).toFixed(3) : null,
+                        carbAdjSensitivity: carbAdjSensitivity ? carbAdjSensitivity.toFixed(2) : null
                     });
                     setBodyState(detectedState);
                     setBundles(processedBundles);
@@ -5969,7 +6078,7 @@
                                 tdd = parseFloat(twoWeekMatch[1]);
                                 break;
                             }
-                            const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
+                            const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
                             if (currentMatch && !tdd) {
                                 tdd = parseFloat(currentMatch[1]);
                             }
@@ -6367,7 +6476,7 @@
                                                     analysisResults.effectiveTargetSource === 'signal-fallback' ? 'text-amber-400' :
                                                     'text-gray-400'
                                                 }`}>
-                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? 'ðŸŽ¯ Dynamic Target' : 
+                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? '🎯 Dynamic Target' : 
                                                      analysisResults.effectiveTargetSource === 'signal-fallback' ? 'ðŸ“¡ Signal Fallback' :
                                                      'ðŸ“Œ Configured Target'}
                                                 </span>
@@ -6843,68 +6952,49 @@
                                     <div className="glass-card rounded-2xl p-6">
                                         <h2 className="text-xl font-bold text-white mb-4">Signals Summary</h2>
                                         
-                                        {/* TDD and Metrics Display */}
-                                        {(analysisResults.tdd24h || analysisResults.totalCarbs24h) && (
-                                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 pb-4 border-b border-gray-700">
-                                                {analysisResults.tdd24h && (
-                                                    <div className="bg-gray-800/50 rounded-lg p-3">
-                                                        <div className="text-gray-400 text-xs mb-1">TDD (24h)</div>
-                                                        <div className="text-white font-bold text-lg">
-                                                            {analysisResults.tdd24h.toFixed(1)} U
+                                        {/* Simplified Metrics Display */}
+                                        {(analysisResults.insulinPerCarb || analysisResults.carbAdjSensitivity) && (
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4 pb-4 border-b border-gray-700">
+                                                {analysisResults.insulinPerCarb && (
+                                                    <div className="bg-gray-800/50 rounded-lg p-4">
+                                                        <div className="text-gray-400 text-xs mb-1">Insulin per Carb</div>
+                                                        <div className="text-white font-bold text-2xl">
+                                                            {analysisResults.insulinPerCarb} U/g
                                                         </div>
-                                                        {analysisResults.tdd2Week && (() => {
-                                                            const diff = analysisResults.tdd24h - analysisResults.tdd2Week;
-                                                            const pct = (diff / analysisResults.tdd2Week * 100);
-                                                            return (
-                                                                <div className={`text-xs mt-1 ${Math.abs(pct) > 15 ? 'text-yellow-400' : 'text-gray-500'}`}>
-                                                                    {diff >= 0 ? '+' : ''}{diff.toFixed(1)} U ({pct >= 0 ? '+' : ''}{pct.toFixed(0)}%)
-                                                                </div>
-                                                            );
-                                                        })()}
+                                                        <div className="text-gray-500 text-xs mt-2">
+                                                            {analysisResults.totalCarbs24h && analysisResults.tdd24h 
+                                                                ? `${analysisResults.tdd24h.toFixed(1)}U ÷ ${analysisResults.totalCarbs24h.toFixed(0)}g`
+                                                                : 'TDD ÷ Carbs'}
+                                                        </div>
                                                     </div>
                                                 )}
                                                 
-                                                {analysisResults.tdd2Week && (
-                                                    <div className="bg-gray-800/50 rounded-lg p-3">
-                                                        <div className="text-gray-400 text-xs mb-1">TDD (2wk avg)</div>
-                                                        <div className="text-white font-bold text-lg">
-                                                            {analysisResults.tdd2Week.toFixed(1)} U
-                                                        </div>
-                                                        <div className="text-gray-500 text-xs mt-1">Baseline</div>
+                                                <div className="bg-gray-800/50 rounded-lg p-4">
+                                                    <div className="text-gray-400 text-xs mb-1">Carb-Adjusted Sensitivity</div>
+                                                    <div className={`font-bold text-2xl ${
+                                                        analysisResults.carbAdjSensitivity 
+                                                            ? parseFloat(analysisResults.carbAdjSensitivity) >= 1.20 ? 'text-blue-300'
+                                                            : parseFloat(analysisResults.carbAdjSensitivity) >= 1.10 ? 'text-blue-400'
+                                                            : parseFloat(analysisResults.carbAdjSensitivity) >= 1.05 ? 'text-green-300'
+                                                            : parseFloat(analysisResults.carbAdjSensitivity) >= 0.90 ? 'text-green-400'
+                                                            : parseFloat(analysisResults.carbAdjSensitivity) >= 0.80 ? 'text-yellow-400'
+                                                            : 'text-red-400'
+                                                            : 'text-gray-500'
+                                                    }`}>
+                                                        {analysisResults.carbAdjSensitivity || '—'}
                                                     </div>
-                                                )}
-                                                
-                                                {analysisResults.totalCarbs24h !== undefined && analysisResults.totalCarbs24h !== null && (
-                                                    <div className="bg-gray-800/50 rounded-lg p-3">
-                                                        <div className="text-gray-400 text-xs mb-1">Carbs (24h)</div>
-                                                        <div className="text-white font-bold text-lg">
-                                                            {analysisResults.totalCarbs24h.toFixed(0)} g
-                                                        </div>
-                                                        {analysisResults.tdd24h && analysisResults.totalCarbs24h > 0 && (
-                                                            <div className="text-gray-500 text-xs mt-1">
-                                                                {(analysisResults.tdd24h / analysisResults.totalCarbs24h).toFixed(3)} U/g
-                                                            </div>
-                                                        )}
+                                                    <div className="text-gray-500 text-xs mt-2">
+                                                        {analysisResults.carbAdjSensitivity 
+                                                            ? (() => {
+                                                                const val = parseFloat(analysisResults.carbAdjSensitivity);
+                                                                const pct = ((val - 1.0) * 100).toFixed(0);
+                                                                return val >= 1.0 
+                                                                    ? `↑ ${pct}% more sensitive`
+                                                                    : `↓ ${Math.abs(pct)}% less sensitive`;
+                                                            })()
+                                                            : 'Needs 3+ days history'}
                                                     </div>
-                                                )}
-                                                
-                                                {analysisResults.sensitivityIndex && (
-                                                    <div className="bg-gray-800/50 rounded-lg p-3">
-                                                        <div className="text-gray-400 text-xs mb-1">Sensitivity Index</div>
-                                                        <div className="text-white font-bold text-lg">
-                                                            {analysisResults.sensitivityIndex}
-                                                        </div>
-                                                        <div className="text-xs mt-1">
-                                                            {parseFloat(analysisResults.sensitivityIndex) > 1.1 ? (
-                                                                <span className="text-blue-400">↑ More sensitive</span>
-                                                            ) : parseFloat(analysisResults.sensitivityIndex) < 0.9 ? (
-                                                                <span className="text-red-400">↓ Less sensitive</span>
-                                                            ) : (
-                                                                <span className="text-green-400">→ Normal</span>
-                                                            )}
-                                                        </div>
-                                                    </div>
-                                                )}
+                                                </div>
                                             </div>
                                         )}
                                         
