@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.1.5 - All Emojis Removed</title>
+    <title>Daily Insulin Settings Review v3.1.7 - JSONP (No CORS!)</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -5478,19 +5478,60 @@
                     
                     console.log('Total carbs (24h):', totalCarbs24h);
                     
-                    // Calculate Carb-Adjusted Sensitivity from Sheets history
+                    
+                    
+                    // Calculate Carb-Adjusted Sensitivity from Sheets history using JSONP
                     let carbAdjSensitivity = null;
                     if (sheetsWebAppUrl && tdd24h && totalCarbs24h > 0) {
                         try {
-                            console.log('Fetching Sheets history for Carb-Adjusted calculation...');
-                            const historyUrl = `${sheetsWebAppUrl}?action=read&days=14`;
-                            const historyResponse = await fetch(historyUrl, {
-                                method: 'GET',
-                                headers: { 'Content-Type': 'application/json' }
-                            });
-                            const historyData = await historyResponse.json();
+                            console.log('Fetching history from Sheets using JSONP...');
                             
-                            if (historyData.success && historyData.entries && historyData.entries.length > 0) {
+                            // Create unique callback name
+                            const callbackName = 'jsonpCallback_' + Date.now();
+                            
+                            // Create promise that will resolve when JSONP completes
+                            const jsonpPromise = new Promise((resolve, reject) => {
+                                // Define global callback function
+                                window[callbackName] = function(data) {
+                                    // Clean up
+                                    delete window[callbackName];
+                                    const script = document.getElementById(callbackName);
+                                    if (script) script.remove();
+                                    
+                                    if (data && data.success) {
+                                        resolve(data);
+                                    } else {
+                                        reject(new Error('Failed to fetch history'));
+                                    }
+                                };
+                                
+                                // Create script tag
+                                const script = document.createElement('script');
+                                script.id = callbackName;
+                                script.src = `${sheetsWebAppUrl}?action=read&days=14&callback=${callbackName}`;
+                                script.onerror = () => {
+                                    delete window[callbackName];
+                                    reject(new Error('Script load error'));
+                                };
+                                
+                                // Timeout after 10 seconds
+                                setTimeout(() => {
+                                    if (window[callbackName]) {
+                                        delete window[callbackName];
+                                        const script = document.getElementById(callbackName);
+                                        if (script) script.remove();
+                                        reject(new Error('JSONP timeout'));
+                                    }
+                                }, 10000);
+                                
+                                // Append script to trigger load
+                                document.head.appendChild(script);
+                            });
+                            
+                            // Wait for JSONP to complete
+                            const historyData = await jsonpPromise;
+                            
+                            if (historyData.entries && historyData.entries.length > 0) {
                                 console.log(`Fetched ${historyData.entries.length} history entries`);
                                 
                                 // Filter valid entries (non-override, has TDD and carbs)
@@ -5505,8 +5546,8 @@
                                     const avgTDD = validEntries.reduce((sum, e) => sum + parseFloat(e.tdd24h), 0) / validEntries.length;
                                     const avgCarbs = validEntries.reduce((sum, e) => sum + parseFloat(e.carbs24h), 0) / validEntries.length;
                                     
-                                    // Calculate baseline basal
-                                    let baselineBasal = basalTotal; // From earlier calculation
+                                    // Calculate baseline basal (40% of average TDD)
+                                    const baselineBasal = avgTDD * 0.40;
                                     
                                     // Calculate baseline bolus per carb
                                     const avgBolus = avgTDD - baselineBasal;
@@ -5540,6 +5581,9 @@
                             console.warn('Failed to fetch history for Carb-Adjusted calculation:', err);
                         }
                     }
+                    
+                    
+
                     
                     
                     // Run signal analysis with principled ISF/TDD-based calculation
@@ -6232,7 +6276,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v2.0 â€” State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.1.7 - JSONP (No CORS!)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
