@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.1.8 - All Emojis Removed</title>
+    <title>Daily Insulin Settings Review v3.1.9 - ALL Emojis Gone!</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -177,12 +177,12 @@
         };
         
         const CIRCADIAN_PERIODS = [
-            { name: 'Deep Sleep', emoji: '🌙', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
-            { name: 'Dawn', emoji: '🌅', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
-            { name: 'Morning', emoji: '☀️', startHour: 8, endHour: 12, description: 'Peak insulin sensitivity' },
-            { name: 'Afternoon', emoji: '🌤️', startHour: 12, endHour: 17, description: 'Stable, declining sensitivity' },
-            { name: 'Evening', emoji: '🌆', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
-            { name: 'Sleep Onset', emoji: '😴', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
+            { name: 'Deep Sleep', emoji: '[SLEEP]', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
+            { name: 'Dawn', emoji: '[DAWN]', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
+            { name: 'Morning', emoji: '[MORNING]', startHour: 8, endHour: 12, description: 'Peak insulin sensitivity' },
+            { name: 'Afternoon', emoji: '[AFTERNOON]', startHour: 12, endHour: 17, description: 'Stable, declining sensitivity' },
+            { name: 'Evening', emoji: '[EVENING]', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
+            { name: 'Sleep Onset', emoji: '[NIGHT]', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
         ];
         
         // Independent time blocks for multi-action support
@@ -3776,12 +3776,12 @@
                     // AGP Priority by Period table (FEATURE-003)
                     if (agp7day && agp7day.hourlyStats) {
                         const periodHours = {
-                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: '🌙' },
-                            'Dawn': { hours: [4, 5, 6, 7], emoji: '🌅' },
-                            'Morning': { hours: [8, 9, 10, 11], emoji: '☀️' },
-                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: '🌤️' },
-                            'Evening': { hours: [17, 18, 19, 20], emoji: '🌆' },
-                            'Sleep Onset': { hours: [21, 22, 23], emoji: '😴' }
+                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: '[SLEEP]' },
+                            'Dawn': { hours: [4, 5, 6, 7], emoji: '[DAWN]' },
+                            'Morning': { hours: [8, 9, 10, 11], emoji: '[MORNING]' },
+                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: '[AFTERNOON]' },
+                            'Evening': { hours: [17, 18, 19, 20], emoji: '[EVENING]' },
+                            'Sleep Onset': { hours: [21, 22, 23], emoji: '[NIGHT]' }
                         };
                         
                         const periodStats = [];
@@ -6276,7 +6276,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.1.8 - All Emojis Removed</p>
+                                    <p className="text-gray-400 text-sm">v3.1.9 - ALL Emojis Gone!</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -6512,7 +6512,7 @@
                                                     analysisResults.effectiveTargetSource === 'signal-fallback' ? 'text-amber-400' :
                                                     'text-gray-400'
                                                 }`}>
-                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? '🎯 Dynamic Target' : 
+                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? '[TARGET] Dynamic Target' : 
                                                      analysisResults.effectiveTargetSource === 'signal-fallback' ? 'ðŸ“¡ Signal Fallback' :
                                                      'ðŸ“Œ Configured Target'}
                                                 </span>
