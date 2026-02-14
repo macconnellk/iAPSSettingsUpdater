@@ -1,9 +1,10 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.3 (JSON Export)</title>
+    <title>Daily Insulin Settings Review v2.3.1 (JSON Export - Fixed)</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4000,35 +4001,49 @@
                     const events = [];
                     
                     bundle.findings?.forEach(finding => {
+                        // Skip signal-based findings - they don't have specific events
+                        if (finding.type === FindingType.BASAL_SIGNAL_LOW || 
+                            finding.type === FindingType.BASAL_SIGNAL_HIGH ||
+                            finding.type === FindingType.BASAL_RATIO_EXCEEDED) {
+                            return;
+                        }
+                        
                         const evidence = finding.evidence || finding.details || '';
                         
                         // Parse BG value
                         const bgMatch = evidence.match(/(\d+)\s*mg\/dL/);
+                        if (!bgMatch) return; // Skip if no BG value found
+                        
+                        const bgValue = parseInt(bgMatch[1]);
+                        if (bgValue === 0) return; // Skip invalid BG readings
+                        
                         // Parse time
-                        const timeMatch = evidence.match(/at\s+([0-9:]+\s*[AP]M)/);
+                        const timeMatch = evidence.match(/at\s+([0-9:]+\s*[AP]M)/i);
                         // Parse date reference
                         const dateMatch = evidence.match(/on\s+([A-Z][a-z]+\s+\d+)/i) || 
                                        evidence.match(/(yesterday|today)/i);
                         
-                        if (bgMatch) {
-                            const bgValue = parseInt(bgMatch[1]);
-                            events.push({
-                                date: dateMatch ? parseEventDate(dateMatch[1]) : new Date().toISOString().split('T')[0],
-                                time: timeMatch ? timeMatch[1] : null,
-                                type: finding.type === FindingType.UNEXPLAINED_LOW ? 'unexplained_low' :
-                                      finding.type === FindingType.ISF_INDUCED_LOW ? 'correction_induced_low' :
-                                      finding.type === FindingType.DIRECT_MEAL_LOW ? 'meal_induced_low' :
-                                      finding.type === FindingType.TRANSIENT_HIGH_LOW ? 'spike_crash' :
-                                      finding.type,
-                                bg: bgValue,
-                                context: finding.type === FindingType.UNEXPLAINED_LOW ? 'No IOB, no COB, fasting' :
-                                        finding.type === FindingType.ISF_INDUCED_LOW ? 'Following correction' :
-                                        finding.type === FindingType.DIRECT_MEAL_LOW ? 'Following meal' :
-                                        'Event detected',
-                                severity: bgValue < 54 ? 'severe' : 
-                                        bgValue < 70 ? 'moderate' : 'mild'
-                            });
-                        }
+                        events.push({
+                            date: dateMatch ? parseEventDate(dateMatch[1]) : new Date().toISOString().split('T')[0],
+                            time: timeMatch ? timeMatch[1] : null,
+                            type: finding.type === FindingType.UNEXPLAINED_LOW ? 'unexplained_low' :
+                                  finding.type === FindingType.ISF_INDUCED_LOW ? 'correction_induced_low' :
+                                  finding.type === FindingType.DIRECT_MEAL_LOW ? 'meal_induced_low' :
+                                  finding.type === FindingType.TRANSIENT_HIGH_LOW ? 'spike_crash' :
+                                  finding.type === FindingType.POST_MEAL_HIGH ? 'post_meal_high' :
+                                  finding.type === FindingType.CORRECTION_INEFFECTIVE ? 'correction_ineffective' :
+                                  finding.type,
+                            bg: bgValue,
+                            context: finding.type === FindingType.UNEXPLAINED_LOW ? 'No IOB, no COB, fasting' :
+                                    finding.type === FindingType.ISF_INDUCED_LOW ? 'Following correction' :
+                                    finding.type === FindingType.DIRECT_MEAL_LOW ? 'Following meal' :
+                                    finding.type === FindingType.TRANSIENT_HIGH_LOW ? 'Spike then crash pattern' :
+                                    finding.type === FindingType.POST_MEAL_HIGH ? 'Post-meal high' :
+                                    'Event detected',
+                            severity: bgValue < 54 ? 'severe' : 
+                                    bgValue < 70 ? 'moderate' : 
+                                    bgValue > 250 ? 'high' : 'mild'
+                        });
                     });
                     
                     return events;
@@ -4040,16 +4055,35 @@
                         return null;
                     }
                     
-                    // Find matching period
+                    // Find matching period by schedule hour
                     const scheduleHour = bundle.recommendations?.[0]?.scheduleTime ? 
                         parseInt(bundle.recommendations[0].scheduleTime.split(':')[0]) : null;
                     
                     if (scheduleHour === null) return null;
                     
-                    const period = analysisResults.signalAnalysis.periods.find(p => {
-                        const hours = p.hours || [];
-                        return hours.includes(scheduleHour);
-                    });
+                    // Map hour to period name
+                    const periodHoursMap = {
+                        'Deep Sleep': [0, 1, 2, 3],
+                        'Dawn': [4, 5, 6, 7],
+                        'Morning': [8, 9, 10, 11],
+                        'Afternoon': [12, 13, 14, 15, 16],
+                        'Evening': [17, 18, 19, 20],
+                        'Sleep Onset': [21, 22, 23]
+                    };
+                    
+                    // Find which period contains this hour
+                    let matchingPeriodName = null;
+                    for (const [periodName, hours] of Object.entries(periodHoursMap)) {
+                        if (hours.includes(scheduleHour)) {
+                            matchingPeriodName = periodName;
+                            break;
+                        }
+                    }
+                    
+                    if (!matchingPeriodName) return null;
+                    
+                    // Find the period data by name
+                    const period = analysisResults.signalAnalysis.periods.find(p => p.name === matchingPeriodName);
                     
                     if (!period) return null;
                     
@@ -4113,13 +4147,13 @@
                 // Build structured JSON
                 const json = {
                     meta: {
-                        version: "2.3",
+                        version: "2.3.1",
                         timestamp: now.toISOString(),
                         analysisWindow: config?.basalSignalWindow || 7,
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
                             coveragePercent: Math.round((analysisResults.nightscoutData?.glucose?.length || 0) / (7 * 24 * 12) * 100),
-                            cleanWindows: analysisResults.signalAnalysis?.cleanWindows || 0
+                            cleanWindows: analysisResults.signalAnalysis?.cleanWindows?.total || analysisResults.signalAnalysis?.cleanWindows || 0
                         }
                     },
                     
@@ -4226,9 +4260,24 @@
                             const agpCheck = getAGPCheckForPeriod(period.name, agp7day);
                             const divergence = checkDivergence(period, agpCheck);
                             
+                            // Convert period hours to array if it's a string
+                            let periodHours = period.hours;
+                            if (typeof periodHours === 'string') {
+                                // Parse "00:00-04:00" format
+                                const periodHoursMap = {
+                                    'Deep Sleep': [0, 1, 2, 3],
+                                    'Dawn': [4, 5, 6, 7],
+                                    'Morning': [8, 9, 10, 11],
+                                    'Afternoon': [12, 13, 14, 15, 16],
+                                    'Evening': [17, 18, 19, 20],
+                                    'Sleep Onset': [21, 22, 23]
+                                };
+                                periodHours = periodHoursMap[period.name] || [];
+                            }
+                            
                             return {
                                 name: period.name,
-                                hours: period.hours,
+                                hours: periodHours,
                                 medianDeviation: period.medianDeviation,
                                 signal: period.signal,
                                 cleanWindows: period.totalWindows,
@@ -4240,15 +4289,15 @@
                     
                     agp: agp7day ? {
                         overall: {
-                            tir: agp7day.overall?.tir,
-                            gmi: agp7day.overall?.gmi,
-                            cv: agp7day.overall?.cv,
-                            lowPercent: agp7day.overall?.low,
-                            veryLowPercent: agp7day.overall?.veryLow
+                            tir: agp7day.overall?.tir ?? agp7day.tir,
+                            gmi: agp7day.overall?.gmi ?? agp7day.gmi,
+                            cv: agp7day.overall?.cv ?? agp7day.cv,
+                            lowPercent: agp7day.overall?.low ?? agp7day.low,
+                            veryLowPercent: agp7day.overall?.veryLow ?? agp7day.veryLow
                         },
                         trend48h: agp48h ? {
-                            tir: agp48h.overall?.tir,
-                            delta: agp48h.overall?.tir - agp7day.overall?.tir,
+                            tir: agp48h.overall?.tir ?? agp48h.tir,
+                            delta: (agp48h.overall?.tir ?? agp48h.tir) - (agp7day.overall?.tir ?? agp7day.tir),
                             problemHoursDelta: 0 // TODO: Calculate actual delta
                         } : null,
                         problemHours: (agp7day.hourlyStats || [])
