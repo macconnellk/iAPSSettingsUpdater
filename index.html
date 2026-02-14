@@ -1,9 +1,10 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.2.0 - FINAL (Zero Emojis)</title>
+    <title>Daily Insulin Settings Review v3.2.3 - Midnight Wraparound Fix</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -201,6 +202,58 @@
             if (isNaN(hour)) return 'General';
             const block = TIME_BLOCKS.find(b => hour >= b.startHour && hour < b.endHour);
             return block ? block.name : 'General';
+        };
+        
+        // Extract affected hours from a bundle's basal recommendations
+        const getAffectedHours = (bundle) => {
+            if (!bundle || !bundle.recommendations) return [];
+            
+            const hours = [];
+            bundle.recommendations.forEach(rec => {
+                if (rec.param === 'basal' && rec.scheduleTime) {
+                    const hour = parseInt(rec.scheduleTime.split(':')[0]);
+                    if (!isNaN(hour)) {
+                        hours.push(hour);
+                    }
+                }
+            });
+            
+            return hours;
+        };
+        
+        // Check if two bundles' basal changes overlap or are adjacent
+        const basalChangesOverlap = (bundle1, bundle2) => {
+            const hours1 = getAffectedHours(bundle1);
+            const hours2 = getAffectedHours(bundle2);
+            
+            if (hours1.length === 0 || hours2.length === 0) return false;
+            
+            // Helper: Calculate circular distance on 24-hour clock
+            const circularDistance = (h1, h2) => {
+                const diff = Math.abs(h1 - h2);
+                return Math.min(diff, 24 - diff);
+            };
+            
+            // Check if any hours are the same OR adjacent (within 1 hour, accounting for midnight wraparound)
+            // Adjacent hours could interact physiologically (basal action curves overlap)
+            return hours1.some(h1 => 
+                hours2.some(h2 => circularDistance(h1, h2) <= 1)
+            );
+        };
+        
+        // Helper to check if bundles are directionally compatible for simultaneous changes
+        const bundlesAreCompatible = (bundle1, bundle2) => {
+            // Both must be basal changes
+            const b1Basal = bundle1.recommendations.some(r => r.param === 'basal');
+            const b2Basal = bundle2.recommendations.some(r => r.param === 'basal');
+            if (!b1Basal || !b2Basal) return false;
+            
+            // Get primary direction for each bundle
+            const b1Dir = bundle1.recommendations[0]?.changePercent > 0 ? 'increase' : 'decrease';
+            const b2Dir = bundle2.recommendations[0]?.changePercent > 0 ? 'increase' : 'decrease';
+            
+            // Compatible if: both same direction OR opposite directions (LOW + HIGH is fine!)
+            return true; // All basal changes are compatible if they don't overlap
         };
 
         // =========================================================================
@@ -691,7 +744,7 @@
                 slotConflicts.forEach(conflict => {
                     bundles.push({
                         id: `conflict_${conflict.slot}`,
-                        name: `[WARNING]  Conflict: ${conflict.slot}`,
+                        name: `[WARNING]  Conflict: ${conflict.slot}`,
                         tier: Tier.ROUTINE, // Low priority since conflicted
                         priority: 'REFERENCE',
                         recommendations: [],
@@ -719,7 +772,7 @@
                 if (basalRatioInfo && basalRatioInfo.exceedsCap) {
                     bundles.unshift({
                         id: 'basal_ratio_warning',
-                        name: `[WARNING]  Basal Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 Exceeds Cap`,
+                        name: `[WARNING]  Basal Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 Exceeds Cap`,
                         tier: Tier.FOUNDATIONAL,
                         priority: 'REFERENCE',
                         recommendations: [{
@@ -737,7 +790,7 @@
                         evidenceDetails: [
                             { icon: '[STRUCTURAL]', detail: `Maximum rate: ${basalRatioInfo.maxRate} U/hr at ${basalRatioInfo.maxHour}`, type: 'structural' },
                             { icon: '[STRUCTURAL]', detail: `Minimum rate: ${basalRatioInfo.minRate} U/hr at ${basalRatioInfo.minHour}`, type: 'structural' },
-                            { icon: '[WARNING] ', detail: `Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`, type: 'structural' }
+                            { icon: '[WARNING] ', detail: `Ratio ${basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${basalRatioInfo.cap}:1 guideline`, type: 'structural' }
                         ],
                         conflictsWith: [],
                         blockedBy: null,
@@ -1330,7 +1383,7 @@
                     return `${last3DayEvents} event(s) in last 3 days (${totalEvents - last3DayEvents} older)`;
                 } else if (mostRecentHours !== null && !isNaN(mostRecentHours)) {
                     const daysAgo = Math.round(mostRecentHours / 24);
-                    return `[WARNING]  ${totalEvents} event(s) - most recent ${daysAgo} day(s) ago`;
+                    return `[WARNING]  ${totalEvents} event(s) - most recent ${daysAgo} day(s) ago`;
                 } else {
                     // Fallback when we can't determine recency
                     const days = findings.reduce((sum, f) => sum + (f.daysWithPattern || 1), 0) / findings.length;
@@ -1354,7 +1407,7 @@
                     // Add recency indicator
                     const icon = f.eventsLast24h > 0 ? '' : 
                                 f.eventsLast3Days > 0 ? '[OLD]' : 
-                                f.isStructural ? '[STRUCTURAL]' : '[WARNING] ';
+                                f.isStructural ? '[STRUCTURAL]' : '[WARNING] ';
                     return {
                         icon,
                         detail: f.details || 'No details available',
@@ -1580,11 +1633,13 @@
                     }
                 });
                 
-                // Step 4: Multi-action PRIMARY selection
+                // Step 4: Multi-action PRIMARY selection (v3.2.3 - Midnight Wraparound Fix)
                 // - All URGENT bundles become PRIMARY (regardless of time block)
-                // - Then one non-urgent PRIMARY per time block
-                // - BUT: Bundles with only 3-day events (no 24h events) go to REFERENCE
+                // - Allow MULTIPLE basal changes to non-overlapping time periods
+                // - For overlapping periods or non-basal: one PRIMARY per time block
+                // - Bundles with only 3-day events (no 24h events) go to REFERENCE
                 const primaryByBlock = {};
+                const primaryBasalBundles = []; // Track basal bundles for overlap checking
                 
                 bundles.forEach(bundle => {
                     if (bundle.blockedBy || 
@@ -1600,7 +1655,7 @@
                         return;
                     }
                     
-                    // Option 1 fix: Only 3-day events (no 24h events) â†’ REFERENCE
+                    // Only 3-day events (no 24h events) -> REFERENCE
                     // Exception: Structural findings (basal signal) are always current
                     if (!bundle.hasRecentEvents && bundle.hasLast3DayEvents && !bundle.hasStructuralFinding) {
                         bundle.priority = 'REFERENCE';
@@ -1608,20 +1663,48 @@
                         return;
                     }
                     
-                    // One non-urgent PRIMARY per time block
+                    // Check if this is a basal change
+                    const isBasalChange = bundle.recommendations.some(r => r.param === 'basal');
                     const block = bundle.timeBlock;
-                    if (!primaryByBlock[block]) {
-                        bundle.priority = 'PRIMARY';
-                        primaryByBlock[block] = bundle;
+                    
+                    if (isBasalChange) {
+                        // For basal changes: check if actual HOURS overlap (not just time blocks)
+                        const overlapsExisting = primaryBasalBundles.some(existing => 
+                            basalChangesOverlap(existing, bundle)
+                        );
+                        
+                        if (!overlapsExisting) {
+                            // No overlap! Allow this basal change to be PRIMARY
+                            bundle.priority = 'PRIMARY';
+                            primaryBasalBundles.push(bundle);
+                            if (!primaryByBlock[block]) primaryByBlock[block] = bundle;
+                        } else {
+                            // Overlaps with existing basal change - defer to watchlist
+                            bundle.priority = 'REFERENCE';
+                            bundle.demotedReason = 'Deferred - apply primary first';
+                        }
                     } else {
-                        bundle.priority = 'REFERENCE';
+                        // For non-basal changes (CR, ISF): use original "one per block" logic
+                        if (!primaryByBlock[block]) {
+                            bundle.priority = 'PRIMARY';
+                            primaryByBlock[block] = bundle;
+                        } else {
+                            bundle.priority = 'REFERENCE';
+                            bundle.demotedReason = 'Deferred - apply primary first';
+                        }
                     }
                 });
                 
                 // Log multi-action summary
                 const primaries = bundles.filter(b => b.priority === 'PRIMARY');
-                console.log('Multi-action selection:', {
+                const basalPrimaries = primaries.filter(p => p.recommendations.some(r => r.param === 'basal'));
+                console.log('Multi-action selection (v3.2.3 - Midnight Fix):', {
                     urgent: primaries.filter(b => b.isUrgent).map(b => b.name),
+                    basalChanges: basalPrimaries.map(b => {
+                        const hours = getAffectedHours(b);
+                        return `${b.timeBlock} (hrs ${hours.join(',')}): ${b.name}`;
+                    }),
+                    nonBasal: primaries.filter(p => !basalPrimaries.includes(p)).map(b => b.name),
                     byBlock: Object.entries(primaryByBlock).map(([block, b]) => `${block}: ${b.name}`)
                 });
                 
@@ -3346,7 +3429,7 @@
                 
                 // Basal Ratio Warning
                 if (analysisResults.basalRatioInfo?.exceedsCap) {
-                    output += `[WARNING]  **Basal Ratio Warning:** ${analysisResults.basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${analysisResults.basalRatioInfo.cap}:1 cap\n`;
+                    output += `[WARNING]  **Basal Ratio Warning:** ${analysisResults.basalRatioInfo.ratio.toFixed(1)}:1 exceeds ${analysisResults.basalRatioInfo.cap}:1 cap\n`;
                     output += `- Max: ${analysisResults.basalRatioInfo.maxRate} U/hr at ${analysisResults.basalRatioInfo.maxHour}\n`;
                     output += `- Min: ${analysisResults.basalRatioInfo.minRate} U/hr at ${analysisResults.basalRatioInfo.minHour}\n`;
                     output += `- CR/ISF recommendations have 20% confidence penalty applied.\n\n`;
@@ -3378,14 +3461,14 @@
                     primaryBundles.forEach((primaryBundle, idx) => {
                         // Add recency indicator
                         const recencyIcon = primaryBundle.hasRecentEvents ? '[NEW]' : '[OLD]';
-                                           primaryBundle.hasLast3DayEvents ? '[OLD]' : '[WARNING] ';
+                                           primaryBundle.hasLast3DayEvents ? '[OLD]' : '[WARNING] ';
                         const urgentTag = primaryBundle.isUrgent ? ' [URGENT]' : '';
                         const blockTag = primaryBundles.length > 1 ? ` [${primaryBundle.timeBlock}]` : '';
                         
                         output += `### ${primaryBundle.name} ${recencyIcon}${urgentTag}${blockTag}\n\n`;
                         
                         if (primaryBundle.urgentReason) {
-                            output += `[WARNING]  **${primaryBundle.urgentReason}** - requires immediate attention\n\n`;
+                            output += `[WARNING]  **${primaryBundle.urgentReason}** - requires immediate attention\n\n`;
                         }
                         
                         output += `**Why:** ${primaryBundle.rootCause}\n\n`;
@@ -3427,13 +3510,13 @@
                             const last3Count = primaryBundle.findings?.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0) || 0;
                             output += `**Recency:** ${last3Count} event(s) in last 3 days\n`;
                         } else {
-                            output += `**Recency:** [WARNING]  Caution - no events in last 3 days\n`;
+                            output += `**Recency:** [WARNING]  Caution - no events in last 3 days\n`;
                         }
                         
                         if (primaryBundle.compoundEffect && primaryBundle.compoundEffect.description) {
                             output += `**Compound Effect:** ${primaryBundle.compoundEffect.description}`;
                             if (primaryBundle.compoundEffect.warning) {
-                                output += ` [WARNING]  ${primaryBundle.compoundEffect.warning}`;
+                                output += ` [WARNING]  ${primaryBundle.compoundEffect.warning}`;
                             }
                             output += `\n`;
                         }
@@ -3460,7 +3543,7 @@
                     referenceBundles.forEach(bundle => {
                         // Add recency indicator to name
                         const recencyIcon = bundle.hasRecentEvents ? '[NEW]' : '[OLD]';
-                                           bundle.hasLast3DayEvents ? '[OLD]' : '[WARNING] ';
+                                           bundle.hasLast3DayEvents ? '[OLD]' : '[WARNING] ';
                         output += `### ${recencyIcon} ${bundle.name} (Tier ${bundle.tier})\n`;
                         
                         // Generate appropriate status message
@@ -3470,7 +3553,7 @@
                         } else if (bundle.blockedBy) {
                             status = bundle.blockedBy;
                         } else if (bundle.compoundEffect?.warning === 'HIGH') {
-                            status = `[WARNING]  Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`;
+                            status = `[WARNING]  Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`;
                         } else if (bundle.isSlotConflict) {
                             status = 'Hold - conflicting patterns detected';
                         } else if (bundle.isBasalRatioWarning) {
@@ -3496,7 +3579,7 @@
                             const last3Count = bundle.findings?.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0) || 0;
                             output += `- **Recency:** ${last3Count} event(s) in last 3 days\n`;
                         } else {
-                            output += `- **Recency:** [WARNING]  No recent events - pattern may have resolved\n`;
+                            output += `- **Recency:** [WARNING]  No recent events - pattern may have resolved\n`;
                         }
                         
                         // Show brief evidence details (first 2)
@@ -3548,8 +3631,8 @@
                     recentChanges.forEach(change => {
                         const outcomeEmoji = {
                             [OutcomeType.EFFECTIVE]: '',
-                            [OutcomeType.CAUSED_LOW]: '[WARNING]  Low',
-                            [OutcomeType.CAUSED_HIGH]: '[WARNING]  High',
+                            [OutcomeType.CAUSED_LOW]: '[WARNING]  Low',
+                            [OutcomeType.CAUSED_HIGH]: '[WARNING]  High',
                             [OutcomeType.REVERTED]: 'â†©',
                             [OutcomeType.PENDING]: 'â³',
                             [OutcomeType.INDETERMINATE]: '?'
@@ -3661,10 +3744,10 @@
                             
                             // BUG-023: Add info about excluded stale data or gaps
                             if (dynamicTarget?.excludedStaleRows > 0) {
-                                output += ` [WARNING]  (${dynamicTarget.excludedStaleRows} stale rows excluded)`;
+                                output += ` [WARNING]  (${dynamicTarget.excludedStaleRows} stale rows excluded)`;
                             }
                             if (dynamicTarget?.hasGap) {
-                                output += ` [WARNING]  (gap detected - post-override transition)`;
+                                output += ` [WARNING]  (gap detected - post-override transition)`;
                             }
                             output += `\n`;
                         }
@@ -3674,7 +3757,7 @@
                         // BUG-023: Show conflict warning if target diverges from signal (only for non-fallback)
                         if (!isSignalFallback && signalPct && Math.abs(targetPct - signalPct) > 1.5) {
                             const direction = targetPct > signalPct ? 'increase' : 'decrease';
-                            output += `\n[WARNING]  **Target/Signal Divergence:** Target (${targetPct.toFixed(1)}%) suggests ${direction}, but today's signal (${signalPct.toFixed(1)}%) differs by ${Math.abs(targetPct - signalPct).toFixed(1)}%.\n`;
+                            output += `\n[WARNING]  **Target/Signal Divergence:** Target (${targetPct.toFixed(1)}%) suggests ${direction}, but today's signal (${signalPct.toFixed(1)}%) differs by ${Math.abs(targetPct - signalPct).toFixed(1)}%.\n`;
                         }
                         
                         output += `\n`;
@@ -3711,10 +3794,10 @@
                         
                         // Determine AGP problem
                         if (avgHigh > 25) {
-                            return { status: 'HIGH', icon: '[WARNING] ', detail: `${avgHigh.toFixed(0)}% HIGH` };
+                            return { status: 'HIGH', icon: '[WARNING] ', detail: `${avgHigh.toFixed(0)}% HIGH` };
                         }
                         if (avgLow > 5) {
-                            return { status: 'LOW', icon: '[WARNING] ', detail: `${avgLow.toFixed(0)}% LOW` };
+                            return { status: 'LOW', icon: '[WARNING] ', detail: `${avgLow.toFixed(0)}% LOW` };
                         }
                         return { status: 'OK', icon: '', detail: 'OK' };
                     };
@@ -3889,7 +3972,7 @@
                         output += `**Distribution:** ${parts.join(' | ')}\n`;
                     }
                     if (dist.incrementsSkipped > 0) {
-                        output += `[WARNING]  ${dist.incrementsSkipped} increment(s) not applied - no suitable periods available.\n`;
+                        output += `[WARNING]  ${dist.incrementsSkipped} increment(s) not applied - no suitable periods available.\n`;
                     }
                     // Show ratio protection info
                     if (dist.ratioProtection?.active) {
@@ -3981,7 +4064,7 @@
                     // Recency indicator
                     const recencyIcon = finding.eventsLast24h > 0 ? '[NEW]' : '[OLD]';
                                        finding.eventsLast3Days > 0 ? '[OLD]' : 
-                                       finding.isStructural ? '[STRUCTURAL]' : '[WARNING] ';
+                                       finding.isStructural ? '[STRUCTURAL]' : '[WARNING] ';
                     output += `${idx + 1}. ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
                     output += `   - Severity: ${(finding.severity * 100).toFixed(0)}%\n`;
                     output += `   - ${finding.details}\n\n`;
@@ -4461,14 +4544,14 @@
                 let output = `## AGP Summary (7 Days)\n\n`;
                 
                 // Overall summary line with goals
-                const tirStatus = agp.tir.inRange >= goals.tir ? '' : '[WARNING] ';
-                const gmiStatus = agp.gmi < goals.gmi ? '' : '[WARNING] ';
-                const cvStatus = agp.cv < goals.cv ? '' : '[WARNING] ';
+                const tirStatus = agp.tir.inRange >= goals.tir ? '' : '[WARNING] ';
+                const gmiStatus = agp.gmi < goals.gmi ? '' : '[WARNING] ';
+                const cvStatus = agp.cv < goals.cv ? '' : '[WARNING] ';
                 output += `**Overall:** ${agp.tir.inRange.toFixed(0)}% TIR (â‰¥${goals.tir}% ${tirStatus}) | GMI ${agp.gmi.toFixed(1)}% (<${goals.gmi}% ${gmiStatus}) | CV ${agp.cv.toFixed(0)}% (<${goals.cv}% ${cvStatus})\n`;
                 
                 // Safety line with goals
-                const lowStatus = agp.tir.low < goals.low ? '' : '[WARNING] ';
-                const veryLowStatus = agp.tir.veryLow < goals.veryLow ? '' : '[WARNING] ';
+                const lowStatus = agp.tir.low < goals.low ? '' : '[WARNING] ';
+                const veryLowStatus = agp.tir.veryLow < goals.veryLow ? '' : '[WARNING] ';
                 const veryLowDisplay = agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0);
                 output += `**Safety:** ${agp.tir.low.toFixed(0)}% Low (<${goals.low}% ${lowStatus}) | ${veryLowDisplay}% Very Low (<${goals.veryLow}% ${veryLowStatus})\n`;
                 
@@ -4491,11 +4574,11 @@
                 output += `**Time in Range** *(Day 70-160, Night 70-140)*:\n`;
                 output += `| Range | % | Goal | Status |\n`;
                 output += `|-------|---|------|--------|\n`;
-                output += `| Very High (>250) | ${agp.tir.veryHigh.toFixed(0)}% | <${goals.veryHigh}% | ${agp.tir.veryHigh < goals.veryHigh ? '' : '[WARNING] '} |\n`;
-                output += `| High (160-250) | ${agp.tir.high.toFixed(0)}% | <${goals.high}% | ${agp.tir.high < goals.high ? '' : '[WARNING] '} |\n`;
-                output += `| In Range (70-160) | ${agp.tir.inRange.toFixed(0)}% | â‰¥${goals.tir}% | ${agp.tir.inRange >= goals.tir ? '' : '[WARNING] '} |\n`;
-                output += `| Low (54-70) | ${agp.tir.low.toFixed(0)}% | <${goals.low}% | ${agp.tir.low < goals.low ? '' : '[WARNING] '} |\n`;
-                output += `| Very Low (<54) | ${agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0)}% | <${goals.veryLow}% | ${agp.tir.veryLow < goals.veryLow ? '' : '[WARNING] '} |\n\n`;
+                output += `| Very High (>250) | ${agp.tir.veryHigh.toFixed(0)}% | <${goals.veryHigh}% | ${agp.tir.veryHigh < goals.veryHigh ? '' : '[WARNING] '} |\n`;
+                output += `| High (160-250) | ${agp.tir.high.toFixed(0)}% | <${goals.high}% | ${agp.tir.high < goals.high ? '' : '[WARNING] '} |\n`;
+                output += `| In Range (70-160) | ${agp.tir.inRange.toFixed(0)}% | â‰¥${goals.tir}% | ${agp.tir.inRange >= goals.tir ? '' : '[WARNING] '} |\n`;
+                output += `| Low (54-70) | ${agp.tir.low.toFixed(0)}% | <${goals.low}% | ${agp.tir.low < goals.low ? '' : '[WARNING] '} |\n`;
+                output += `| Very Low (<54) | ${agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0)}% | <${goals.veryLow}% | ${agp.tir.veryLow < goals.veryLow ? '' : '[WARNING] '} |\n\n`;
                 
                 // Full 24-hour breakdown
                 output += `**Hourly Breakdown:**\n`;
@@ -4519,7 +4602,7 @@
                     
                     // Status indicator
                     let status = '';
-                    if (stats.tir.inRange < 70) status = '[WARNING]  Low TIR';
+                    if (stats.tir.inRange < 70) status = '[WARNING]  Low TIR';
                     else if (stats.tir.low + stats.tir.veryLow > 5) status = '”´ Lows';
                     else if (stats.tir.inRange < 80) status = '[OLD]';
                     
@@ -4575,7 +4658,7 @@
                 const dateStr = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 
                 let output = `# Daily Review - ${dateStr}\n`;
-                output += `**State:** ${this.formatStateName(bodyState.state)} ${bodyState.state === BodyStateType.STABLE ? '' : '[WARNING] '}\n\n`;
+                output += `**State:** ${this.formatStateName(bodyState.state)} ${bodyState.state === BodyStateType.STABLE ? '' : '[WARNING] '}\n\n`;
                 
                 const primaryBundles = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
                 if (primaryBundles.length > 0) {
@@ -5337,10 +5420,10 @@
                         console.log(`Using dynamic target: ${effectiveBasalTarget}% (${dynamicResult.daysOfData} days of data)`);
                         console.log(`Yesterday Final %: ${yesterdayFinal}`);
                         if (dynamicResult.hasGap) {
-                            console.log(`[WARNING]  Gap detected: ${dynamicResult.gapDays} days - post-override transition`);
+                            console.log(`[WARNING]  Gap detected: ${dynamicResult.gapDays} days - post-override transition`);
                         }
                         if (dynamicResult.excludedStaleRows > 0) {
-                            console.log(`[WARNING]  Excluded ${dynamicResult.excludedStaleRows} stale rows (>5 days old)`);
+                            console.log(`[WARNING]  Excluded ${dynamicResult.excludedStaleRows} stale rows (>5 days old)`);
                         }
                     } else {
                         // BUG-023: Mark that we need to fall back to today's signal
@@ -6276,7 +6359,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.2.0 - FINAL (Zero Emojis)</p>
+                                    <p className="text-gray-400 text-sm">v3.2.3 - Midnight Wraparound Fix</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -6658,7 +6741,7 @@
                                         )}
                                         {analysisResults.basalOptimization.distribution?.incrementsSkipped > 0 && (
                                             <div className="mt-2 text-xs text-orange-400">
-                                                [WARNING]  {analysisResults.basalOptimization.distribution.incrementsSkipped} increment(s) not applied - avoiding opposite-signal periods
+                                                [WARNING]  {analysisResults.basalOptimization.distribution.incrementsSkipped} increment(s) not applied - avoiding opposite-signal periods
                                             </div>
                                         )}
                                     </div>
@@ -6668,7 +6751,7 @@
                                 {analysisResults.basalRatioInfo?.exceedsCap && (
                                     <div className="glass-card rounded-2xl p-6 border-l-4 border-l-orange-500 bg-orange-500/5">
                                         <div className="flex items-start gap-3">
-                                            <span className="text-2xl">[WARNING] </span>
+                                            <span className="text-2xl">[WARNING] </span>
                                             <div className="flex-1">
                                                 <h3 className="text-orange-400 font-bold mb-2">
                                                     Basal Ratio {analysisResults.basalRatioInfo.ratio.toFixed(1)}:1 Exceeds {analysisResults.basalRatioInfo.cap}:1 Cap
@@ -6720,7 +6803,7 @@
                                                 <div className="space-y-4">
                                                     <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4">
                                                         <p className="text-yellow-400 font-medium mb-2">
-                                                            [WARNING]  Safety findings detected but all exceed safe compound effect threshold
+                                                            [WARNING]  Safety findings detected but all exceed safe compound effect threshold
                                                         </p>
                                                         <p className="text-gray-400 text-sm">
                                                             Address ONE of the following individually instead of applying multiple changes:
@@ -6821,7 +6904,7 @@
                                                         
                                                         {primary.urgentReason && (
                                                             <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 mb-4">
-                                                                <p className="text-red-400 text-sm font-medium">[WARNING]  {primary.urgentReason}</p>
+                                                                <p className="text-red-400 text-sm font-medium">[WARNING]  {primary.urgentReason}</p>
                                                             </div>
                                                         )}
                                                         
@@ -6963,7 +7046,7 @@
                                                         </p>
                                                         {bundle.signalConflict && !bundle.blockedBy?.includes('Signal conflict') && (
                                                             <p className="text-orange-400 text-xs mt-1">
-                                                                [WARNING]  {bundle.signalConflict}
+                                                                [WARNING]  {bundle.signalConflict}
                                                             </p>
                                                         )}
                                                         {bundle.recommendations.length > 0 && !bundle.isBasalRatioWarning && (
