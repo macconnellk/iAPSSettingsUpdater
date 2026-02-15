@@ -4891,6 +4891,176 @@
                 }
                 
                 return output;
+            },
+            
+            // SPEC 2: Generate trend section from Sheets history
+            generateTrendSection(historyEntries, currentData) {
+                if (!historyEntries || historyEntries.length === 0) {
+                    return '# TREND CONTEXT (14-day history)\n\n_No history available. Trends will populate after 2+ logged sessions._\n\n---\n\n';
+                }
+                
+                let output = '# TREND CONTEXT (14-day history)\n\n';
+                const entries = historyEntries.sort((a, b) => new Date(a.date) - new Date(b.date));
+                const n = entries.length;
+                
+                // === Key Metrics Sparkline ===
+                output += '## Key Metrics\n\n';
+                output += '| Date | TIR | TDD_24h | Carbs | U/g | Basal% | Ratio | Direction |\n';
+                output += '|------|-----|---------|-------|-----|--------|-------|-----------|\n';
+                
+                for (const e of entries) {
+                    const date = e.date ? new Date(e.date).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '?';
+                    const tir = e.tir7d ? `${parseFloat(e.tir7d).toFixed(0)}%` : '-';
+                    const tdd = e.tdd24h ? parseFloat(e.tdd24h).toFixed(1) : '-';
+                    const carbs = e.carbs24h ? parseFloat(e.carbs24h).toFixed(0) : '-';
+                    const upg = e.insulinPerCarb ? parseFloat(e.insulinPerCarb).toFixed(3) : '-';
+                    const basalPct = e.finalPercent ? `${parseFloat(e.finalPercent).toFixed(1)}%` : (e.targetPercent ? `${parseFloat(e.targetPercent).toFixed(1)}%` : '-');
+                    const ratio = e.basalRatio ? `${parseFloat(e.basalRatio).toFixed(1)}:1` : '-';
+                    const dir = e.direction || '-';
+                    output += `| ${date} | ${tir} | ${tdd} | ${carbs} | ${upg} | ${basalPct} | ${ratio} | ${dir} |\n`;
+                }
+                output += '\n';
+                
+                // === Period Deviation Trends ===
+                const hasDeviations = entries.some(e => e.periodDeviations && 
+                    Object.values(e.periodDeviations).some(v => v !== null && v !== '' && v !== undefined));
+                
+                if (hasDeviations) {
+                    output += '## Period Deviation Trends (mg/dL from target)\n\n';
+                    output += '| Date | Deep Sleep | Dawn | Morning | Afternoon | Evening | Sleep Onset |\n';
+                    output += '|------|-----------|------|---------|-----------|---------|------------|\n';
+                    
+                    for (const e of entries) {
+                        const date = e.date ? new Date(e.date).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '?';
+                        const pd = e.periodDeviations || {};
+                        const fmt = (v) => (v !== null && v !== '' && v !== undefined) ? parseFloat(v).toFixed(0) : '-';
+                        output += `| ${date} | ${fmt(pd.deepSleep)} | ${fmt(pd.dawn)} | ${fmt(pd.morning)} | ${fmt(pd.afternoon)} | ${fmt(pd.evening)} | ${fmt(pd.sleepOnset)} |\n`;
+                    }
+                    output += '\n';
+                }
+                
+                // === Persistent Item Tracking ===
+                const recentWithActions = entries.filter(e => e.primaryActions);
+                const recentWithWatch = entries.filter(e => e.watchItems);
+                
+                if (recentWithActions.length >= 2 || recentWithWatch.length >= 2) {
+                    output += '## Item Persistence\n\n';
+                    
+                    // Track action names across days
+                    const actionFrequency = {};
+                    for (const e of recentWithActions) {
+                        const actions = Array.isArray(e.primaryActions) ? e.primaryActions : [];
+                        for (const a of actions) {
+                            const key = a.name || 'unknown';
+                            actionFrequency[key] = (actionFrequency[key] || 0) + 1;
+                        }
+                    }
+                    
+                    const watchFrequency = {};
+                    for (const e of recentWithWatch) {
+                        const items = Array.isArray(e.watchItems) ? e.watchItems : [];
+                        for (const w of items) {
+                            const key = w.name || 'unknown';
+                            watchFrequency[key] = (watchFrequency[key] || 0) + 1;
+                        }
+                    }
+                    
+                    // Persistent = appeared 3+ times
+                    const persistentActions = Object.entries(actionFrequency).filter(([k, v]) => v >= 3);
+                    const persistentWatch = Object.entries(watchFrequency).filter(([k, v]) => v >= 3);
+                    
+                    if (persistentActions.length > 0) {
+                        output += '**Recurring primary actions** (3+ appearances):\n';
+                        for (const [name, count] of persistentActions) {
+                            output += `- ${name}: ${count}/${recentWithActions.length} sessions\n`;
+                        }
+                        output += '\n';
+                    }
+                    
+                    if (persistentWatch.length > 0) {
+                        output += '**Recurring watch items** (3+ appearances):\n';
+                        for (const [name, count] of persistentWatch) {
+                            output += `- ${name}: ${count}/${recentWithWatch.length} sessions\n`;
+                        }
+                        output += '\n';
+                    }
+                    
+                    // Escalations: items in today's primary that were in yesterday's watch
+                    if (currentData?.primaryActions && recentWithWatch.length > 0) {
+                        const lastWatch = recentWithWatch[recentWithWatch.length - 1];
+                        const lastWatchNames = (Array.isArray(lastWatch.watchItems) ? lastWatch.watchItems : [])
+                            .map(w => w.name);
+                        const todayPrimaryNames = (Array.isArray(currentData.primaryActions) ? currentData.primaryActions : [])
+                            .map(a => a.name);
+                        
+                        const escalated = todayPrimaryNames.filter(n => lastWatchNames.includes(n));
+                        if (escalated.length > 0) {
+                            output += '**⬆ Escalated to primary today:**\n';
+                            for (const name of escalated) {
+                                output += `- ${name}\n`;
+                            }
+                            output += '\n';
+                        }
+                    }
+                    
+                    // Resolved: items in yesterday's primary/watch that are absent today
+                    if (recentWithActions.length > 0 && currentData) {
+                        const lastActions = recentWithActions[recentWithActions.length - 1];
+                        const lastActionNames = (Array.isArray(lastActions.primaryActions) ? lastActions.primaryActions : [])
+                            .map(a => a.name);
+                        const todayAllNames = [
+                            ...(Array.isArray(currentData.primaryActions) ? currentData.primaryActions : []).map(a => a.name),
+                            ...(Array.isArray(currentData.watchItems) ? currentData.watchItems : []).map(w => w.name)
+                        ];
+                        
+                        const resolved = lastActionNames.filter(n => !todayAllNames.includes(n));
+                        if (resolved.length > 0) {
+                            output += '**✓ Resolved (no longer appearing):**\n';
+                            for (const name of resolved) {
+                                output += `- ${name}\n`;
+                            }
+                            output += '\n';
+                        }
+                    }
+                }
+                
+                // === Summary Stats ===
+                const tirValues = entries.map(e => e.tir7d ? parseFloat(e.tir7d) : null).filter(v => v !== null);
+                const tddValues = entries.map(e => e.tdd24h ? parseFloat(e.tdd24h) : null).filter(v => v !== null);
+                
+                if (tirValues.length >= 2 || tddValues.length >= 2) {
+                    output += '## Summary\n\n';
+                    
+                    if (tirValues.length >= 2) {
+                        const tirFirst = tirValues.slice(0, Math.ceil(tirValues.length / 2));
+                        const tirSecond = tirValues.slice(Math.ceil(tirValues.length / 2));
+                        const avgFirst = tirFirst.reduce((a, b) => a + b, 0) / tirFirst.length;
+                        const avgSecond = tirSecond.reduce((a, b) => a + b, 0) / tirSecond.length;
+                        const tirDelta = avgSecond - avgFirst;
+                        const tirArrow = tirDelta > 1 ? '↑' : tirDelta < -1 ? '↓' : '→';
+                        output += `- **TIR trend:** ${avgFirst.toFixed(0)}% → ${avgSecond.toFixed(0)}% (${tirDelta > 0 ? '+' : ''}${tirDelta.toFixed(1)}%) ${tirArrow}\n`;
+                    }
+                    
+                    if (tddValues.length >= 2) {
+                        const tddFirst = tddValues.slice(0, Math.ceil(tddValues.length / 2));
+                        const tddSecond = tddValues.slice(Math.ceil(tddValues.length / 2));
+                        const avgFirst = tddFirst.reduce((a, b) => a + b, 0) / tddFirst.length;
+                        const avgSecond = tddSecond.reduce((a, b) => a + b, 0) / tddSecond.length;
+                        const tddDelta = avgSecond - avgFirst;
+                        const tddArrow = tddDelta > 1 ? '↑' : tddDelta < -1 ? '↓' : '→';
+                        output += `- **TDD trend:** ${avgFirst.toFixed(1)} → ${avgSecond.toFixed(1)}U (${tddDelta > 0 ? '+' : ''}${tddDelta.toFixed(1)}U) ${tddArrow}\n`;
+                    }
+                    
+                    output += `- **Sessions logged:** ${n} over ${(() => {
+                        const first = new Date(entries[0].date);
+                        const last = new Date(entries[n-1].date);
+                        return Math.round((last - first) / (1000 * 60 * 60 * 24));
+                    })() || 1} days\n`;
+                    output += '\n';
+                }
+                
+                output += '---\n\n';
+                return output;
             }
         };
 
@@ -5389,7 +5559,7 @@
             };
             
             // Auto-log to Google Sheets after analysis
-            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules) => {
+            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules, processedBundles = []) => {
                 console.log('=== attemptAutoLog called ===');
                 console.log('Sheets URL:', sheetsWebAppUrl);
                 console.log('State:', state.state);
@@ -5558,7 +5728,36 @@
                         basal: scheduleToObject(activeSchedules?.basal || basalSchedule),
                         cr: scheduleToObject(activeSchedules?.cr || crSchedule),
                         isf: scheduleToObject(activeSchedules?.isf || isfSchedule)
-                    }
+                    },
+                    // SPEC 2: Trend tracking columns
+                    tir7d: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
+                            return agp ? agp.tir.inRange.toFixed(1) : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    basalRatio: basalRatioInfo?.ratio ? basalRatioInfo.ratio.toFixed(1) : '',
+                    primaryActions: (() => {
+                        try {
+                            const primary = (processedBundles || []).filter(b => b.priority === 'PRIMARY');
+                            return JSON.stringify(primary.map(b => ({
+                                name: b.name,
+                                timeBlock: b.timeBlock || 'General',
+                                urgent: b.isUrgent || false,
+                                recs: (b.recommendations || []).map(r => `${r.scheduleTime} ${r.param} ${r.changePercent > 0 ? '+' : ''}${r.changePercent.toFixed(1)}%`).join('; ')
+                            })));
+                        } catch(e) { return '[]'; }
+                    })(),
+                    watchItems: (() => {
+                        try {
+                            const watch = (processedBundles || []).filter(b => b.priority === 'REFERENCE');
+                            return JSON.stringify(watch.map(b => ({
+                                name: b.name,
+                                status: b.demotedReason || b.blockedBy || 'deferred',
+                                confidence: b.confidence ? b.confidence.toFixed(2) : '0'
+                            })));
+                        } catch(e) { return '[]'; }
+                    })()
                 };
                 
                 console.log('Auto-log payload:', payload);
@@ -6081,7 +6280,7 @@
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
-                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules);
+                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles);
                     
                 } catch (err) {
                     console.error('Analysis error:', err);
@@ -6260,7 +6459,46 @@
                         console.error('Structured JSON generation failed (continuing with markdown only):', jsonErr);
                     }
                     
-                    const combinedOutput = structuredJSON + output;
+                    // SPEC 2: Fetch trend history from Sheets and generate trend section
+                    let trendSection = '';
+                    if (sheetsWebAppUrl) {
+                        try {
+                            console.log('Fetching trend history from Sheets...');
+                            const historyResponse = await fetch(`${sheetsWebAppUrl}?action=read&days=14`, {
+                                method: 'GET',
+                                headers: { 'Content-Type': 'application/json' }
+                            });
+                            const historyData = await historyResponse.json();
+                            
+                            if (historyData.success && historyData.entries && historyData.entries.length > 0) {
+                                console.log(`Trend history: ${historyData.entries.length} entries from ${historyData.oldestDate} to ${historyData.newestDate}`);
+                                
+                                // Build current session data for comparison
+                                const currentData = {
+                                    primaryActions: (bundles || []).filter(b => b.priority === 'PRIMARY').map(b => ({
+                                        name: b.name,
+                                        timeBlock: b.timeBlock || 'General'
+                                    })),
+                                    watchItems: (bundles || []).filter(b => b.priority === 'REFERENCE').map(b => ({
+                                        name: b.name,
+                                        status: b.demotedReason || b.blockedBy || 'deferred'
+                                    }))
+                                };
+                                
+                                trendSection = OutputFormatter.generateTrendSection(historyData.entries, currentData);
+                            } else {
+                                console.log('Trend history: No entries found');
+                                trendSection = OutputFormatter.generateTrendSection([], null);
+                            }
+                        } catch (trendErr) {
+                            console.error('Trend history fetch failed (continuing without trends):', trendErr);
+                            trendSection = '# TREND CONTEXT\n\n_Failed to fetch history: ' + trendErr.message + '_\n\n---\n\n';
+                        }
+                    } else {
+                        trendSection = '# TREND CONTEXT\n\n_No Google Sheets URL configured. Configure Sheets URL to enable trend tracking._\n\n---\n\n';
+                    }
+                    
+                    const combinedOutput = structuredJSON + trendSection + output;
                     
                     if (!output) {
                         console.error('copyForClaudeReview: formatForClaude returned empty');
@@ -6454,7 +6692,36 @@
                         basal: scheduleToObject(basalSchedule),
                         cr: scheduleToObject(crSchedule),
                         isf: scheduleToObject(isfSchedule)
-                    }
+                    },
+                    // SPEC 2: Trend tracking columns
+                    tir7d: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            return agp ? agp.tir.inRange.toFixed(1) : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    basalRatio: analysisResults?.basalRatioInfo?.ratio ? analysisResults.basalRatioInfo.ratio.toFixed(1) : '',
+                    primaryActions: (() => {
+                        try {
+                            const primary = (bundles || []).filter(b => b.priority === 'PRIMARY');
+                            return JSON.stringify(primary.map(b => ({
+                                name: b.name,
+                                timeBlock: b.timeBlock || 'General',
+                                urgent: b.isUrgent || false,
+                                recs: (b.recommendations || []).map(r => `${r.scheduleTime} ${r.param} ${r.changePercent > 0 ? '+' : ''}${r.changePercent.toFixed(1)}%`).join('; ')
+                            })));
+                        } catch(e) { return '[]'; }
+                    })(),
+                    watchItems: (() => {
+                        try {
+                            const watch = (bundles || []).filter(b => b.priority === 'REFERENCE');
+                            return JSON.stringify(watch.map(b => ({
+                                name: b.name,
+                                status: b.demotedReason || b.blockedBy || 'deferred',
+                                confidence: b.confidence ? b.confidence.toFixed(2) : '0'
+                            })));
+                        } catch(e) { return '[]'; }
+                    })()
                 };
                 
                 try {
