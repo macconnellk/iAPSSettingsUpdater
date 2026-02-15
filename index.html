@@ -1,10 +1,9 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.3.1 (JSON Export - Fixed)</title>
+    <title>Daily Insulin Settings Review v3.1.5 - All Emojis Removed</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -178,12 +177,12 @@
         };
         
         const CIRCADIAN_PERIODS = [
-            { name: 'Deep Sleep', emoji: 'ðŸŒ™', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
-            { name: 'Dawn', emoji: 'ðŸŒ…', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
-            { name: 'Morning', emoji: 'â˜€ï¸', startHour: 8, endHour: 12, description: 'Peak insulin sensitivity' },
-            { name: 'Afternoon', emoji: 'ðŸŒ¤ï¸', startHour: 12, endHour: 17, description: 'Stable, declining sensitivity' },
-            { name: 'Evening', emoji: 'ðŸŒ†', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
-            { name: 'Sleep Onset', emoji: 'ðŸ˜´', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
+            { name: 'Deep Sleep', emoji: '🌙', startHour: 0, endHour: 4, description: 'GH peaks, lowest cortisol' },
+            { name: 'Dawn', emoji: '🌅', startHour: 4, endHour: 8, description: 'Cortisol surge (dawn phenomenon)' },
+            { name: 'Morning', emoji: '☀️', startHour: 8, endHour: 12, description: 'Peak insulin sensitivity' },
+            { name: 'Afternoon', emoji: '🌤️', startHour: 12, endHour: 17, description: 'Stable, declining sensitivity' },
+            { name: 'Evening', emoji: '🌆', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
+            { name: 'Sleep Onset', emoji: '😴', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
         ];
         
         // Independent time blocks for multi-action support
@@ -658,11 +657,11 @@
             
             getProtectionIcon(level) {
                 switch (level) {
-                    case ProtectionLevel.LOCKED: return 'â›”';
-                    case ProtectionLevel.PROTECTED: return 'ðŸ”´';
-                    case ProtectionLevel.CAUTION: return 'ðŸŸ¡';
-                    case ProtectionLevel.CLEAR: return 'ðŸŸ¢';
-                    default: return 'âšª';
+                    case ProtectionLevel.LOCKED: return "[LOCKED]";
+                    case ProtectionLevel.PROTECTED: return "[PROTECTED]";
+                    case ProtectionLevel.CAUTION: return "[CAUTION]";
+                    case ProtectionLevel.CLEAR: return "[CLEAR]";
+                    default: return "[NONE]";
                 }
             }
         };
@@ -700,8 +699,8 @@
                         rootCause: 'Conflicting findings at same schedule slot',
                         evidenceSummary: `Both strengthening (${conflict.strengthenCount}) and weakening (${conflict.weakenCount}) patterns detected`,
                         evidenceDetails: [
-                            { icon: 'â†‘', detail: `Strengthen: ${conflict.strengthenTypes}`, type: 'conflict' },
-                            { icon: 'â†“', detail: `Weaken: ${conflict.weakenTypes}`, type: 'conflict' }
+                            { icon: 'UP', detail: `Strengthen: ${conflict.strengthenTypes}`, type: 'conflict' },
+                            { icon: 'DOWN', detail: `Weaken: ${conflict.weakenTypes}`, type: 'conflict' }
                         ],
                         conflictsWith: [],
                         blockedBy: `High variability - ${conflict.details}. Hold changes until patterns stabilize.`,
@@ -3378,9 +3377,9 @@
                     
                     primaryBundles.forEach((primaryBundle, idx) => {
                         // Add recency indicator
-                        const recencyIcon = primaryBundle.hasRecentEvents ? 'âœ“' : 
-                                           primaryBundle.hasLast3DayEvents ? 'â—‹' : 'âš ï¸';
-                        const urgentTag = primaryBundle.isUrgent ? ' ðŸš¨ URGENT' : '';
+                        const recencyIcon = primaryBundle.hasRecentEvents ? '[NEW]' :
+                                           primaryBundle.hasLast3DayEvents ? '[OLD]' : '[STALE]';
+                        const urgentTag = primaryBundle.isUrgent ? ' [URGENT]' : '';
                         const blockTag = primaryBundles.length > 1 ? ` [${primaryBundle.timeBlock}]` : '';
                         
                         output += `### ${primaryBundle.name} ${recencyIcon}${urgentTag}${blockTag}\n\n`;
@@ -3460,8 +3459,8 @@
                 if (referenceBundles.length > 0) {
                     referenceBundles.forEach(bundle => {
                         // Add recency indicator to name
-                        const recencyIcon = bundle.hasRecentEvents ? 'âœ“' : 
-                                           bundle.hasLast3DayEvents ? 'â—‹' : 'âš ï¸';
+                        const recencyIcon = bundle.hasRecentEvents ? '[NEW]' :
+                                           bundle.hasLast3DayEvents ? '[OLD]' : '[STALE]';
                         output += `### ${recencyIcon} ${bundle.name} (Tier ${bundle.tier})\n`;
                         
                         // Generate appropriate status message
@@ -3581,25 +3580,56 @@
                         output += `**TDD:**\n`;
                         output += `- 24-hour: ${analysisResults.tdd24h.toFixed(1)} U\n`;
                         output += `- 2-week avg: ${analysisResults.tdd2Week.toFixed(1)} U\n`;
-                        
-                        if (Math.abs(diffPct) >= 10) {
-                            output += `- **Difference:** ${diffStr} U (${diffPctStr}%) ${diff > 0 ? 'â†‘' : 'â†“'}\n`;
-                        } else {
-                            output += `- Difference: ${diffStr} U (${diffPctStr}%)\n`;
-                        }
-                        output += `\n`;
+                        output += `- **Difference:** ${diffStr} U (${diffPctStr}%) ${diff > 0 ? '↑' : '↓'}\n\n`;
                     } else if (analysisResults.tdd2Week) {
-                        output += `**TDD:** ${analysisResults.tdd2Week.toFixed(1)} U (2-week avg)\n`;
+                        output += `**TDD:** ${analysisResults.tdd2Week.toFixed(1)} U (2-week avg)\n\n`;
                     } else if (analysisResults.tdd24h) {
-                        output += `**TDD:** ${analysisResults.tdd24h.toFixed(1)} U (24-hour)\n`;
+                        output += `**TDD:** ${analysisResults.tdd24h.toFixed(1)} U (24-hour)\n\n`;
                     } else if (analysisResults.tdd) {
-                        output += `**TDD:** ${analysisResults.tdd.toFixed(1)} U\n`;
+                        output += `**TDD:** ${analysisResults.tdd.toFixed(1)} U\n\n`;
                     }
                     
-                    // Display 24h carbs
+                    // Display 24h carbs and key metrics
                     if (analysisResults.totalCarbs24h !== undefined && analysisResults.totalCarbs24h !== null) {
                         output += `**Carbs (24h):** ${analysisResults.totalCarbs24h.toFixed(0)}g\n`;
                     }
+                    if (analysisResults.insulinPerCarb) {
+                        output += `**Insulin per Carb:** ${analysisResults.insulinPerCarb} U/g\n`;
+                    }
+                    // Display Carb-Adjusted Sensitivity with interpretation
+                    if (analysisResults.carbAdjSensitivity) {
+                        const sensitivity = parseFloat(analysisResults.carbAdjSensitivity);
+                        let interpretation = '';
+                        
+                        if (sensitivity >= 1.20) {
+                            interpretation = 'Very High Sensitivity';
+                        } else if (sensitivity >= 1.10) {
+                            interpretation = 'Significantly More Sensitive';
+                        } else if (sensitivity >= 1.05) {
+                            interpretation = 'Moderately More Sensitive';
+                        } else if (sensitivity >= 0.95) {
+                            interpretation = 'Normal Range';
+                        } else if (sensitivity >= 0.90) {
+                            interpretation = 'Moderately Less Sensitive';
+                        } else if (sensitivity >= 0.80) {
+                            interpretation = 'Significantly Less Sensitive';
+                        } else {
+                            interpretation = 'Very Low Sensitivity/Resistant';
+                        }
+                        
+                        const percentChange = ((sensitivity - 1.0) * 100).toFixed(0);
+                        const changeStr = sensitivity >= 1.0 
+                            ? `${percentChange}% more sensitive` 
+                            : `${Math.abs(percentChange)}% less sensitive`;
+                        
+                        output += `**Carb-Adjusted Sensitivity:** ${sensitivity.toFixed(2)}\n`;
+                        output += `  _${interpretation} (${changeStr})_\n`;
+                        output += `  _Formula: Expected TDD for today's carbs ÷ Actual TDD_\n`;
+                    } else {
+                        output += `**Carb-Adjusted Sensitivity:** _Insufficient history (needs 7+ days)_\n`;
+                        output += `  _Will calculate automatically once you have 3+ days logged_\n`;
+                    }
+                    output += `\n`;
                     output += `\n`;
                     
                     output += `**Clean Windows:** ${analysisResults.signalAnalysis.cleanWindows?.total || 0} readings analyzed\n`;
@@ -3730,15 +3760,15 @@
                         const signal = period.signal || 'INSUFFICIENT';
                         const protection = ProtectionSystem.getProtectionIcon(ProtectionLevel.CLEAR);
                         const agpCheck = getAGPCheckForPeriod(period.name);
-                        output += `| ${period.emoji} ${period.name} | ${dev} | ${signal} | ${agpCheck.icon} ${agpCheck.detail} | ${protection} |\n`;
+                        output += `| ${period.name} | ${dev} | ${signal} | ${agpCheck.icon} ${agpCheck.detail} | ${protection} |\n`;
                     });
                     output += `\n`;
                     
                     // Show divergence warnings if any
                     if (divergences.length > 0) {
-                        output += `**âš ï¸ Signal/AGP Divergence Detected:**\n`;
+                        output += `**Signal/AGP Divergence Detected:**\n`;
                         divergences.forEach(d => {
-                            output += `- **${d.emoji} ${d.period}:** ${d.message} â†’ *${d.recommendation}*\n`;
+                            output += `- **${d.period}:** ${d.message} -> *${d.recommendation}*\n`;
                         });
                         output += `\n*Basal changes will not fix meal-driven highs. Consider CR or pre-bolus timing instead.*\n\n`;
                     }
@@ -3746,12 +3776,12 @@
                     // AGP Priority by Period table (FEATURE-003)
                     if (agp7day && agp7day.hourlyStats) {
                         const periodHours = {
-                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: 'ðŸŒ™' },
-                            'Dawn': { hours: [4, 5, 6, 7], emoji: 'ðŸŒ…' },
-                            'Morning': { hours: [8, 9, 10, 11], emoji: 'â˜€ï¸' },
-                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: 'ðŸŒ¤ï¸' },
-                            'Evening': { hours: [17, 18, 19, 20], emoji: 'ðŸŒ†' },
-                            'Sleep Onset': { hours: [21, 22, 23], emoji: 'ðŸ˜´' }
+                            'Deep Sleep': { hours: [0, 1, 2, 3], emoji: '🌙' },
+                            'Dawn': { hours: [4, 5, 6, 7], emoji: '🌅' },
+                            'Morning': { hours: [8, 9, 10, 11], emoji: '☀️' },
+                            'Afternoon': { hours: [12, 13, 14, 15, 16], emoji: '🌤️' },
+                            'Evening': { hours: [17, 18, 19, 20], emoji: '🌆' },
+                            'Sleep Onset': { hours: [21, 22, 23], emoji: '😴' }
                         };
                         
                         const periodStats = [];
@@ -3803,7 +3833,7 @@
                         
                         periodStats.forEach(p => {
                             const hourLabel = this.formatHourLabel(p.worstHour);
-                            output += `| ${p.emoji} ${p.period} | ${p.avgTIR.toFixed(0)}% | ${hourLabel} (${p.worstTIR.toFixed(0)}%) | ${p.focus} |\n`;
+                            output += `| ${p.period} | ${p.avgTIR.toFixed(0)}% | ${hourLabel} (${p.worstTIR.toFixed(0)}%) | ${p.focus} |\n`;
                         });
                         output += `\n`;
                     }
@@ -3817,7 +3847,7 @@
                     
                     // BUG-023: Show safety override warning if active
                     if (analysisResults.basalOptimization.safetyOverride) {
-                        output += `âš ï¸ **Safety Override Active:** ${analysisResults.basalOptimization.safetyOverrideReason}\n\n`;
+                        output += `**Safety Override Active:** ${analysisResults.basalOptimization.safetyOverrideReason}\n\n`;
                     }
                     
                     const dist = analysisResults.basalOptimization.distribution;
@@ -3949,8 +3979,9 @@
                 
                 sortedFindings.forEach((finding, idx) => {
                     // Recency indicator
-                    const recencyIcon = finding.eventsLast24h > 0 ? 'âœ“' : 
-                                       finding.eventsLast3Days > 0 ? 'â—‹' : 
+                    const recencyIcon = finding.eventsLast24h > 0 ? '[NEW]' :
+                                       finding.eventsLast3Days > 0 ? '[OLD]' :
+                                       finding.isStructural ? '[STRUCTURAL]' : '[STALE]';
                                        finding.isStructural ? 'â—' : 'âš ï¸';
                     output += `${idx + 1}. ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
                     output += `   - Severity: ${(finding.severity * 100).toFixed(0)}%\n`;
@@ -3962,11 +3993,9 @@
                 return output;
             },
             
-            // SPEC 1: Generate structured JSON export for Claude analysis
+            // Generate structured JSON export for Claude analysis
             generateStructuredExport(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = []) {
-                const now = new Date();
-                
-                // Calculate AGP for metrics
+                // Calculate AGP (same as formatForClaude)
                 const agp7day = analysisResults.nightscoutData?.glucose 
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7) 
                     : null;
@@ -3974,94 +4003,9 @@
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
                     : null;
                 
-                // Helper: Parse event date from text
-                const parseEventDate = (dateStr) => {
-                    const now = new Date();
-                    if (dateStr === 'today') {
-                        return now.toISOString().split('T')[0];
-                    }
-                    if (dateStr === 'yesterday') {
-                        const yesterday = new Date(now);
-                        yesterday.setDate(yesterday.getDate() - 1);
-                        return yesterday.toISOString().split('T')[0];
-                    }
-                    // Parse "Feb 12" format
-                    const match = dateStr.match(/([A-Z][a-z]+)\s+(\d+)/);
-                    if (match) {
-                        const month = new Date(Date.parse(match[1] + ' 1, 2000')).getMonth();
-                        const day = parseInt(match[2]);
-                        const year = now.getFullYear();
-                        return new Date(year, month, day).toISOString().split('T')[0];
-                    }
-                    return now.toISOString().split('T')[0];
-                };
-                
-                // Helper: Extract events from bundle findings
-                const extractEvents = (bundle) => {
-                    const events = [];
-                    
-                    bundle.findings?.forEach(finding => {
-                        // Skip signal-based findings - they don't have specific events
-                        if (finding.type === FindingType.BASAL_SIGNAL_LOW || 
-                            finding.type === FindingType.BASAL_SIGNAL_HIGH ||
-                            finding.type === FindingType.BASAL_RATIO_EXCEEDED) {
-                            return;
-                        }
-                        
-                        const evidence = finding.evidence || finding.details || '';
-                        
-                        // Parse BG value
-                        const bgMatch = evidence.match(/(\d+)\s*mg\/dL/);
-                        if (!bgMatch) return; // Skip if no BG value found
-                        
-                        const bgValue = parseInt(bgMatch[1]);
-                        if (bgValue === 0) return; // Skip invalid BG readings
-                        
-                        // Parse time
-                        const timeMatch = evidence.match(/at\s+([0-9:]+\s*[AP]M)/i);
-                        // Parse date reference
-                        const dateMatch = evidence.match(/on\s+([A-Z][a-z]+\s+\d+)/i) || 
-                                       evidence.match(/(yesterday|today)/i);
-                        
-                        events.push({
-                            date: dateMatch ? parseEventDate(dateMatch[1]) : new Date().toISOString().split('T')[0],
-                            time: timeMatch ? timeMatch[1] : null,
-                            type: finding.type === FindingType.UNEXPLAINED_LOW ? 'unexplained_low' :
-                                  finding.type === FindingType.ISF_INDUCED_LOW ? 'correction_induced_low' :
-                                  finding.type === FindingType.DIRECT_MEAL_LOW ? 'meal_induced_low' :
-                                  finding.type === FindingType.TRANSIENT_HIGH_LOW ? 'spike_crash' :
-                                  finding.type === FindingType.POST_MEAL_HIGH ? 'post_meal_high' :
-                                  finding.type === FindingType.CORRECTION_INEFFECTIVE ? 'correction_ineffective' :
-                                  finding.type,
-                            bg: bgValue,
-                            context: finding.type === FindingType.UNEXPLAINED_LOW ? 'No IOB, no COB, fasting' :
-                                    finding.type === FindingType.ISF_INDUCED_LOW ? 'Following correction' :
-                                    finding.type === FindingType.DIRECT_MEAL_LOW ? 'Following meal' :
-                                    finding.type === FindingType.TRANSIENT_HIGH_LOW ? 'Spike then crash pattern' :
-                                    finding.type === FindingType.POST_MEAL_HIGH ? 'Post-meal high' :
-                                    'Event detected',
-                            severity: bgValue < 54 ? 'severe' : 
-                                    bgValue < 70 ? 'moderate' : 
-                                    bgValue > 250 ? 'high' : 'mild'
-                        });
-                    });
-                    
-                    return events;
-                };
-                
-                // Helper: Get signal support for a bundle
-                const getSignalSupport = (bundle, analysisResults) => {
-                    if (!bundle.hasStructuralFinding || !analysisResults.signalAnalysis?.periods) {
-                        return null;
-                    }
-                    
-                    // Find matching period by schedule hour
-                    const scheduleHour = bundle.recommendations?.[0]?.scheduleTime ? 
-                        parseInt(bundle.recommendations[0].scheduleTime.split(':')[0]) : null;
-                    
-                    if (scheduleHour === null) return null;
-                    
-                    // Map hour to period name
+                // Helper: AGP check for a period (mirrors formatForClaude logic)
+                const getAGPCheckForPeriod = (periodName) => {
+                    if (!agp7day || !agp7day.hourlyStats) return { status: 'NO_DATA', avgHigh: null, avgLow: null };
                     const periodHoursMap = {
                         'Deep Sleep': [0, 1, 2, 3],
                         'Dawn': [4, 5, 6, 7],
@@ -4070,267 +4014,253 @@
                         'Evening': [17, 18, 19, 20],
                         'Sleep Onset': [21, 22, 23]
                     };
-                    
-                    // Find which period contains this hour
-                    let matchingPeriodName = null;
-                    for (const [periodName, hours] of Object.entries(periodHoursMap)) {
-                        if (hours.includes(scheduleHour)) {
-                            matchingPeriodName = periodName;
-                            break;
-                        }
-                    }
-                    
-                    if (!matchingPeriodName) return null;
-                    
-                    // Find the period data by name
-                    const period = analysisResults.signalAnalysis.periods.find(p => p.name === matchingPeriodName);
-                    
-                    if (!period) return null;
-                    
-                    return {
-                        period: period.name,
-                        deviation: period.medianDeviation,
-                        cleanWindows: period.totalWindows,
-                        signal: period.signal
-                    };
+                    const hours = periodHoursMap[periodName];
+                    if (!hours) return { status: 'UNKNOWN', avgHigh: null, avgLow: null };
+                    const periodStats = hours.map(h => agp7day.hourlyStats[h]).filter(s => s !== null);
+                    if (periodStats.length === 0) return { status: 'NO_DATA', avgHigh: null, avgLow: null };
+                    const avgHigh = periodStats.reduce((sum, s) => sum + s.tir.high + s.tir.veryHigh, 0) / periodStats.length;
+                    const avgLow = periodStats.reduce((sum, s) => sum + s.tir.low + s.tir.veryLow, 0) / periodStats.length;
+                    if (avgHigh > 25) return { status: 'HIGH', avgHigh: Math.round(avgHigh), avgLow: Math.round(avgLow) };
+                    if (avgLow > 5) return { status: 'LOW', avgHigh: Math.round(avgHigh), avgLow: Math.round(avgLow) };
+                    return { status: 'OK', avgHigh: Math.round(avgHigh), avgLow: Math.round(avgLow) };
                 };
                 
-                // Helper: Get AGP check for period
-                const getAGPCheckForPeriod = (periodName, agp7day) => {
-                    if (!agp7day?.hourlyStats) return null;
-                    
-                    const periodHours = {
-                        'Deep Sleep': [0, 1, 2, 3],
-                        'Dawn': [4, 5, 6, 7],
-                        'Morning': [8, 9, 10, 11],
-                        'Afternoon': [12, 13, 14, 15, 16],
-                        'Evening': [17, 18, 19, 20],
-                        'Sleep Onset': [21, 22, 23]
-                    };
-                    
-                    const hours = periodHours[periodName] || [];
-                    const stats = agp7day.hourlyStats.filter(h => hours.includes(h.hour));
-                    
-                    if (stats.length === 0) return null;
-                    
-                    const avgHigh = stats.reduce((sum, h) => sum + h.high, 0) / stats.length;
-                    const avgLow = stats.reduce((sum, h) => sum + h.low, 0) / stats.length;
-                    
-                    return {
-                        status: avgLow > 4 ? 'LOWS' : avgHigh > 25 ? 'HIGH' : 'OK',
-                        avgHigh: Math.round(avgHigh),
-                        avgLow: Math.round(avgLow)
-                    };
-                };
-                
-                // Helper: Check for Signal/AGP divergence
-                const checkDivergence = (period, agpCheck) => {
-                    if (!period || !agpCheck) return null;
-                    
-                    if (period.signal === 'LOW' && agpCheck.status === 'HIGH') {
-                        return {
-                            type: 'SIGNAL_LOW_AGP_HIGH',
-                            recommendation: 'CR/timing issue, NOT basal'
-                        };
+                // Helper: compute divergence for a period
+                const getDivergence = (period) => {
+                    const agpCheck = getAGPCheckForPeriod(period.name);
+                    const signalDir = period.medianDeviation < -10 ? 'LOW' : period.medianDeviation > 10 ? 'HIGH' : 'NEUTRAL';
+                    if (signalDir === 'LOW' && agpCheck.status === 'HIGH') {
+                        return { type: 'SIGNAL_LOW_AGP_HIGH', recommendation: 'CR/timing issue, NOT basal' };
                     }
-                    
-                    if (period.signal === 'HIGH' && agpCheck.status === 'LOWS') {
-                        return {
-                            type: 'SIGNAL_HIGH_AGP_LOW',
-                            recommendation: 'Mixed signals - need more data'
-                        };
+                    if (signalDir === 'HIGH' && agpCheck.status === 'LOW') {
+                        return { type: 'SIGNAL_HIGH_AGP_LOW', recommendation: 'Check for overcorrection cycles or aggressive ISF' };
                     }
-                    
                     return null;
                 };
                 
-                // Build structured JSON
-                const json = {
+                // Helper: map a bundle to an action/watchList JSON object
+                const mapBundle = (bundle) => {
+                    // Determine recency tag
+                    let recency = 'STALE';
+                    if (bundle.hasStructuralFinding) recency = 'STRUCTURAL';
+                    else if (bundle.hasRecentEvents) recency = 'NEW';
+                    else if (bundle.hasLast3DayEvents) recency = 'OLD';
+                    
+                    // Build evidence object
+                    const evidence = {
+                        events: [],
+                        signalSupport: null,
+                        eventsLast24h: bundle.findings?.reduce((sum, f) => sum + (f.eventsLast24h || 0), 0) || 0,
+                        eventsLast3Days: bundle.findings?.reduce((sum, f) => sum + (f.eventsLast3Days || 0), 0) || 0
+                    };
+                    
+                    // Extract events from findings
+                    if (bundle.findings) {
+                        bundle.findings.forEach(f => {
+                            if (f.type === 'unexplained_low' || f.type === 'direct_meal_low' || 
+                                f.type === 'isf_induced_low' || f.type === 'transient_high_low') {
+                                evidence.events.push({
+                                    date: f.eventDate || null,
+                                    time: f.eventTime || f.scheduleTime,
+                                    type: f.type,
+                                    bg: f.lowBG || f.peakBG || null,
+                                    context: f.details?.substring(0, 200) || null,
+                                    severity: f.severity >= 0.8 ? 'severe' : f.severity >= 0.5 ? 'moderate' : 'mild'
+                                });
+                            }
+                            // Signal support from structural findings
+                            if (f.isStructural && f.type === 'basal_signal_low' || f.type === 'basal_signal_high') {
+                                evidence.signalSupport = {
+                                    period: f.period || f.scheduleTime,
+                                    deviation: f.medianDeviation || null,
+                                    signal: f.signal || null
+                                };
+                            }
+                        });
+                    }
+                    
+                    return {
+                        id: bundle.id,
+                        priority: bundle.priority,
+                        tier: bundle.tier,
+                        urgent: bundle.isUrgent || false,
+                        recency,
+                        name: bundle.name,
+                        detector: bundle.findings?.[0]?.type || 'unknown',
+                        timeBlock: bundle.timeBlock || 'General',
+                        rootCause: bundle.rootCause || null,
+                        urgentReason: bundle.urgentReason || null,
+                        recommendations: (bundle.recommendations || []).map(rec => ({
+                            parameter: rec.param,
+                            scheduleTime: rec.scheduleTime,
+                            currentValue: rec.currentValue,
+                            recommendedValue: rec.newValue,
+                            changePercent: rec.changePercent,
+                            protectionLevel: rec.protectionLevel || 'clear'
+                        })),
+                        evidence,
+                        compoundEffect: bundle.compoundEffect?.description ? {
+                            totalChangePercent: bundle.compoundEffect.total || 0,
+                            status: bundle.compoundEffect.warning || 'CLEAR'
+                        } : null,
+                        confidence: bundle.confidence || 0
+                    };
+                };
+                
+                // Build primary actions
+                const primaryBundles = bundles.filter(b => b.priority === 'PRIMARY');
+                const referenceBundles = bundles.filter(b => b.priority === 'REFERENCE');
+                
+                // Build period signals with AGP check and divergence
+                const periodSignals = (analysisResults.signalAnalysis?.periods || []).map(period => ({
+                    name: period.name,
+                    hours: {
+                        'Deep Sleep': [0,1,2,3], 'Dawn': [4,5,6,7], 'Morning': [8,9,10,11],
+                        'Afternoon': [12,13,14,15,16], 'Evening': [17,18,19,20], 'Sleep Onset': [21,22,23]
+                    }[period.name] || [],
+                    medianDeviation: period.medianDeviation,
+                    signal: period.signal || 'INSUFFICIENT',
+                    cleanWindows: period.cleanWindowCount || 0,
+                    agpCheck: getAGPCheckForPeriod(period.name),
+                    divergence: period.medianDeviation !== null ? getDivergence(period) : null
+                }));
+                
+                // Build problem hours from AGP
+                const problemHours = [];
+                if (agp7day?.hourlyStats) {
+                    agp7day.hourlyStats.forEach((stats, hour) => {
+                        if (!stats) return;
+                        const totalLow = stats.tir.low + stats.tir.veryLow;
+                        const totalHigh = stats.tir.high + stats.tir.veryHigh;
+                        let flag = null;
+                        if (totalLow > 5) flag = 'LOWS';
+                        else if (stats.tir.inRange < 70) flag = 'LOW_TIR';
+                        if (flag) {
+                            problemHours.push({
+                                hour,
+                                tir: Math.round(stats.tir.inRange),
+                                highPct: Math.round(totalHigh),
+                                lowPct: Math.round(totalLow),
+                                mean: Math.round(stats.mean),
+                                flag
+                            });
+                        }
+                    });
+                }
+                
+                // Compute 48h delta
+                let trend48hDelta = null;
+                let problemHoursDelta = null;
+                if (agp7day && agp48h) {
+                    trend48hDelta = agp48h.tir.inRange - agp7day.tir.inRange;
+                    const ph7d = agp7day.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
+                    const ph48h = agp48h.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
+                    problemHoursDelta = ph48h - ph7d;
+                }
+                
+                // Assemble structured export
+                const structured = {
                     meta: {
-                        version: "2.3.1",
-                        timestamp: now.toISOString(),
-                        analysisWindow: config?.basalSignalWindow || 7,
+                        version: '2.3.1',
+                        timestamp: new Date().toISOString(),
+                        analysisWindow: config?.analysisWindow || 7,
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
-                            coveragePercent: Math.round((analysisResults.nightscoutData?.glucose?.length || 0) / (7 * 24 * 12) * 100),
-                            cleanWindows: analysisResults.signalAnalysis?.cleanWindows?.total || analysisResults.signalAnalysis?.cleanWindows || 0
+                            coveragePercent: analysisResults.nightscoutData?.glucose ? 
+                                Math.round((analysisResults.nightscoutData.glucose.length / (288 * (config?.analysisWindow || 7))) * 100) : 0,
+                            cleanWindows: analysisResults.signalAnalysis?.cleanWindows?.total || 0
                         }
                     },
-                    
                     state: {
-                        mode: bodyState.state,
+                        mode: this.formatStateName(bodyState.state).toLowerCase(),
                         daysInState: bodyState.daysInState,
-                        overridePercent: bodyState.state === BodyStateType.OVERRIDE_ACTIVE ? bodyState.overridePercent : null,
+                        overridePercent: bodyState.overridePercent || null,
                         contributingFactors: bodyState.contributingFactors || [],
                         basalRatio: analysisResults.basalRatioInfo ? {
                             value: analysisResults.basalRatioInfo.ratio,
                             cap: analysisResults.basalRatioInfo.cap,
                             exceedsCap: analysisResults.basalRatioInfo.exceedsCap,
-                            maxRate: {
-                                value: analysisResults.basalRatioInfo.maxRate,
-                                hour: analysisResults.basalRatioInfo.maxHour
-                            },
-                            minRate: {
-                                value: analysisResults.basalRatioInfo.minRate,
-                                hour: analysisResults.basalRatioInfo.minHour
-                            },
+                            maxRate: { value: analysisResults.basalRatioInfo.maxRate, hour: analysisResults.basalRatioInfo.maxHour },
+                            minRate: { value: analysisResults.basalRatioInfo.minRate, hour: analysisResults.basalRatioInfo.minHour },
                             blockedRecommendations: bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio')).length
                         } : null
                     },
-                    
-                    actions: bundles
-                        .filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0)
-                        .map((bundle, idx) => ({
-                            id: `bundle_${String(idx + 1).padStart(3, '0')}`,
-                            priority: bundle.priority,
-                            tier: bundle.tier,
-                            urgent: bundle.isUrgent || false,
-                            recency: bundle.hasRecentEvents ? 'NEW' : 
-                                    bundle.hasLast3DayEvents ? 'OLD' : 
-                                    bundle.hasStructuralFinding ? 'STRUCTURAL' : 'UNKNOWN',
-                            name: bundle.name,
-                            detector: bundle.findings?.[0]?.type || 'unknown',
-                            timeBlock: bundle.timeBlock,
-                            rootCause: bundle.rootCause,
-                            urgentReason: bundle.urgentReason || null,
-                            recommendations: bundle.recommendations.map(rec => ({
-                                parameter: rec.param,
-                                scheduleTime: rec.scheduleTime,
-                                currentValue: rec.currentValue,
-                                recommendedValue: rec.newValue,
-                                changePercent: rec.changePercent,
-                                protectionLevel: rec.protectionLevel
-                            })),
-                            evidence: {
-                                events: extractEvents(bundle),
-                                signalSupport: getSignalSupport(bundle, analysisResults),
-                                eventsLast24h: bundle.evidenceDetails?.filter(e => e.recency === 'last 24h').length || 0,
-                                eventsLast3Days: bundle.evidenceDetails?.filter(e => e.recency === 'last 3 days').length || 0
-                            },
-                            compoundEffect: bundle.compoundEffect ? {
-                                totalChangePercent: bundle.compoundEffect.total,
-                                status: bundle.compoundEffect.warning || 'CLEAR'
-                            } : null,
-                            confidence: bundle.confidence || null
-                        })),
-                    
-                    watchList: bundles
-                        .filter(b => b.priority === 'REFERENCE')
-                        .map((bundle, idx) => ({
-                            id: `bundle_${String(bundles.filter(b2 => b2.priority === 'PRIMARY').length + idx + 1).padStart(3, '0')}`,
-                            priority: bundle.priority,
-                            tier: bundle.tier,
-                            name: bundle.name,
-                            status: bundle.blockedBy || bundle.demotedReason || 'Deferred',
-                            statusReason: bundle.blockedBy ? 'blocked' : 
-                                        bundle.demotedReason ? 'deferred' : 'unknown',
-                            confidence: bundle.confidence || null,
-                            recency: bundle.hasRecentEvents ? 'NEW' : 
-                                    bundle.hasLast3DayEvents ? 'OLD' : 
-                                    bundle.hasStructuralFinding ? 'STRUCTURAL' : 'UNKNOWN',
-                            recommendations: bundle.recommendations.map(rec => ({
-                                parameter: rec.param,
-                                scheduleTime: rec.scheduleTime,
-                                currentValue: rec.currentValue,
-                                recommendedValue: rec.newValue,
-                                changePercent: rec.changePercent
-                            })),
-                            blockedBy: bundle.blockedBy || null
-                        })),
-                    
+                    actions: primaryBundles.map(mapBundle),
+                    watchList: referenceBundles.map(b => {
+                        const mapped = mapBundle(b);
+                        mapped.status = b.demotedReason || b.blockedBy || 
+                            (b.isSlotConflict ? 'Hold - conflicting patterns' : 'Deferred');
+                        mapped.statusReason = b.demotedReason ? 'demoted' : 
+                            b.blockedBy ? 'blocked' : 
+                            b.isSlotConflict ? 'conflict' : 'deferred';
+                        mapped.blockedBy = b.blockedBy || null;
+                        return mapped;
+                    }),
                     signals: {
                         tdd: {
-                            hour24: analysisResults.tdd24h,
-                            week2Avg: analysisResults.tdd2Week,
-                            diffPercent: analysisResults.tdd2Week ? 
-                                ((analysisResults.tdd24h - analysisResults.tdd2Week) / analysisResults.tdd2Week * 100) : 0,
-                            direction: analysisResults.tdd24h > analysisResults.tdd2Week ? 'UP' : 'DOWN'
+                            hour24: analysisResults.tdd24h || null,
+                            week2Avg: analysisResults.tdd2Week || null,
+                            diffPercent: (analysisResults.tdd24h && analysisResults.tdd2Week) ? 
+                                ((analysisResults.tdd24h - analysisResults.tdd2Week) / analysisResults.tdd2Week) * 100 : null,
+                            direction: (analysisResults.tdd24h && analysisResults.tdd2Week) ?
+                                (analysisResults.tdd24h > analysisResults.tdd2Week ? 'UP' : 
+                                 analysisResults.tdd24h < analysisResults.tdd2Week ? 'DOWN' : 'FLAT') : null
                         },
-                        carbs24h: analysisResults.totalCarbs24h || 0,
+                        carbs24h: analysisResults.totalCarbs24h || null,
                         carbAdjustedSensitivity: analysisResults.carbAdjustedSensitivity || null,
                         basalPercentOfTDD: {
-                            current: analysisResults.signalAnalysis?.currentBasalPercent,
-                            signal: analysisResults.signalAnalysis?.signalOnlyAnchor,
-                            target: dynamicTarget?.targetPercent,
-                            final: analysisResults.signalAnalysis?.finalPercent,
-                            targetSource: dynamicTarget?.source || 'not-available'
+                            current: analysisResults.signalAnalysis?.currentBasalPercent || null,
+                            signal: analysisResults.signalAnalysis?.signalOnlyAnchor || null,
+                            target: analysisResults.effectiveBasalTarget || null,
+                            final: analysisResults.finalPercent || null,
+                            targetSource: analysisResults.effectiveTargetSource || 'not-available'
                         },
-                        weightedDeviation: analysisResults.signalAnalysis?.weightedDeviation,
-                        periods: (analysisResults.signalAnalysis?.periods || []).map(period => {
-                            const agpCheck = getAGPCheckForPeriod(period.name, agp7day);
-                            const divergence = checkDivergence(period, agpCheck);
-                            
-                            // Convert period hours to array if it's a string
-                            let periodHours = period.hours;
-                            if (typeof periodHours === 'string') {
-                                // Parse "00:00-04:00" format
-                                const periodHoursMap = {
-                                    'Deep Sleep': [0, 1, 2, 3],
-                                    'Dawn': [4, 5, 6, 7],
-                                    'Morning': [8, 9, 10, 11],
-                                    'Afternoon': [12, 13, 14, 15, 16],
-                                    'Evening': [17, 18, 19, 20],
-                                    'Sleep Onset': [21, 22, 23]
-                                };
-                                periodHours = periodHoursMap[period.name] || [];
-                            }
-                            
-                            return {
-                                name: period.name,
-                                hours: periodHours,
-                                medianDeviation: period.medianDeviation,
-                                signal: period.signal,
-                                cleanWindows: period.totalWindows,
-                                agpCheck: agpCheck,
-                                divergence: divergence
-                            };
-                        })
+                        weightedDeviation: analysisResults.signalAnalysis?.weightedDeviation || null,
+                        periods: periodSignals
                     },
-                    
-                    agp: agp7day ? {
-                        overall: {
-                            tir: agp7day.overall?.tir ?? agp7day.tir,
-                            gmi: agp7day.overall?.gmi ?? agp7day.gmi,
-                            cv: agp7day.overall?.cv ?? agp7day.cv,
-                            lowPercent: agp7day.overall?.low ?? agp7day.low,
-                            veryLowPercent: agp7day.overall?.veryLow ?? agp7day.veryLow
-                        },
-                        trend48h: agp48h ? {
-                            tir: agp48h.overall?.tir ?? agp48h.tir,
-                            delta: (agp48h.overall?.tir ?? agp48h.tir) - (agp7day.overall?.tir ?? agp7day.tir),
-                            problemHoursDelta: 0 // TODO: Calculate actual delta
+                    agp: {
+                        overall: agp7day ? {
+                            tir: agp7day.tir,
+                            gmi: agp7day.gmi,
+                            cv: agp7day.cv
                         } : null,
-                        problemHours: (agp7day.hourlyStats || [])
-                            .filter(h => h.tir < 70 || h.low > 4)
-                            .map(h => ({
-                                hour: h.hour,
-                                tir: h.tir,
-                                highPct: h.high,
-                                lowPct: h.low,
-                                flag: h.low > 4 ? 'LOWS' : 'LOW_TIR'
-                            }))
-                    } : null,
-                    
-                    recentChanges: {
-                        autoDetected: detectedChanges.map(change => ({
-                            time: change.scheduleTime,
-                            parameter: change.param,
-                            from: change.oldValue,
-                            to: change.newValue,
-                            changePercent: change.changePercent,
-                            detectedDate: change.detectedDate || new Date().toISOString().split('T')[0]
-                        })),
-                        manuallyLogged: [] // TODO: Pull from localStorage or Sheets if available
+                        trend48h: agp48h ? {
+                            tir: agp48h.tir,
+                            delta: trend48hDelta,
+                            problemHoursDelta: problemHoursDelta
+                        } : null,
+                        problemHours
                     },
-                    
+                    recentChanges: {
+                        autoDetected: (detectedChanges || []).map(c => ({
+                            time: c.time,
+                            parameter: c.type,
+                            from: c.from,
+                            to: c.to,
+                            changePercent: c.changePercent,
+                            detectedDate: new Date().toISOString().split('T')[0]
+                        })),
+                        manuallyLogged: (() => {
+                            try {
+                                return ChangeTracker.getRecentChanges(7).map(c => ({
+                                    date: c.date,
+                                    scheduleTime: c.scheduleTime,
+                                    parameter: c.param,
+                                    from: c.oldValue,
+                                    to: c.newValue,
+                                    outcome: c.outcome
+                                }));
+                            } catch(e) { return []; }
+                        })()
+                    },
                     schedules: {
-                        cr: schedules.cr?.map(s => ({ time: s.time, value: s.value })) || [],
-                        isf: schedules.isf?.map(s => ({ time: s.time, value: s.value })) || [],
-                        basal: schedules.basal?.map(s => ({ time: s.time, value: s.value })) || []
+                        cr: schedules.cr || [],
+                        isf: schedules.isf || [],
+                        basal: schedules.basal || []
                     }
                 };
                 
-                return json;
+                return structured;
             },
             
             // Generate contextual prompts for Claude review
@@ -4984,8 +4914,8 @@
             // Google Sheets Logging State
             const [sheetsWebAppUrl, setSheetsWebAppUrl] = useState(() => {
                 try {
-                    return localStorage.getItem('googleSheetsWebAppUrl') || 'https://script.google.com/macros/s/AKfycbzFj05CKepvJJx9l-HYTeNkihHKm6vLxb2zJsC0z2X1KFuEeGl-nxgkwYUfzLetgm09/exec';
-                } catch (e) { return 'https://script.google.com/macros/s/AKfycbzFj05CKepvJJx9l-HYTeNkihHKm6vLxb2zJsC0z2X1KFuEeGl-nxgkwYUfzLetgm09/exec'; }
+                    return localStorage.getItem('googleSheetsWebAppUrl') || 'https://script.google.com/macros/s/AKfycbw4wE8Mft5N9z6PXFTTn5WLkresnqoWbnEKe7rxLqCaFqc6D7_qj41FWxEe86vecN0/exec';
+                } catch (e) { return 'https://script.google.com/macros/s/AKfycbw4wE8Mft5N9z6PXFTTn5WLkresnqoWbnEKe7rxLqCaFqc6D7_qj41FWxEe86vecN0/exec'; }
             });
             const [loggingNotes, setLoggingNotes] = useState('');
             const [logStatus, setLogStatus] = useState('idle'); // idle, logging, success, error
@@ -5474,28 +5404,62 @@
                     (sum, p) => sum + (p.cleanWindowCount || 0), 0
                 ) || 0;
                 
-                // Calculate TDD from iAPS deviceStatus (matches v25 logic)
+                // Calculate basal total from active schedule
+                let basalTotal = 0;
+                if (activeSchedules?.basal && Array.isArray(activeSchedules.basal)) {
+                    // Use the basal array directly, not converted to object
+                    basalTotal = activeSchedules.basal.reduce((sum, entry) => sum + entry.value, 0);
+                } else if (basalSchedule) {
+                    basalTotal = basalSchedule.reduce((sum, entry) => sum + entry.value, 0);
+                }
+                console.log('Basal total for sensitivity calculation:', basalTotal.toFixed(2));
+                
+                // Calculate TDD from iAPS deviceStatus (extract both 24h and 2-week)
                 let tdd = null;
+                let tdd24h = null;
+                let tdd2Week = null;
                 if (nightscoutData?.deviceStatus) {
                     for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
                         const status = nightscoutData.deviceStatus[i];
                         if (status.openaps?.enacted?.reason) {
                             const reason = status.openaps.enacted.reason;
-                            // Try 2-week TDD first (preferred)
+                            // Extract TDD values from reason string
+                            // "Insulin 24h" = Rolling 24-hour insulin delivery (what we want)
+                            // "TDD" = Today's total since midnight (calendar day)
                             const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
+                            const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
+                            
                             if (twoWeekMatch) {
-                                tdd = parseFloat(twoWeekMatch[1]);
-                                break;
+                                tdd2Week = parseFloat(twoWeekMatch[1]);
+                                tdd = tdd2Week; // Prefer 2-week for calculations
                             }
-                            // Fall back to current TDD
-                            const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
-                            if (currentMatch && !tdd) {
-                                tdd = parseFloat(currentMatch[1]);
+                            if (currentMatch) {
+                                tdd24h = parseFloat(currentMatch[1]);
+                                if (!tdd) tdd = tdd24h; // Fallback to 24h
                             }
+                            
+                            if (tdd2Week || tdd24h) break;
                         }
                     }
                 }
-                console.log('TDD from iAPS:', tdd);
+                
+                // Calculate total carbs in last 24 hours
+                let totalCarbs24h = 0;
+                if (nightscoutData?.treatments) {
+                    const now = new Date();
+                    const yesterday = new Date(now - 24 * 60 * 60 * 1000);
+                    
+                    nightscoutData.treatments.forEach(t => {
+                        if (t.carbs && t.carbs > 0 && t.created_at) {
+                            const treatmentTime = new Date(t.created_at);
+                            if (treatmentTime >= yesterday && treatmentTime <= now) {
+                                totalCarbs24h += t.carbs;
+                            }
+                        }
+                    });
+                }
+                
+                console.log('TDD from iAPS:', { tdd, tdd24h, tdd2Week, totalCarbs24h });
                 
                 // Debug: check signalOnlyAnchor
                 console.log('=== Signal % Debug in attemptAutoLog ===');
@@ -5561,6 +5525,10 @@
                     direction: direction,
                     isOverride: isOverrideActive,
                     notes: isOverrideActive ? 'Auto-logged (override)' : 'Auto-logged',
+                    // NEW: TDD and Carb tracking  
+                    tdd24h: tdd24h ? tdd24h.toFixed(1) : '',
+                    tdd2wk: tdd2Week ? tdd2Week.toFixed(1) : '',
+                    carbs24h: totalCarbs24h ? totalCarbs24h.toFixed(0) : '',
                     // Schedule snapshots for change detection (FEATURE-004)
                     // Use activeSchedules (fresh from Nightscout) not React state (stale)
                     schedules: {
@@ -5732,9 +5700,11 @@
                             if (status.openaps?.enacted?.reason) {
                                 const reason = status.openaps.enacted.reason;
                                 
-                                // Extract both TDD values from reason string
+                                // Extract TDD values from reason string
+                                // "Insulin 24h" = Rolling 24-hour insulin delivery (what we want)
+                                // "TDD" = Today's total since midnight (calendar day)
                                 const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                                const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
+                                const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
                                 
                                 if (twoWeekMatch) {
                                     tdd2Week = parseFloat(twoWeekMatch[1]);
@@ -5757,7 +5727,8 @@
                     console.log('TDD extracted:', {
                         tdd24h: tdd24h,
                         tdd2Week: tdd2Week,
-                        usingForSignal: tddForSignal
+                        usingForSignal: tddForSignal,
+                        source: 'Insulin 24h from iAPS enacted string (rolling 24-hour)'
                     });
                     
                     // Calculate total carbs in last 24 hours
@@ -5777,6 +5748,70 @@
                     }
                     
                     console.log('Total carbs (24h):', totalCarbs24h);
+                    
+                    // Calculate Carb-Adjusted Sensitivity from Sheets history
+                    let carbAdjSensitivity = null;
+                    if (sheetsWebAppUrl && tdd24h && totalCarbs24h > 0) {
+                        try {
+                            console.log('Fetching Sheets history for Carb-Adjusted calculation...');
+                            const historyUrl = `${sheetsWebAppUrl}?action=read&days=14`;
+                            const historyResponse = await fetch(historyUrl, {
+                                method: 'GET',
+                                headers: { 'Content-Type': 'application/json' }
+                            });
+                            const historyData = await historyResponse.json();
+                            
+                            if (historyData.success && historyData.entries && historyData.entries.length > 0) {
+                                console.log(`Fetched ${historyData.entries.length} history entries`);
+                                
+                                // Filter valid entries (non-override, has TDD and carbs)
+                                const validEntries = historyData.entries.filter(e => 
+                                    !e.isOverride && 
+                                    e.tdd24h && parseFloat(e.tdd24h) > 0 &&
+                                    e.carbs24h && parseFloat(e.carbs24h) > 0
+                                );
+                                
+                                if (validEntries.length >= 3) {
+                                    // Calculate baseline averages
+                                    const avgTDD = validEntries.reduce((sum, e) => sum + parseFloat(e.tdd24h), 0) / validEntries.length;
+                                    const avgCarbs = validEntries.reduce((sum, e) => sum + parseFloat(e.carbs24h), 0) / validEntries.length;
+                                    
+                                    // Calculate baseline basal
+                                    let baselineBasal = basalTotal; // From earlier calculation
+                                    
+                                    // Calculate baseline bolus per carb
+                                    const avgBolus = avgTDD - baselineBasal;
+                                    const baselineBolusPerCarb = avgBolus / avgCarbs;
+                                    
+                                    // Calculate expected TDD for today's carbs
+                                    const expectedBolus = baselineBolusPerCarb * totalCarbs24h;
+                                    const expectedTDD = expectedBolus + baselineBasal;
+                                    
+                                    // Carb-Adjusted Sensitivity = Expected / Actual
+                                    carbAdjSensitivity = expectedTDD / tdd24h;
+                                    
+                                    console.log('Carb-Adjusted calculation:', {
+                                        validEntries: validEntries.length,
+                                        avgTDD: avgTDD.toFixed(1),
+                                        avgCarbs: avgCarbs.toFixed(0),
+                                        baselineBasal: baselineBasal.toFixed(1),
+                                        baselineBolusPerCarb: baselineBolusPerCarb.toFixed(3),
+                                        todayCarbs: totalCarbs24h,
+                                        expectedTDD: expectedTDD.toFixed(1),
+                                        actualTDD: tdd24h,
+                                        carbAdjSensitivity: carbAdjSensitivity.toFixed(2)
+                                    });
+                                } else {
+                                    console.log(`Insufficient history for Carb-Adjusted calculation (${validEntries.length} entries, need 3+)`);
+                                }
+                            } else {
+                                console.log('No history available from Sheets');
+                            }
+                        } catch (err) {
+                            console.warn('Failed to fetch history for Carb-Adjusted calculation:', err);
+                        }
+                    }
+                    
                     
                     // Run signal analysis with principled ISF/TDD-based calculation
                     const signalAnalysis = SignalAnalysis.analyzeCleanWindows(
@@ -5882,14 +5917,23 @@
                     const aggregatedFindings = aggregateFindings(allFindings);
                     
                     // Calculate current basal percent for comparison
-                    const currentBasalTotal = activeSchedules.basal.reduce((sum, entry, idx, arr) => {
-                        const nextIdx = (idx + 1) % arr.length;
-                        const currentHour = parseInt(entry.time.split(':')[0]);
-                        const nextHour = nextIdx === 0 ? 24 : parseInt(arr[nextIdx].time.split(':')[0]);
-                        const hours = nextHour - currentHour;
-                        return sum + (entry.value * hours);
-                    }, 0);
-                    const currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
+                    let currentBasalTotal = 0;
+                    let currentBasalPercent = null;
+                    
+                    if (activeSchedules?.basal && Array.isArray(activeSchedules.basal)) {
+                        currentBasalTotal = activeSchedules.basal.reduce((sum, entry, idx, arr) => {
+                            const nextIdx = (idx + 1) % arr.length;
+                            const currentHour = parseInt(entry.time.split(':')[0]);
+                            const nextHour = nextIdx === 0 ? 24 : parseInt(arr[nextIdx].time.split(':')[0]);
+                            const hours = nextHour - currentHour;
+                            return sum + (entry.value * hours);
+                        }, 0);
+                        currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
+                    } else {
+                        console.warn('activeSchedules.basal not available, using basalSchedule fallback');
+                        currentBasalTotal = basalSchedule.reduce((sum, entry) => sum + entry.value, 0);
+                        currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
+                    }
                     
                     // BUG-023 FIX 2: Safety override when LOW signals dominate
                     // Count period signals
@@ -6005,7 +6049,9 @@
                         tdd: tddForSignal,  // For calculations (2-week preferred)
                         tdd24h: tdd24h,     // 24-hour TDD for trend comparison
                         tdd2Week: tdd2Week, // 2-week TDD for stable baseline
-                        totalCarbs24h: totalCarbs24h  // Total carbs in last 24h
+                        totalCarbs24h: totalCarbs24h,  // Total carbs in last 24h
+                        insulinPerCarb: (tdd24h && totalCarbs24h > 0) ? (tdd24h / totalCarbs24h).toFixed(3) : null,
+                        carbAdjSensitivity: carbAdjSensitivity ? carbAdjSensitivity.toFixed(2) : null
                     });
                     setBodyState(detectedState);
                     setBundles(processedBundles);
@@ -6153,7 +6199,7 @@
                 
                 try {
                     const schedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule };
-                    console.log('Calling OutputFormatter functions with:', {
+                    console.log('Calling OutputFormatter.formatForClaude with:', {
                         hasAnalysisResults: !!analysisResults,
                         hasBodyState: !!bodyState,
                         bundlesCount: bundles?.length,
@@ -6162,9 +6208,7 @@
                         detectedChangesCount: detectedChanges?.length || 0
                     });
                     
-                    // SPEC 1: Generate BOTH structured JSON and markdown report
-                    console.log('Generating structured JSON export...');
-                    const structuredData = OutputFormatter.generateStructuredExport(
+                    const output = OutputFormatter.formatForClaude(
                         analysisResults,
                         bodyState,
                         bundles,
@@ -6174,61 +6218,50 @@
                         detectedChanges
                     );
                     
-                    console.log('Generating markdown report...');
-                    const markdownReport = OutputFormatter.formatForClaude(
-                        analysisResults,
-                        bodyState,
-                        bundles,
-                        schedules,
-                        CONFIG,
-                        dynamicTarget,
-                        detectedChanges
-                    );
+                    // Generate structured JSON export
+                    let structuredJSON = '';
+                    try {
+                        const structured = OutputFormatter.generateStructuredExport(
+                            analysisResults,
+                            bodyState,
+                            bundles,
+                            schedules,
+                            CONFIG,
+                            dynamicTarget,
+                            detectedChanges
+                        );
+                        structuredJSON = '# STRUCTURED DATA (for Claude analysis)\n\n```json\n' + 
+                            JSON.stringify(structured, null, 2) + '\n```\n\n---\n\n';
+                        console.log('Structured JSON generated, keys:', Object.keys(structured));
+                    } catch (jsonErr) {
+                        console.error('Structured JSON generation failed (continuing with markdown only):', jsonErr);
+                    }
                     
-                    if (!structuredData || !markdownReport) {
-                        console.error('copyForClaudeReview: generation failed', {
-                            hasStructuredData: !!structuredData,
-                            hasMarkdown: !!markdownReport
-                        });
+                    const combinedOutput = structuredJSON + output;
+                    
+                    if (!output) {
+                        console.error('copyForClaudeReview: formatForClaude returned empty');
                         alert('Failed to generate report. Check console for details.');
                         return;
                     }
                     
-                    console.log('Structured data generated:', structuredData);
-                    console.log('Markdown report generated, length:', markdownReport.length);
-                    
-                    // Combine JSON and markdown with clear section headers
-                    const combined = `# STRUCTURED DATA (for Claude analysis)
-
-\`\`\`json
-${JSON.stringify(structuredData, null, 2)}
-\`\`\`
-
----
-
-${markdownReport}`;
-                    
-                    console.log('Combined output length:', combined.length);
-                    console.log('JSON actions count:', structuredData.actions?.length || 0);
-                    console.log('JSON watchList count:', structuredData.watchList?.length || 0);
+                    console.log('Output generated, markdown length:', output.length, 'total length:', combinedOutput.length);
                     
                     try {
-                        await navigator.clipboard.writeText(combined);
+                        await navigator.clipboard.writeText(combinedOutput);
                         setCopyStatus('copied');
                         setTimeout(() => setCopyStatus('idle'), 2000);
-                        console.log('✓ Copied to clipboard successfully (JSON + Markdown)');
                     } catch (clipboardErr) {
                         console.error('Clipboard API failed:', clipboardErr);
                         // Fallback
                         const textarea = document.createElement('textarea');
-                        textarea.value = combined;
+                        textarea.value = combinedOutput;
                         document.body.appendChild(textarea);
                         textarea.select();
                         document.execCommand('copy');
                         document.body.removeChild(textarea);
                         setCopyStatus('copied');
                         setTimeout(() => setCopyStatus('idle'), 2000);
-                        console.log('✓ Copied using fallback method (JSON + Markdown)');
                     }
                 } catch (err) {
                     console.error('copyForClaudeReview error:', err);
@@ -6329,7 +6362,7 @@ ${markdownReport}`;
                                 tdd = parseFloat(twoWeekMatch[1]);
                                 break;
                             }
-                            const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
+                            const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
                             if (currentMatch && !tdd) {
                                 tdd = parseFloat(currentMatch[1]);
                             }
@@ -6727,7 +6760,7 @@ ${markdownReport}`;
                                                     analysisResults.effectiveTargetSource === 'signal-fallback' ? 'text-amber-400' :
                                                     'text-gray-400'
                                                 }`}>
-                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? 'ðŸŽ¯ Dynamic Target' : 
+                                                    {analysisResults.effectiveTargetSource === 'dynamic' ? '🎯 Dynamic Target' : 
                                                      analysisResults.effectiveTargetSource === 'signal-fallback' ? 'ðŸ“¡ Signal Fallback' :
                                                      'ðŸ“Œ Configured Target'}
                                                 </span>
@@ -7019,7 +7052,7 @@ ${markdownReport}`;
                                                             <TierBadge tier={primary.tier} />
                                                             {primary.isUrgent && (
                                                                 <span className="px-2 py-0.5 bg-red-500/20 text-red-400 text-xs rounded-full animate-pulse">
-                                                                    ðŸš¨ URGENT
+                                                                    [URGENT]
                                                                 </span>
                                                             )}
                                                             {primaryBundles.length > 1 && (
@@ -7202,11 +7235,57 @@ ${markdownReport}`;
                                 {analysisResults.signalAnalysis && (
                                     <div className="glass-card rounded-2xl p-6">
                                         <h2 className="text-xl font-bold text-white mb-4">Signals Summary</h2>
+                                        
+                                        {/* Simplified Metrics Display */}
+                                        {(analysisResults.insulinPerCarb || analysisResults.carbAdjSensitivity) && (
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4 pb-4 border-b border-gray-700">
+                                                {analysisResults.insulinPerCarb && (
+                                                    <div className="bg-gray-800/50 rounded-lg p-4">
+                                                        <div className="text-gray-400 text-xs mb-1">Insulin per Carb</div>
+                                                        <div className="text-white font-bold text-2xl">
+                                                            {analysisResults.insulinPerCarb} U/g
+                                                        </div>
+                                                        <div className="text-gray-500 text-xs mt-2">
+                                                            {analysisResults.totalCarbs24h && analysisResults.tdd24h 
+                                                                ? `${analysisResults.tdd24h.toFixed(1)}U ÷ ${analysisResults.totalCarbs24h.toFixed(0)}g`
+                                                                : 'TDD ÷ Carbs'}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                
+                                                <div className="bg-gray-800/50 rounded-lg p-4">
+                                                    <div className="text-gray-400 text-xs mb-1">Carb-Adjusted Sensitivity</div>
+                                                    <div className={`font-bold text-2xl ${
+                                                        analysisResults.carbAdjSensitivity 
+                                                            ? parseFloat(analysisResults.carbAdjSensitivity) >= 1.20 ? 'text-blue-300'
+                                                            : parseFloat(analysisResults.carbAdjSensitivity) >= 1.10 ? 'text-blue-400'
+                                                            : parseFloat(analysisResults.carbAdjSensitivity) >= 1.05 ? 'text-green-300'
+                                                            : parseFloat(analysisResults.carbAdjSensitivity) >= 0.90 ? 'text-green-400'
+                                                            : parseFloat(analysisResults.carbAdjSensitivity) >= 0.80 ? 'text-yellow-400'
+                                                            : 'text-red-400'
+                                                            : 'text-gray-500'
+                                                    }`}>
+                                                        {analysisResults.carbAdjSensitivity || '—'}
+                                                    </div>
+                                                    <div className="text-gray-500 text-xs mt-2">
+                                                        {analysisResults.carbAdjSensitivity 
+                                                            ? (() => {
+                                                                const val = parseFloat(analysisResults.carbAdjSensitivity);
+                                                                const pct = ((val - 1.0) * 100).toFixed(0);
+                                                                return val >= 1.0 
+                                                                    ? `↑ ${pct}% more sensitive`
+                                                                    : `↓ ${Math.abs(pct)}% less sensitive`;
+                                                            })()
+                                                            : 'Needs 3+ days history'}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+                                        
                                         <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                                             {analysisResults.signalAnalysis.periods.map(period => (
                                                 <div key={period.name} className="bg-gray-800/50 rounded-lg p-3">
                                                     <div className="flex items-center gap-2 mb-1">
-                                                        <span>{period.emoji}</span>
                                                         <span className="text-white font-medium text-sm">{period.name}</span>
                                                     </div>
                                                     <div className={`text-lg font-bold font-mono ${
