@@ -5377,6 +5377,8 @@
             };
             
             // Load dynamic basal target from Google Sheets history
+            // Also caches raw entries for reuse by carb-adjusted sensitivity
+            let _cachedSheetsEntries = null;
             const loadDynamicTarget = async () => {
                 console.log('=== loadDynamicTarget called ===');
                 
@@ -5394,6 +5396,10 @@
                         console.log('Dynamic target: No entries found');
                         return null;
                     }
+                    
+                    // Cache entries for reuse by carb-adjusted sensitivity calculation
+                    _cachedSheetsEntries = data.entries;
+                    console.log('Dynamic target: Cached', data.entries.length, 'entries for reuse');
                     
                     // Filter out override rows and rows without signalPercent
                     const validRows = data.entries.filter(row => {
@@ -5991,19 +5997,29 @@
                     let carbAdjSensitivity = null;
                     if (sheetsWebAppUrl && tdd24h && totalCarbs24h > 0) {
                         try {
-                            console.log('Fetching Sheets history for Carb-Adjusted calculation...');
-                            const historyUrl = `${sheetsWebAppUrl}?action=read&days=14`;
-                            const historyData = await jsonpFetch(historyUrl);
+                            // Use cached entries from loadDynamicTarget (avoids redundant JSONP call)
+                            let historyEntries = _cachedSheetsEntries;
                             
-                            if (historyData.success && historyData.entries && historyData.entries.length > 0) {
-                                console.log(`Fetched ${historyData.entries.length} history entries`);
+                            if (!historyEntries) {
+                                // Fallback: fetch if cache is empty (loadDynamicTarget may have failed)
+                                console.log('Carb-Adjusted: No cached entries, fetching via JSONP...');
+                                const historyUrl = `${sheetsWebAppUrl}?action=read&days=14`;
+                                const historyData = await jsonpFetch(historyUrl);
+                                historyEntries = (historyData.success && historyData.entries) ? historyData.entries : [];
+                            } else {
+                                console.log(`Carb-Adjusted: Using ${historyEntries.length} cached entries from loadDynamicTarget`);
+                            }
+                            
+                            if (historyEntries.length > 0) {
+                                console.log(`Carb-Adjusted: Processing ${historyEntries.length} entries`);
                                 
                                 // Filter valid entries (non-override, has TDD and carbs)
-                                const validEntries = historyData.entries.filter(e => 
-                                    !e.isOverride && 
-                                    e.tdd24h && parseFloat(e.tdd24h) > 0 &&
-                                    e.carbs24h && parseFloat(e.carbs24h) > 0
-                                );
+                                const validEntries = historyEntries.filter(e => {
+                                    const isOverride = e.isOverride === true || e.isOverride === 'TRUE' || e.isOverride === 'true';
+                                    return !isOverride && 
+                                        e.tdd24h && parseFloat(e.tdd24h) > 0 &&
+                                        e.carbs24h && parseFloat(e.carbs24h) > 0;
+                                });
                                 
                                 if (validEntries.length >= 3) {
                                     // Calculate baseline averages
