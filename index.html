@@ -4057,23 +4057,39 @@
                     // Extract events from findings
                     if (bundle.findings) {
                         bundle.findings.forEach(f => {
+                            const evt0 = f.events?.[0] || {};
+                            
                             if (f.type === 'unexplained_low' || f.type === 'direct_meal_low' || 
-                                f.type === 'isf_induced_low' || f.type === 'transient_high_low') {
+                                f.type === 'isf_induced_low' || f.type === 'transient_high_low' ||
+                                f.type === 'post_meal_high') {
+                                // Extract BG from the finding's events array (type-specific property names)
+                                const bg = evt0.lowBG || evt0.peakBG || evt0.highBG || null;
+                                
+                                // Extract date from eventTime
+                                let eventDate = null;
+                                try {
+                                    if (f.eventTime) {
+                                        const d = new Date(f.eventTime);
+                                        if (!isNaN(d)) eventDate = d.toISOString().split('T')[0];
+                                    }
+                                } catch(e) {}
+                                
                                 evidence.events.push({
-                                    date: f.eventDate || null,
+                                    date: eventDate,
                                     time: f.eventTime || f.scheduleTime,
                                     type: f.type,
-                                    bg: f.lowBG || f.peakBG || null,
+                                    bg,
                                     context: f.details?.substring(0, 200) || null,
                                     severity: f.severity >= 0.8 ? 'severe' : f.severity >= 0.5 ? 'moderate' : 'mild'
                                 });
                             }
-                            // Signal support from structural findings
-                            if (f.isStructural && f.type === 'basal_signal_low' || f.type === 'basal_signal_high') {
+                            // Signal support from structural findings (fix operator precedence)
+                            if (f.type === 'basal_signal_low' || f.type === 'basal_signal_high') {
                                 evidence.signalSupport = {
                                     period: f.period || f.scheduleTime,
-                                    deviation: f.medianDeviation || null,
-                                    signal: f.signal || null
+                                    deviation: evt0.medianDeviation ?? f.medianDeviation ?? null,
+                                    signal: evt0.signal ?? f.signal ?? null,
+                                    cleanWindows: evt0.cleanWindows ?? null
                                 };
                             }
                         });
@@ -4166,8 +4182,15 @@
                         analysisWindow: config?.analysisWindow || 7,
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
-                            coveragePercent: analysisResults.nightscoutData?.glucose ? 
-                                Math.round((analysisResults.nightscoutData.glucose.length / (288 * (config?.analysisWindow || 7))) * 100) : 0,
+                            coveragePercent: (() => {
+                                // Use AGP reading count (already filtered/deduped for analysis window)
+                                // rather than raw glucose array which may span wider timeframe
+                                const expectedPerDay = 288; // 5-min intervals
+                                const days = config?.analysisWindow || 7;
+                                const actualReadings = agp7day?.readingCount || 
+                                    analysisResults.nightscoutData?.glucose?.length || 0;
+                                return Math.min(100, Math.round((actualReadings / (expectedPerDay * days)) * 100));
+                            })(),
                             cleanWindows: analysisResults.signalAnalysis?.cleanWindows?.total || 0
                         }
                     },
