@@ -6459,16 +6459,35 @@
                         console.error('Structured JSON generation failed (continuing with markdown only):', jsonErr);
                     }
                     
-                    // SPEC 2: Fetch trend history from Sheets and generate trend section
+                    // SPEC 2: Fetch trend history from Sheets using JSONP (bypasses CORS)
                     let trendSection = '';
                     if (sheetsWebAppUrl) {
                         try {
-                            console.log('Fetching trend history from Sheets...');
-                            const historyResponse = await fetch(`${sheetsWebAppUrl}?action=read&days=14`, {
-                                method: 'GET',
-                                headers: { 'Content-Type': 'application/json' }
+                            console.log('Fetching trend history from Sheets via JSONP...');
+                            
+                            const historyData = await new Promise((resolve, reject) => {
+                                const callbackName = '_trendCb_' + Date.now();
+                                const timeout = setTimeout(() => {
+                                    delete window[callbackName];
+                                    reject(new Error('JSONP timeout (10s)'));
+                                }, 10000);
+                                
+                                window[callbackName] = (data) => {
+                                    clearTimeout(timeout);
+                                    delete window[callbackName];
+                                    if (script.parentNode) script.parentNode.removeChild(script);
+                                    resolve(data);
+                                };
+                                
+                                const script = document.createElement('script');
+                                script.src = `${sheetsWebAppUrl}?action=read&days=14&callback=${callbackName}`;
+                                script.onerror = () => {
+                                    clearTimeout(timeout);
+                                    delete window[callbackName];
+                                    reject(new Error('JSONP script load failed'));
+                                };
+                                document.head.appendChild(script);
                             });
-                            const historyData = await historyResponse.json();
                             
                             if (historyData.success && historyData.entries && historyData.entries.length > 0) {
                                 console.log(`Trend history: ${historyData.entries.length} entries from ${historyData.oldestDate} to ${historyData.newestDate}`);
@@ -6487,7 +6506,7 @@
                                 
                                 trendSection = OutputFormatter.generateTrendSection(historyData.entries, currentData);
                             } else {
-                                console.log('Trend history: No entries found');
+                                console.log('Trend history: No entries found or error:', historyData.error);
                                 trendSection = OutputFormatter.generateTrendSection([], null);
                             }
                         } catch (trendErr) {
