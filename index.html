@@ -5995,6 +5995,9 @@
                     
                     // Calculate Carb-Adjusted Sensitivity from Sheets history
                     let carbAdjSensitivity = null;
+                    const basalTotal = activeSchedules?.basal 
+                        ? activeSchedules.basal.reduce((sum, entry) => sum + entry.value, 0)
+                        : 0;
                     console.log('Carb-Adjusted: Gate check -', {
                         hasSheetsUrl: !!sheetsWebAppUrl,
                         tdd24h: tdd24h,
@@ -6506,18 +6509,42 @@
                         console.error('Structured JSON generation failed (continuing with markdown only):', jsonErr);
                     }
                     
-                    // SPEC 2: Fetch trend history from Sheets using JSONP (bypasses CORS)
+                    // SPEC 2: Build trend section from cached Sheets data (no async fetch needed)
                     let trendSection = '';
-                    if (sheetsWebAppUrl) {
+                    if (_cachedSheetsEntries && _cachedSheetsEntries.length > 0) {
                         try {
-                            console.log('Fetching trend history from Sheets via JSONP...');
+                            // Filter to last 14 days from cached entries
+                            const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+                            const recentEntries = _cachedSheetsEntries.filter(e => {
+                                const d = new Date(e.date || e.timestamp);
+                                return d >= fourteenDaysAgo;
+                            });
+                            console.log(`Trend section: Using ${recentEntries.length} cached entries (of ${_cachedSheetsEntries.length} total)`);
                             
+                            // Build current session data for comparison
+                            const currentData = {
+                                primaryActions: (bundles || []).filter(b => b.priority === 'PRIMARY').map(b => ({
+                                    name: b.name,
+                                    timeBlock: b.timeBlock || 'General'
+                                })),
+                                watchItems: (bundles || []).filter(b => b.priority === 'REFERENCE').map(b => ({
+                                    name: b.name,
+                                    status: b.demotedReason || b.blockedBy || 'deferred'
+                                }))
+                            };
+                            
+                            trendSection = OutputFormatter.generateTrendSection(recentEntries, currentData);
+                        } catch (trendErr) {
+                            console.error('Trend section generation failed:', trendErr);
+                            trendSection = '# TREND CONTEXT\n\n_Error generating trend section_\n\n---\n\n';
+                        }
+                    } else if (sheetsWebAppUrl) {
+                        // Fallback: fetch if no cache (shouldn't happen normally)
+                        try {
+                            console.log('Trend section: No cache, fetching via JSONP...');
                             const historyData = await jsonpFetch(`${sheetsWebAppUrl}?action=read&days=14`);
                             
                             if (historyData.success && historyData.entries && historyData.entries.length > 0) {
-                                console.log(`Trend history: ${historyData.entries.length} entries from ${historyData.oldestDate} to ${historyData.newestDate}`);
-                                
-                                // Build current session data for comparison
                                 const currentData = {
                                     primaryActions: (bundles || []).filter(b => b.priority === 'PRIMARY').map(b => ({
                                         name: b.name,
@@ -6528,11 +6555,7 @@
                                         status: b.demotedReason || b.blockedBy || 'deferred'
                                     }))
                                 };
-                                
                                 trendSection = OutputFormatter.generateTrendSection(historyData.entries, currentData);
-                            } else {
-                                console.log('Trend history: No entries found or error:', historyData.error);
-                                trendSection = OutputFormatter.generateTrendSection([], null);
                             }
                         } catch (trendErr) {
                             console.error('Trend history fetch failed (continuing without trends):', trendErr);
@@ -6553,20 +6576,38 @@
                     console.log('Output generated, markdown length:', output.length, 'total length:', combinedOutput.length);
                     
                     try {
-                        await navigator.clipboard.writeText(combinedOutput);
-                        setCopyStatus('copied');
-                        setTimeout(() => setCopyStatus('idle'), 2000);
+                        // Try modern Clipboard API first
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            await navigator.clipboard.writeText(combinedOutput);
+                            setCopyStatus('copied');
+                            setTimeout(() => setCopyStatus('idle'), 2000);
+                        } else {
+                            throw new Error('Clipboard API not available');
+                        }
                     } catch (clipboardErr) {
                         console.error('Clipboard API failed:', clipboardErr);
-                        // Fallback
+                        // iOS-compatible fallback: element must be visible and use setSelectionRange
                         const textarea = document.createElement('textarea');
                         textarea.value = combinedOutput;
+                        textarea.setAttribute('readonly', '');
+                        textarea.style.position = 'fixed';
+                        textarea.style.left = '0';
+                        textarea.style.top = '0';
+                        textarea.style.opacity = '0.01';
+                        textarea.style.width = '1px';
+                        textarea.style.height = '1px';
                         document.body.appendChild(textarea);
-                        textarea.select();
-                        document.execCommand('copy');
+                        textarea.focus();
+                        textarea.setSelectionRange(0, combinedOutput.length);
+                        const success = document.execCommand('copy');
                         document.body.removeChild(textarea);
-                        setCopyStatus('copied');
-                        setTimeout(() => setCopyStatus('idle'), 2000);
+                        if (success) {
+                            setCopyStatus('copied');
+                            setTimeout(() => setCopyStatus('idle'), 2000);
+                        } else {
+                            setCopyStatus('idle');
+                            alert('Copy failed on this browser. Try long-pressing the button, or use Chrome/Safari.');
+                        }
                     }
                 } catch (err) {
                     console.error('copyForClaudeReview error:', err);
