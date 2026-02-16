@@ -3,7 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.3.1 (JSON Export - Fixed)</title>
+    <title>Daily Insulin Settings Review v2.3.2 (Google Sheets Logging - Fixed)</title>
+    <!-- 
+        CHANGELOG v2.3.2:
+        - Fixed Google Sheets logging: Added 4 missing trend columns to payload
+          * tir7d: 7-day Time in Range from AGP
+          * basalRatio: Current basal ratio (max/min)
+          * primaryActions: JSON array of PRIMARY priority bundles
+          * watchItems: JSON array of REFERENCE priority bundles
+    -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -6397,7 +6405,27 @@ ${markdownReport}`;
                         basal: scheduleToObject(basalSchedule),
                         cr: scheduleToObject(crSchedule),
                         isf: scheduleToObject(isfSchedule)
-                    }
+                    },
+                    // Trend summary fields (for long-term tracking)
+                    tir7d: analysisResults?.agp?.overall?.tir?.toFixed?.(1) || '',
+                    basalRatio: analysisResults?.basalRatioInfo?.ratio?.toFixed?.(1) || '',
+                    primaryActions: JSON.stringify(
+                        bundles
+                            .filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0)
+                            .map(b => ({
+                                name: b.name,
+                                tier: b.tier,
+                                timeBlock: b.timeBlock
+                            }))
+                    ),
+                    watchItems: JSON.stringify(
+                        bundles
+                            .filter(b => b.priority === 'REFERENCE')
+                            .map(b => ({
+                                name: b.name,
+                                status: b.blockedBy || b.demotedReason || 'Deferred'
+                            }))
+                    )
                 };
                 
                 try {
