@@ -5995,6 +5995,13 @@
                     
                     // Calculate Carb-Adjusted Sensitivity from Sheets history
                     let carbAdjSensitivity = null;
+                    console.log('Carb-Adjusted: Gate check -', {
+                        hasSheetsUrl: !!sheetsWebAppUrl,
+                        tdd24h: tdd24h,
+                        totalCarbs24h: totalCarbs24h,
+                        cacheSize: _cachedSheetsEntries ? _cachedSheetsEntries.length : 'NULL',
+                        willEnter: !!(sheetsWebAppUrl && tdd24h && totalCarbs24h > 0)
+                    });
                     if (sheetsWebAppUrl && tdd24h && totalCarbs24h > 0) {
                         try {
                             // Use cached entries from loadDynamicTarget (avoids redundant JSONP call)
@@ -6011,7 +6018,15 @@
                             }
                             
                             if (historyEntries.length > 0) {
-                                console.log(`Carb-Adjusted: Processing ${historyEntries.length} entries`);
+                                // Log first entry fields for debugging
+                                const sample = historyEntries[0];
+                                console.log('Carb-Adjusted: Sample entry fields:', Object.keys(sample));
+                                console.log('Carb-Adjusted: Sample entry values:', {
+                                    tdd24h: sample.tdd24h, 
+                                    carbs24h: sample.carbs24h, 
+                                    isOverride: sample.isOverride,
+                                    date: sample.date
+                                });
                                 
                                 // Filter valid entries (non-override, has TDD and carbs)
                                 const validEntries = historyEntries.filter(e => {
@@ -6020,6 +6035,8 @@
                                         e.tdd24h && parseFloat(e.tdd24h) > 0 &&
                                         e.carbs24h && parseFloat(e.carbs24h) > 0;
                                 });
+                                
+                                console.log(`Carb-Adjusted: ${validEntries.length} valid of ${historyEntries.length} total entries`);
                                 
                                 if (validEntries.length >= 3) {
                                     // Calculate baseline averages
@@ -6058,8 +6075,10 @@
                                 console.log('No history available from Sheets');
                             }
                         } catch (err) {
-                            console.warn('Failed to fetch history for Carb-Adjusted calculation:', err);
+                            console.warn('Carb-Adjusted: ERROR:', err.message, err.stack);
                         }
+                    } else {
+                        console.log('Carb-Adjusted: Skipped - gate check failed');
                     }
                     
                     
