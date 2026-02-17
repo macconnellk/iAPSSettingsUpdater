@@ -3,8 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.3.3 (Google Sheets Logging - Complete)</title>
+    <title>Daily Insulin Settings Review v2.3.4 (Google Sheets Logging - Complete Fix)</title>
     <!-- 
+        CHANGELOG v2.3.4:
+        - Fixed: AGP now calculated during analysis and stored in analysisResults
+        - Fixed: Corrected TIR access path (agp.tir.inRange vs agp.overall.tir)
+        - All 9 Google Sheets columns now populate correctly
+        
         CHANGELOG v2.3.3:
         - Fixed missing TDD and carbs fields: tdd24h, tdd2wk, carbs24h
         - Now all 9 fields populate correctly in Google Sheets
@@ -5789,6 +5794,13 @@
                     
                     console.log('Total carbs (24h):', totalCarbs24h);
                     
+                    // Calculate AGP for 7-day TIR (needed for logging)
+                    const agp7day = nightscoutData.glucose 
+                        ? MarkdownExporter.calculateAGP(nightscoutData.glucose, 7)
+                        : null;
+                    
+                    console.log('AGP 7-day TIR:', agp7day?.tir?.inRange?.toFixed(1) || 'N/A');
+                    
                     // Run signal analysis with principled ISF/TDD-based calculation
                     const signalAnalysis = SignalAnalysis.analyzeCleanWindows(
                         nightscoutData, 
@@ -6016,7 +6028,8 @@
                         tdd: tddForSignal,  // For calculations (2-week preferred)
                         tdd24h: tdd24h,     // 24-hour TDD for trend comparison
                         tdd2Week: tdd2Week, // 2-week TDD for stable baseline
-                        totalCarbs24h: totalCarbs24h  // Total carbs in last 24h
+                        totalCarbs24h: totalCarbs24h,  // Total carbs in last 24h
+                        agp: agp7day  // 7-day AGP for TIR logging
                     });
                     setBodyState(detectedState);
                     setBundles(processedBundles);
@@ -6413,7 +6426,7 @@ ${markdownReport}`;
                         isf: scheduleToObject(isfSchedule)
                     },
                     // Trend summary fields (for long-term tracking)
-                    tir7d: analysisResults?.agp?.overall?.tir?.toFixed?.(1) || '',
+                    tir7d: analysisResults?.agp?.tir?.inRange?.toFixed?.(1) || '',
                     basalRatio: analysisResults?.basalRatioInfo?.ratio?.toFixed?.(1) || '',
                     primaryActions: JSON.stringify(
                         bundles
