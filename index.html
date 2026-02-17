@@ -3,8 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.3.5 (Google Sheets Logging - Runtime Fix)</title>
+    <title>Daily Insulin Settings Review v2.3.6 (Auto-Log Fixed)</title>
     <!-- 
+        CHANGELOG v2.3.6:
+        - Fixed: Updated attemptAutoLog (auto-log function) with all 9 fields
+        - Both manual and auto-log now send complete data to Google Sheets
+        - Added debug logging for all calculated values
+        
         CHANGELOG v2.3.5:
         - Fixed: Changed MarkdownExporter to OutputFormatter (correct object reference)
         - Resolves "MarkdownExporter is not defined" runtime error
@@ -5456,7 +5461,7 @@
             };
             
             // Auto-log to Google Sheets after analysis
-            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules) => {
+            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules, tdd24h, tdd2Week, totalCarbs24h, agp7day, bundles) => {
                 console.log('=== attemptAutoLog called ===');
                 console.log('Sheets URL:', sheetsWebAppUrl);
                 console.log('State:', state.state);
@@ -5494,33 +5499,15 @@
                     (sum, p) => sum + (p.cleanWindowCount || 0), 0
                 ) || 0;
                 
-                // Calculate TDD from iAPS deviceStatus (matches v25 logic)
-                let tdd = null;
-                if (nightscoutData?.deviceStatus) {
-                    for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
-                        const status = nightscoutData.deviceStatus[i];
-                        if (status.openaps?.enacted?.reason) {
-                            const reason = status.openaps.enacted.reason;
-                            // Try 2-week TDD first (preferred)
-                            const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                            if (twoWeekMatch) {
-                                tdd = parseFloat(twoWeekMatch[1]);
-                                break;
-                            }
-                            // Fall back to current TDD
-                            const currentMatch = reason.match(/TDD (\d+\.?\d*)/);
-                            if (currentMatch && !tdd) {
-                                tdd = parseFloat(currentMatch[1]);
-                            }
-                        }
-                    }
-                }
-                console.log('TDD from iAPS:', tdd);
-                
                 // Debug: check signalOnlyAnchor
                 console.log('=== Signal % Debug in attemptAutoLog ===');
                 console.log('signalAnalysis?.signalOnlyAnchor:', signalAnalysis?.signalOnlyAnchor);
                 console.log('targetPercent:', targetPercent);
+                console.log('tdd24h:', tdd24h);
+                console.log('tdd2Week:', tdd2Week);
+                console.log('totalCarbs24h:', totalCarbs24h);
+                console.log('TIR 7d:', agp7day?.tir?.inRange);
+                console.log('Basal ratio:', basalRatioInfo?.ratio);
                 
                 // Calculate signal % from signal analysis
                 const signalPercent = signalAnalysis?.signalOnlyAnchor || targetPercent;
@@ -5565,7 +5552,6 @@
                     date: getLocalDateString(),
                     timestamp: new Date().toISOString(),
                     analysisWindow: basalSignalWindow,
-                    tdd: tdd ? tdd.toFixed(1) : '',
                     signalPercent: signalPercent?.toFixed?.(1) || String(signalPercent) || '',
                     targetPercent: targetPercent,
                     gap: gap.toFixed(1),
@@ -5587,7 +5573,30 @@
                         basal: scheduleToObject(activeSchedules?.basal || basalSchedule),
                         cr: scheduleToObject(activeSchedules?.cr || crSchedule),
                         isf: scheduleToObject(activeSchedules?.isf || isfSchedule)
-                    }
+                    },
+                    // Trend summary fields (for long-term tracking)
+                    tdd24h: tdd24h?.toFixed?.(1) || '',
+                    tdd2wk: tdd2Week?.toFixed?.(1) || '',
+                    carbs24h: totalCarbs24h?.toFixed?.(0) || '',
+                    tir7d: agp7day?.tir?.inRange?.toFixed?.(1) || '',
+                    basalRatio: basalRatioInfo?.ratio?.toFixed?.(1) || '',
+                    primaryActions: JSON.stringify(
+                        (bundles || [])
+                            .filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0)
+                            .map(b => ({
+                                name: b.name,
+                                tier: b.tier,
+                                timeBlock: b.timeBlock
+                            }))
+                    ),
+                    watchItems: JSON.stringify(
+                        (bundles || [])
+                            .filter(b => b.priority === 'REFERENCE')
+                            .map(b => ({
+                                name: b.name,
+                                status: b.blockedBy || b.demotedReason || 'Deferred'
+                            }))
+                    )
                 };
                 
                 console.log('Auto-log payload:', payload);
@@ -6040,7 +6049,7 @@
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
-                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules);
+                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, tdd24h, tdd2Week, totalCarbs24h, agp7day, processedBundles);
                     
                 } catch (err) {
                     console.error('Analysis error:', err);
@@ -6450,6 +6459,8 @@ ${markdownReport}`;
                             }))
                     )
                 };
+                
+                console.log('📤 Payload being sent to Google Sheets:', payload);
                 
                 try {
                     // POST with no-cors for Apps Script compatibility
