@@ -3,8 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.3.2 (Google Sheets Logging - Fixed)</title>
+    <title>Daily Insulin Settings Review v2.3.3 (Google Sheets Logging - Complete)</title>
     <!-- 
+        CHANGELOG v2.3.3:
+        - Fixed missing TDD and carbs fields: tdd24h, tdd2wk, carbs24h
+        - Now all 9 fields populate correctly in Google Sheets
+        
         CHANGELOG v2.3.2:
         - Fixed Google Sheets logging: Added 4 missing trend columns to payload
           * tir7d: 7-day Time in Range from AGP
@@ -6384,7 +6388,9 @@ ${markdownReport}`;
                     date: getLocalDateString(),
                     timestamp: new Date().toISOString(),
                     analysisWindow: basalSignalWindow,
-                    tdd: tdd ? tdd.toFixed(1) : '',
+                    tdd24h: analysisResults?.tdd24h?.toFixed?.(1) || '',
+                    tdd2wk: analysisResults?.tdd2Week?.toFixed?.(1) || '',
+                    carbs24h: analysisResults?.totalCarbs24h?.toFixed?.(0) || '',
                     signalPercent: signalPercent?.toFixed?.(1) || String(signalPercent) || '',
                     targetPercent: targetPercent,
                     gap: gap.toFixed(1),
