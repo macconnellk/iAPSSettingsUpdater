@@ -3,8 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v2.3.4 (Google Sheets Logging - Complete Fix)</title>
+    <title>Daily Insulin Settings Review v2.3.5 (Google Sheets Logging - Runtime Fix)</title>
     <!-- 
+        CHANGELOG v2.3.5:
+        - Fixed: Changed MarkdownExporter to OutputFormatter (correct object reference)
+        - Resolves "MarkdownExporter is not defined" runtime error
+        
         CHANGELOG v2.3.4:
         - Fixed: AGP now calculated during analysis and stored in analysisResults
         - Fixed: Corrected TIR access path (agp.tir.inRange vs agp.overall.tir)
@@ -5796,7 +5800,7 @@
                     
                     // Calculate AGP for 7-day TIR (needed for logging)
                     const agp7day = nightscoutData.glucose 
-                        ? MarkdownExporter.calculateAGP(nightscoutData.glucose, 7)
+                        ? OutputFormatter.calculateAGP(nightscoutData.glucose, 7)
                         : null;
                     
                     console.log('AGP 7-day TIR:', agp7day?.tir?.inRange?.toFixed(1) || 'N/A');
