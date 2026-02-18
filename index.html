@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.3.1 - Review Guidance Debug</title>
+    <title>Daily Insulin Settings Review v3.3.2 - Review Guidance Fixed</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -3330,7 +3330,7 @@
                 return Math.round(avgTIR);
             },
             
-            formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = []) {
+            formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], cachedHistory = []) {
                 const now = new Date();
                 const dateStr = now.toLocaleDateString('en-US', { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
@@ -3980,7 +3980,9 @@
                     analysisResults.findings,
                     bundles,
                     analysisResults.signalAnalysis,
-                    bodyState
+                    bodyState,
+                    agp7day, // Pass AGP data for period prioritization
+                    cachedHistory // Pass history for period TIR trends
                 );
                 output += this.formatClaudeReviewPrompts(reviewPrompts);
                 
@@ -7029,7 +7031,8 @@
                         schedules,
                         CONFIG,
                         dynamicTarget,
-                        detectedChanges
+                        detectedChanges,
+                        cachedSheetsEntries || [] // Pass cached history for period TIR trends
                     );
                     
                     // SPEC 3: Extract yesterday's entry from cache for delta comparison
