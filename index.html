@@ -3304,6 +3304,32 @@
         // =========================================================================
         
         const OutputFormatter = {
+            // Period-to-hours mapping (shared constant)
+            PERIOD_HOURS: {
+                'Deep Sleep': [0, 1, 2, 3],
+                'Dawn': [4, 5, 6, 7],
+                'Morning': [8, 9, 10, 11],
+                'Afternoon': [12, 13, 14, 15, 16],
+                'Evening': [17, 18, 19, 20],
+                'Sleep Onset': [21, 22, 23]
+            },
+            
+            // Calculate average TIR for a period from AGP hourly stats
+            calculatePeriodTIR(agp7day, periodName) {
+                if (!agp7day || !agp7day.hourlyStats) return null;
+                const hours = this.PERIOD_HOURS[periodName];
+                if (!hours) return null;
+                
+                const periodStats = hours
+                    .map(h => agp7day.hourlyStats[h])
+                    .filter(s => s !== null);
+                
+                if (periodStats.length === 0) return null;
+                
+                const avgTIR = periodStats.reduce((sum, s) => sum + s.tir.inRange, 0) / periodStats.length;
+                return Math.round(avgTIR);
+            },
+            
             formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = []) {
                 const now = new Date();
                 const dateStr = now.toLocaleDateString('en-US', { 
@@ -4420,259 +4446,250 @@
             },
             
             // Generate contextual prompts for Claude review
-            generateClaudeReviewPrompts(findings, bundles, signalAnalysis, bodyState) {
+            generateClaudeReviewPrompts(findings, bundles, signalAnalysis, bodyState, agpData = null, historyEntries = []) {
+                // AGP-first review guidance implementation
+                
                 const prompts = {
-                    contextCheck: [],
-                    followUp: [],
-                    memoryCandidates: []
+                    turn1ContextByPeriod: [],
+                    sessionContinuity: {
+                        autoDetected: [],
+                        manualLogged: [],
+                        periodTrends: [],
+                        streakAlerts: []
+                    },
+                    decisionMap: []
                 };
                 
-                // Helper to check if finding is recent
-                const isRecent = (f) => f.eventsLast24h > 0;
-                const isLast3Days = (f) => f.eventsLast3Days > 0;
-                
-                // Helper to extract actual event time and date from details string
-                const extractEventTimeAndDate = (details) => {
-                    // Match patterns like "at 12:47 PM yesterday" or "at 1:44 AM on Jan 5"
-                    const match = details?.match(/at (\d{1,2}:\d{2} [AP]M)\s+(yesterday|today|on [A-Za-z]+ \d+)/i);
-                    if (match) {
-                        return {
-                            time: match[1],
-                            dateRef: match[2],
-                            full: `${match[1]} ${match[2]}`
-                        };
-                    }
-                    return null;
+                // Helper: map timeBlock to period name
+                const mapTimeBlockToPeriod = (timeBlock) => {
+                    const mapping = {
+                        'Overnight': 'Deep Sleep',
+                        'Morning': 'Morning',
+                        'Afternoon': 'Afternoon',
+                        'Evening': 'Evening',
+                        'General': null
+                    };
+                    return mapping[timeBlock] || null;
                 };
                 
-                // Helper to get sortable timestamp from date reference
-                const getDateSortKey = (dateRef, timeStr) => {
-                    const now = new Date();
-                    let date = new Date(now);
+                // Helper: get AGP priority for periods
+                const getAGPPriority = () => {
+                    if (!agpData?.hourlyStats) return [];
                     
-                    if (dateRef === 'today') {
-                        // Keep today's date
-                    } else if (dateRef === 'yesterday') {
-                        date.setDate(date.getDate() - 1);
-                    } else {
-                        // Parse "on Jan 5" style
-                        const monthMatch = dateRef.match(/on ([A-Za-z]+) (\d+)/i);
-                        if (monthMatch) {
-                            const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-                            const monthIdx = monthNames.indexOf(monthMatch[1].toLowerCase().substring(0, 3));
-                            if (monthIdx >= 0) {
-                                date.setMonth(monthIdx);
-                                date.setDate(parseInt(monthMatch[2]));
-                                // If this date is in the future, it's from last year
-                                if (date > now) {
-                                    date.setFullYear(date.getFullYear() - 1);
-                                }
+                    const priorities = [];
+                    for (const [periodName, hours] of Object.entries(this.PERIOD_HOURS)) {
+                        const periodStats = hours
+                            .map(h => agpData.hourlyStats[h])
+                            .filter(s => s !== null);
+                        
+                        if (periodStats.length === 0) continue;
+                        
+                        const avgTIR = periodStats.reduce((sum, s) => sum + s.tir.inRange, 0) / periodStats.length;
+                        const avgHigh = periodStats.reduce((sum, s) => sum + s.tir.high + s.tir.veryHigh, 0) / periodStats.length;
+                        const worstHour = Math.min(...periodStats.map(s => s.tir.inRange));
+                        
+                        priorities.push({
+                            period: periodName,
+                            avgTIR: Math.round(avgTIR),
+                            avgHigh: Math.round(avgHigh),
+                            worstHour,
+                            focus: avgTIR < 60 ? 'HIGH' : (avgTIR < 70 ? 'MEDIUM' : 'LOW')
+                        });
+                    }
+                    
+                    return priorities.sort((a, b) => a.avgTIR - b.avgTIR);
+                };
+                
+                // ===== TURN 1: CONTEXT BY PROBLEM PERIOD =====
+                const agpPriorities = getAGPPriority();
+                const problemPeriods = agpPriorities.filter(p => p.avgTIR < 70);
+                
+                for (const period of problemPeriods) {
+                    const periodContext = {
+                        period: period.period,
+                        tir: period.avgTIR,
+                        focus: period.focus === 'HIGH' ? '🔴' : '🟡',
+                        questions: []
+                    };
+                    
+                    // Get divergence for this period
+                    const periodData = signalAnalysis?.periods?.find(p => p.name === period.period);
+                    if (periodData?.divergence) {
+                        periodContext.divergence = periodData.divergence;
+                    }
+                    
+                    // Find bundles/findings for this period
+                    const periodBundles = bundles.filter(b => {
+                        const mappedPeriod = mapTimeBlockToPeriod(b.timeBlock);
+                        return mappedPeriod === period.period;
+                    });
+                    
+                    // Generate context questions for this period
+                    for (const bundle of periodBundles) {
+                        // Post-meal highs
+                        if (bundle.detector === 'post_meal_high') {
+                            const finding = bundle.findings?.[0];
+                            if (finding?.eventsLast24h > 0) {
+                                const carbMatch = finding.details?.match(/(\d+)g/);
+                                const peakMatch = finding.details?.match(/Peak (\d+)/);
+                                const timeMatch = finding.details?.match(/Meal at ([^(]+)/);
+                                periodContext.questions.push({
+                                    q: `Meal at ${timeMatch?.[1]?.trim() || bundle.scheduleTime} (${carbMatch?.[1] || '?'}g → ${peakMatch?.[1] || '?'} peak). What was eaten? Pre-bolus timing?`,
+                                    impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.param}`).join(', ') || 'meal management'
+                                });
                             }
+                        }
+                        
+                        // Unexplained lows
+                        if (bundle.detector === 'unexplained_low') {
+                            const finding = bundle.findings?.[0];
+                            if (finding?.eventsLast24h > 0) {
+                                const timeMatch = finding.details?.match(/at (\d{1,2}:\d{2} [AP]M)/);
+                                periodContext.questions.push({
+                                    q: `Unexplained low at ${timeMatch?.[1] || bundle.scheduleTime}. Any skipped snack or extra activity?`,
+                                    impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.param}`).join(', ') || 'basal timing'
+                                });
+                            }
+                        }
+                        
+                        // Direct meal lows
+                        if (bundle.detector === 'direct_meal_low') {
+                            const finding = bundle.findings?.[0];
+                            if (finding?.eventsLast24h > 0) {
+                                periodContext.questions.push({
+                                    q: `Meal-induced low in ${period.period}. Carb count accurate? Meal timing consistent?`,
+                                    impacts: `${bundle.scheduleTime} CR`
+                                });
+                            }
+                        }
+                        
+                        // CR conflicts
+                        if (bundle.isSlotConflict) {
+                            periodContext.questions.push({
+                                q: `CR conflict at ${bundle.scheduleTime} (strengthen vs weaken). Are meals at this time consistent day-to-day, or highly variable?`,
+                                impacts: 'whether to hold CR changes or act'
+                            });
                         }
                     }
                     
-                    // Parse time
-                    const timeMatch = timeStr?.match(/(\d{1,2}):(\d{2}) ([AP]M)/i);
-                    if (timeMatch) {
-                        let hours = parseInt(timeMatch[1]);
-                        const minutes = parseInt(timeMatch[2]);
-                        const isPM = timeMatch[3].toUpperCase() === 'PM';
-                        if (isPM && hours !== 12) hours += 12;
-                        if (!isPM && hours === 12) hours = 0;
-                        date.setHours(hours, minutes, 0, 0);
-                    }
-                    
-                    return date.getTime();
-                };
-                
-                // ============================================
-                // CONTEXT CHECK - Last 24h only (âœ“ events)
-                // ============================================
-                
-                // Unexplained lows â†’ ask about activity (LAST 24H ONLY)
-                const unexplainedLows = findings.filter(f => 
-                    f.type === 'unexplained_low' && isRecent(f)
-                );
-                if (unexplainedLows.length > 0) {
-                    // Extract time/date info and sort chronologically
-                    const lowsWithTime = unexplainedLows.map(f => {
-                        const extracted = extractEventTimeAndDate(f.details);
-                        return {
-                            finding: f,
-                            timeInfo: extracted,
-                            sortKey: extracted ? getDateSortKey(extracted.dateRef, extracted.time) : 0
-                        };
-                    }).sort((a, b) => a.sortKey - b.sortKey);
-                    
-                    const times = lowsWithTime.map(l => 
-                        l.timeInfo ? l.timeInfo.full : l.finding.scheduleTime
-                    ).join(', ');
-                    
-                    prompts.contextCheck.push(
-                        `Any unusual activity or missed meals? (unexplained lows at ${times})`
-                    );
-                }
-                
-                // Post-meal highs â†’ ask about food type/timing (LAST 24H ONLY)
-                const recentMealHighs = findings.filter(f => 
-                    f.type === 'post_meal_high' && isRecent(f)
-                );
-                if (recentMealHighs.length > 0) {
-                    for (const high of recentMealHighs.slice(0, 2)) {
-                        const carbMatch = high.details?.match(/(\d+)g/);
-                        const peakMatch = high.details?.match(/Peak (\d+)/);
-                        const timeMatch = high.details?.match(/Meal at ([^(]+)/);
-                        const carbs = carbMatch ? carbMatch[1] + 'g' : '?g';
-                        const peak = peakMatch ? peakMatch[1] : '?';
-                        const mealTime = timeMatch ? timeMatch[1].trim() : high.scheduleTime;
-                        prompts.contextCheck.push(
-                            `Food context for meal at ${mealTime}? (${carbs} â†’ ${peak} peak)`
-                        );
+                    if (periodContext.questions.length > 0 || periodContext.divergence) {
+                        prompts.turn1ContextByPeriod.push(periodContext);
                     }
                 }
                 
-                // Transient high â†’ low pattern â†’ ask about pre-bolus timing (LAST 24H ONLY)
-                const transientHighLows = findings.filter(f => 
-                    f.type === 'transient_high_low' && isRecent(f)
+                // Safety fast-track: only recurring severe lows
+                const recurringSevereLows = findings.filter(f => 
+                    f.type === 'unexplained_low' && 
+                    f.severity >= 0.9 && 
+                    f.eventsLast3Days >= 2
                 );
-                if (transientHighLows.length > 0) {
-                    prompts.contextCheck.push(
-                        `Pre-bolus timing for meals? (spike-then-crash pattern detected)`
-                    );
+                
+                if (recurringSevereLows.length > 0) {
+                    prompts.turn1ContextByPeriod.push({
+                        period: 'Safety',
+                        isSafety: true,
+                        questions: recurringSevereLows.map(f => ({
+                            q: `Recurring severe low: ${f.details}. Any pattern to timing or activities?`,
+                            impacts: 'immediate safety concern'
+                        }))
+                    });
                 }
                 
-                // Correction ineffectiveness overnight â†’ ask about bedtime snacks (LAST 24H ONLY)
-                const overnightIneffective = findings.filter(f => 
-                    f.type === 'correction_ineffective' && 
-                    isRecent(f) &&
-                    ['00:00', '01:00', '02:00', '03:00', '04:00', '05:00'].includes(f.scheduleTime)
-                );
-                if (overnightIneffective.length >= 2) {
-                    prompts.contextCheck.push(
-                        `Any bedtime snacks or late meals? (overnight corrections not landing)`
-                    );
-                }
+                // ===== SESSION CONTINUITY =====
+                // Auto-detected changes (from delta view or schedule comparison)
+                prompts.sessionContinuity.autoDetected = [];
                 
-                // Many periods with same signal â†’ ask about equipment
-                if (signalAnalysis?.periods) {
-                    const lowPeriods = signalAnalysis.periods.filter(p => p.signal === 'LOW').length;
-                    const highPeriods = signalAnalysis.periods.filter(p => p.signal === 'HIGH').length;
-                    if (lowPeriods >= 3 || highPeriods >= 3) {
-                        prompts.contextCheck.push(
-                            `Pod or sensor change in last 24-48h?`
-                        );
-                    }
-                }
-                
-                // State-specific questions
-                if (bodyState.state === BodyStateType.RECOVERY) {
-                    prompts.contextCheck.push(
-                        `How is recovery progressing? Any symptoms returning?`
-                    );
-                }
-                
-                // If no context checks generated, add generic
-                if (prompts.contextCheck.length === 0) {
-                    prompts.contextCheck.push(
-                        `Any notable context for today? (no unexplained patterns in last 24h)`
-                    );
-                }
-                
-                // ============================================
-                // FOLLOW-UP - Based on recent changes
-                // ============================================
-                
+                // Manual logged changes (from ChangeTracker)
                 const history = ChangeTracker.getHistory();
                 const pendingChanges = history.changes.filter(c => c.outcome === 'pending');
-                const now = new Date();
-                
                 for (const change of pendingChanges.slice(0, 3)) {
                     const changeDate = new Date(change.date);
-                    const daysAgo = Math.floor((now - changeDate) / (24 * 60 * 60 * 1000));
+                    const daysAgo = Math.floor((new Date() - changeDate) / (24 * 60 * 60 * 1000));
                     if (daysAgo >= 1) {
-                        prompts.followUp.push(
-                            `${change.scheduleTime} ${change.param} ${change.oldValue}â†’${change.newValue} (${change.date}): Applied? What happened?`
+                        prompts.sessionContinuity.manualLogged.push(
+                            `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} (${change.date}): Applied? What happened?`
                         );
                     }
                 }
                 
-                // If no pending changes, check for recently resolved
-                if (pendingChanges.length === 0) {
-                    const recentResolved = history.changes.filter(c => {
-                        const changeDate = new Date(c.date);
-                        const daysAgo = Math.floor((now - changeDate) / (24 * 60 * 60 * 1000));
-                        return c.outcome !== 'pending' && daysAgo <= 5;
+                // Period TIR trends
+                if (historyEntries.length >= 3) {
+                    const last5 = historyEntries.slice(-5);
+                    const periods = ['Deep Sleep', 'Dawn', 'Morning', 'Afternoon', 'Evening', 'Sleep Onset'];
+                    const tirFieldMap = {
+                        'Deep Sleep': 'tirDeepSleep',
+                        'Dawn': 'tirDawn',
+                        'Morning': 'tirMorning',
+                        'Afternoon': 'tirAfternoon',
+                        'Evening': 'tirEvening',
+                        'Sleep Onset': 'tirSleepOnset'
+                    };
+                    
+                    for (const period of periods) {
+                        const field = tirFieldMap[period];
+                        const values = last5.map(e => e[field] ? parseFloat(e[field]) : null).filter(v => v !== null);
+                        
+                        if (values.length >= 2) {
+                            const first = values[0];
+                            const last = values[values.length - 1];
+                            const trend = last > first + 5 ? 'improving ↑' : (last < first - 5 ? 'worsening ↓' : 'stable →');
+                            const delta = last - first;
+                            
+                            prompts.sessionContinuity.periodTrends.push({
+                                period,
+                                values,
+                                trend,
+                                delta: delta.toFixed(0)
+                            });
+                        }
+                    }
+                }
+                
+                // ===== DECISION MAP =====
+                for (const period of problemPeriods) {
+                    const decisionNode = {
+                        period: period.period,
+                        tir: period.avgTIR,
+                        branches: []
+                    };
+                    
+                    const periodData = signalAnalysis?.periods?.find(p => p.name === period.period);
+                    const hasDivergence = periodData?.divergence;
+                    
+                    if (hasDivergence) {
+                        decisionNode.branches.push({
+                            condition: 'Signal/AGP divergence present',
+                            action: periodData.divergence.recommendation,
+                            path: 'This is likely a meal/timing issue, not basal'
+                        });
+                    }
+                    
+                    // Find relevant bundles
+                    const periodBundles = bundles.filter(b => {
+                        const mappedPeriod = mapTimeBlockToPeriod(b.timeBlock);
+                        return mappedPeriod === period.period && b.priority === 'PRIMARY';
                     });
-                    if (recentResolved.length > 0) {
-                        const recent = recentResolved[recentResolved.length - 1];
-                        prompts.followUp.push(
-                            `Any observations since the ${recent.scheduleTime} ${recent.param} change?`
-                        );
+                    
+                    for (const bundle of periodBundles) {
+                        if (bundle.blockedBy?.includes('basal ratio')) {
+                            decisionNode.branches.push({
+                                condition: 'Recommendations blocked by basal ratio',
+                                action: 'Reduce basal rates to improve ratio',
+                                path: `Expected: 2-3 day path to unlock ${bundle.name.split(' ')[0]} adjustments`
+                            });
+                        }
+                    }
+                    
+                    if (decisionNode.branches.length > 0) {
+                        prompts.decisionMap.push(decisionNode);
                     }
                 }
                 
-                if (prompts.followUp.length === 0) {
-                    prompts.followUp.push(`No pending changes to follow up on`);
-                }
-                
-                // ============================================
-                // MEMORY CANDIDATES - Based on patterns (any timeframe)
-                // ============================================
-                
-                // Period order for chronological sorting
-                const periodOrder = ['Deep Sleep', 'Dawn', 'Morning', 'Afternoon', 'Evening', 'Sleep Onset'];
-                
-                // For memory candidates, include all recent unexplained lows (last 3 days)
-                // because learnings can come from historical patterns
-                const allUnexplainedLows = findings.filter(f => 
-                    f.type === 'unexplained_low' && (isRecent(f) || isLast3Days(f))
-                );
-                
-                if (allUnexplainedLows.length > 0) {
-                    const periods = [...new Set(allUnexplainedLows.map(f => f.period || 'unknown'))]
-                        .sort((a, b) => periodOrder.indexOf(a) - periodOrder.indexOf(b));
-                    prompts.memoryCandidates.push(
-                        `If activity explains lows â†’ "Active days cause ${periods.join('/')} lows"`
-                    );
-                }
-                
-                // If a change caused problems
-                const problematicChanges = history.changes.filter(c => 
-                    ['caused_low', 'caused_high', 'reverted'].includes(c.outcome)
-                );
-                for (const change of problematicChanges.slice(0, 2)) {
-                    prompts.memoryCandidates.push(
-                        `${change.scheduleTime} ${change.param} ${change.newValue} was too aggressive â†’ note baseline range`
-                    );
-                }
-                
-                // If a change worked
-                const effectiveChanges = history.changes.filter(c => c.outcome === 'effective');
-                for (const change of effectiveChanges.slice(0, 2)) {
-                    prompts.memoryCandidates.push(
-                        `${change.scheduleTime} ${change.param} ${change.newValue} is working â†’ update known-good value`
-                    );
-                }
-                
-                // State transition learnings
-                if (bodyState.state === BodyStateType.STABLE && bodyState.daysInState <= 3) {
-                    prompts.memoryCandidates.push(
-                        `If stable after override â†’ "Sensitivity returns within ${bodyState.daysInState} days post-override"`
-                    );
-                }
-                
-                // Conflict patterns
-                const conflictBundles = bundles.filter(b => b.isSlotConflict);
-                if (conflictBundles.length > 0) {
-                    prompts.memoryCandidates.push(
-                        `If conflicts resolve â†’ note which direction was correct for this meal slot`
-                    );
-                }
-                
-                // Always add a decision capture line
-                prompts.memoryCandidates.push(
-                    `Tonight's decision: ________________________________`
-                );
+                // Add decision log line
+                prompts.decisionMap.push({
+                    isLogLine: true,
+                    template: `Decision log: "Today: ________. Worst period: ${problemPeriods[0]?.period || 'N/A'} (${problemPeriods[0]?.avgTIR || '?'}% TIR). Rerun: ________."`
+                });
                 
                 return prompts;
             },
@@ -5068,6 +5085,23 @@
                         const pd = e.periodDeviations || {};
                         const fmt = (v) => (v !== null && v !== '' && v !== undefined) ? parseFloat(v).toFixed(0) : '-';
                         output += `| ${date} | ${fmt(pd.deepSleep)} | ${fmt(pd.dawn)} | ${fmt(pd.morning)} | ${fmt(pd.afternoon)} | ${fmt(pd.evening)} | ${fmt(pd.sleepOnset)} |\n`;
+                    }
+                    output += '\n';
+                }
+                
+                // === Period TIR Trends ===
+                const hasPeriodTIR = entries.some(e => 
+                    e.tirDeepSleep || e.tirDawn || e.tirMorning || e.tirAfternoon || e.tirEvening || e.tirSleepOnset);
+                
+                if (hasPeriodTIR) {
+                    output += '## Period TIR Trends (% time in range, 7-day)\n\n';
+                    output += '| Date | Deep Sleep | Dawn | Morning | Afternoon | Evening | Sleep Onset |\n';
+                    output += '|------|-----------|------|---------|-----------|---------|------------|\n';
+                    
+                    for (const e of entries) {
+                        const date = e.date ? new Date(e.date).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '?';
+                        const fmt = (v) => (v !== null && v !== '' && v !== undefined) ? `${parseFloat(v).toFixed(0)}%` : '-';
+                        output += `| ${date} | ${fmt(e.tirDeepSleep)} | ${fmt(e.tirDawn)} | ${fmt(e.tirMorning)} | ${fmt(e.tirAfternoon)} | ${fmt(e.tirEvening)} | ${fmt(e.tirSleepOnset)} |\n`;
                     }
                     output += '\n';
                 }
@@ -6143,6 +6177,49 @@
                         } catch(e) { return ''; }
                     })(),
                     basalRatio: basalRatioInfo?.ratio ? basalRatioInfo.ratio.toFixed(1) : '',
+                    // SPEC 2+: Period TIR tracking
+                    tirDeepSleep: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Deep Sleep');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirDawn: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Dawn');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirMorning: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Morning');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirAfternoon: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Afternoon');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirEvening: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Evening');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirSleepOnset: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Sleep Onset');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
                     primaryActions: (() => {
                         try {
                             const primary = (processedBundles || []).filter(b => b.priority === 'PRIMARY');
@@ -7213,6 +7290,49 @@
                         } catch(e) { return ''; }
                     })(),
                     basalRatio: analysisResults?.basalRatioInfo?.ratio ? analysisResults.basalRatioInfo.ratio.toFixed(1) : '',
+                    // SPEC 2+: Period TIR tracking
+                    tirDeepSleep: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Deep Sleep');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirDawn: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Dawn');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirMorning: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Morning');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirAfternoon: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Afternoon');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirEvening: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Evening');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
+                    tirSleepOnset: (() => {
+                        try {
+                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Sleep Onset');
+                            return tir !== null ? tir.toString() : '';
+                        } catch(e) { return ''; }
+                    })(),
                     primaryActions: (() => {
                         try {
                             const primary = (bundles || []).filter(b => b.priority === 'PRIMARY');
