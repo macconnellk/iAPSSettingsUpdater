@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.1.6 - Manual Log Fixed</title>
+    <title>Daily Insulin Settings Review v3.1.7 - Delta Debug Logging</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -6756,17 +6756,32 @@
                     // SPEC 3: Extract yesterday's entry from cache for delta comparison
                     let yesterdayEntry = null;
                     if (_cachedSheetsEntries && _cachedSheetsEntries.length > 0) {
+                        console.log('=== Delta View Debug ===');
+                        console.log('Cache has', _cachedSheetsEntries.length, 'entries');
                         const sorted = [..._cachedSheetsEntries].sort((a, b) => new Date(a.date) - new Date(b.date));
                         const todayStr = new Date().toISOString().split('T')[0];
+                        console.log('Today string:', todayStr);
+                        console.log('Last 3 cached entries:', sorted.slice(-3).map(e => ({
+                            date: e.date,
+                            parsedDate: e.date ? new Date(e.date).toISOString().split('T')[0] : 'null',
+                            hasPrimaryActions: !!e.primaryActions,
+                            hasWatchItems: !!e.watchItems
+                        })));
                         // Find most recent entry that is NOT from today
                         for (let i = sorted.length - 1; i >= 0; i--) {
                             const entryDate = sorted[i].date ? new Date(sorted[i].date).toISOString().split('T')[0] : null;
+                            console.log(`Checking entry ${i}: date=${sorted[i].date}, parsed=${entryDate}, matches today=${entryDate === todayStr}`);
                             if (entryDate && entryDate !== todayStr) {
                                 yesterdayEntry = sorted[i];
+                                console.log('✓ Found yesterday entry:', entryDate);
                                 break;
                             }
                         }
-                        console.log('Delta View: Yesterday entry:', yesterdayEntry ? new Date(yesterdayEntry.date).toLocaleDateString() : 'none found');
+                        if (!yesterdayEntry) {
+                            console.log('❌ No yesterday entry found');
+                        }
+                    } else {
+                        console.log('Delta View: No cached entries available');
                     }
                     
                     // Generate structured JSON export
