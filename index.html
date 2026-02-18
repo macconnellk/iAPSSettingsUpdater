@@ -4695,30 +4695,79 @@
             },
             
             formatClaudeReviewPrompts(prompts) {
-                let output = `---\n\n## Claude Review Prompts\n\n`;
+                let output = `---\n\n## Review Guidance\n\n`;
                 
-                if (prompts.contextCheck.length > 0) {
-                    output += `**Context Check:**\n`;
-                    for (const prompt of prompts.contextCheck) {
-                        output += `- ${prompt}\n`;
+                // ===== TURN 1: CONTEXT BY PROBLEM PERIOD =====
+                if (prompts.turn1ContextByPeriod && prompts.turn1ContextByPeriod.length > 0) {
+                    output += `**Turn 1 — Context by Problem Period:**\n\n`;
+                    
+                    for (const periodContext of prompts.turn1ContextByPeriod) {
+                        if (periodContext.isSafety) {
+                            output += `⚠️ **Safety Note:**\n`;
+                            for (const q of periodContext.questions) {
+                                output += `  ${q.q}\n`;
+                                output += `  → Impacts: ${q.impacts}\n\n`;
+                            }
+                        } else {
+                            output += `${periodContext.focus} **${periodContext.period}** (${periodContext.tir}% TIR):\n`;
+                            
+                            if (periodContext.divergence) {
+                                output += `  Signal/AGP divergence: ${periodContext.divergence.recommendation}\n`;
+                            }
+                            
+                            if (periodContext.questions.length > 0) {
+                                for (let i = 0; i < periodContext.questions.length; i++) {
+                                    const q = periodContext.questions[i];
+                                    output += `  ${i + 1}. ${q.q}\n`;
+                                    output += `     → Impacts: ${q.impacts}\n`;
+                                }
+                            }
+                            output += `\n`;
+                        }
+                    }
+                }
+                
+                // ===== SESSION CONTINUITY =====
+                output += `**Session Continuity:**\n\n`;
+                
+                if (prompts.sessionContinuity.manualLogged.length > 0) {
+                    output += `_Follow-up on changes:_\n`;
+                    for (const item of prompts.sessionContinuity.manualLogged) {
+                        output += `- ${item}\n`;
+                    }
+                    output += `\n`;
+                } else {
+                    output += `_No pending changes to follow up on._\n\n`;
+                }
+                
+                if (prompts.sessionContinuity.periodTrends.length > 0) {
+                    output += `_Period TIR Trends (last ${prompts.sessionContinuity.periodTrends[0].values.length} sessions):_\n`;
+                    for (const trend of prompts.sessionContinuity.periodTrends) {
+                        const valuesStr = trend.values.map(v => `${v.toFixed(0)}%`).join(' → ');
+                        output += `- ${trend.period}: ${valuesStr} (${trend.trend}, ${trend.delta > 0 ? '+' : ''}${trend.delta}%)\n`;
                     }
                     output += `\n`;
                 }
                 
-                if (prompts.followUp.length > 0) {
-                    output += `**Follow-up on Previous:**\n`;
-                    for (const prompt of prompts.followUp) {
-                        output += `- ${prompt}\n`;
+                // ===== DECISION MAP =====
+                if (prompts.decisionMap && prompts.decisionMap.length > 0) {
+                    output += `**After Keith Responds — Decision Map:**\n\n`;
+                    
+                    for (const node of prompts.decisionMap) {
+                        if (node.isLogLine) {
+                            output += `${node.template}\n`;
+                        } else {
+                            output += `**${node.period}** (${node.tir}% TIR):\n`;
+                            for (const branch of node.branches) {
+                                output += `  If ${branch.condition}:\n`;
+                                output += `  → ${branch.action}\n`;
+                                if (branch.path) {
+                                    output += `  → ${branch.path}\n`;
+                                }
+                                output += `\n`;
+                            }
+                        }
                     }
-                    output += `\n`;
-                }
-                
-                if (prompts.memoryCandidates.length > 0) {
-                    output += `**Memory Candidates:**\n`;
-                    for (const prompt of prompts.memoryCandidates) {
-                        output += `- [ ] ${prompt}\n`;
-                    }
-                    output += `\n`;
                 }
                 
                 return output;
