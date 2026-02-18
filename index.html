@@ -6715,6 +6715,11 @@
             // Copy for Claude review
             const copyForClaudeReview = async () => {
                 console.log('=== copyForClaudeReview called ===');
+                console.log('Cache status at copyForClaudeReview start:', {
+                    exists: !!_cachedSheetsEntries,
+                    length: _cachedSheetsEntries?.length || 0,
+                    typeOf: typeof _cachedSheetsEntries
+                });
                 
                 if (!analysisResults) {
                     console.error('copyForClaudeReview: Missing analysisResults');
