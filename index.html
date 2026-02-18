@@ -6716,11 +6716,6 @@
             // Copy for Claude review
             const copyForClaudeReview = async () => {
                 console.log('=== copyForClaudeReview called ===');
-                console.log('Cache status at copyForClaudeReview start:', {
-                    exists: !!cachedSheetsEntries,
-                    length: cachedSheetsEntries?.length || 0,
-                    typeOf: typeof cachedSheetsEntries
-                });
                 
                 if (!analysisResults) {
                     console.error('copyForClaudeReview: Missing analysisResults');
@@ -6762,32 +6757,17 @@
                     // SPEC 3: Extract yesterday's entry from cache for delta comparison
                     let yesterdayEntry = null;
                     if (cachedSheetsEntries && cachedSheetsEntries.length > 0) {
-                        console.log('=== Delta View Debug ===');
-                        console.log('Cache has', cachedSheetsEntries.length, 'entries');
                         const sorted = [...cachedSheetsEntries].sort((a, b) => new Date(a.date) - new Date(b.date));
                         const todayStr = new Date().toISOString().split('T')[0];
-                        console.log('Today string:', todayStr);
-                        console.log('Last 3 cached entries:', sorted.slice(-3).map(e => ({
-                            date: e.date,
-                            parsedDate: e.date ? new Date(e.date).toISOString().split('T')[0] : 'null',
-                            hasPrimaryActions: !!e.primaryActions,
-                            hasWatchItems: !!e.watchItems
-                        })));
                         // Find most recent entry that is NOT from today
                         for (let i = sorted.length - 1; i >= 0; i--) {
                             const entryDate = sorted[i].date ? new Date(sorted[i].date).toISOString().split('T')[0] : null;
-                            console.log(`Checking entry ${i}: date=${sorted[i].date}, parsed=${entryDate}, matches today=${entryDate === todayStr}`);
                             if (entryDate && entryDate !== todayStr) {
                                 yesterdayEntry = sorted[i];
-                                console.log('✓ Found yesterday entry:', entryDate);
                                 break;
                             }
                         }
-                        if (!yesterdayEntry) {
-                            console.log('❌ No yesterday entry found');
-                        }
-                    } else {
-                        console.log('Delta View: No cached entries available');
+                        console.log('Delta View: Yesterday entry:', yesterdayEntry ? new Date(yesterdayEntry.date).toLocaleDateString() : 'none found');
                     }
                     
                     // Generate structured JSON export
@@ -7022,9 +7002,8 @@
                     (sum, p) => sum + (p.cleanWindowCount || 0), 0
                 );
                 
-                // Calculate TDD from iAPS deviceStatus (extract both 24h and 2-week)
-                let tdd24h = null;
-                let tdd2Week = null;
+                // Calculate TDD from iAPS deviceStatus
+                let tdd = null;
                 const nightscoutData = analysisResults.nightscoutData;
                 if (nightscoutData?.deviceStatus) {
                     for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
@@ -7032,27 +7011,16 @@
                         if (status.openaps?.enacted?.reason) {
                             const reason = status.openaps.enacted.reason;
                             const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
+                            if (twoWeekMatch) {
+                                tdd = parseFloat(twoWeekMatch[1]);
+                                break;
+                            }
                             const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
-                            if (twoWeekMatch) tdd2Week = parseFloat(twoWeekMatch[1]);
-                            if (currentMatch) tdd24h = parseFloat(currentMatch[1]);
-                            if (tdd2Week || tdd24h) break;
-                        }
-                    }
-                }
-                
-                // Calculate total carbs in last 24 hours
-                let totalCarbs24h = 0;
-                if (nightscoutData?.treatments) {
-                    const now = new Date();
-                    const yesterday = new Date(now - 24 * 60 * 60 * 1000);
-                    nightscoutData.treatments.forEach(t => {
-                        if (t.carbs && t.carbs > 0 && t.created_at) {
-                            const treatmentTime = new Date(t.created_at);
-                            if (treatmentTime >= yesterday && treatmentTime <= now) {
-                                totalCarbs24h += t.carbs;
+                            if (currentMatch && !tdd) {
+                                tdd = parseFloat(currentMatch[1]);
                             }
                         }
-                    });
+                    }
                 }
                 
                 // Use effective target from analysis (BUG-018)
@@ -7095,9 +7063,7 @@
                     date: getLocalDateString(),
                     timestamp: new Date().toISOString(),
                     analysisWindow: basalSignalWindow,
-                    tdd24h: tdd24h ? tdd24h.toFixed(1) : '',
-                    tdd2wk: tdd2Week ? tdd2Week.toFixed(1) : '',
-                    carbs24h: totalCarbs24h ? totalCarbs24h.toFixed(0) : '',
+                    tdd: tdd ? tdd.toFixed(1) : '',
                     signalPercent: signalPercent?.toFixed?.(1) || String(signalPercent) || '',
                     targetPercent: targetPercent,
                     gap: gap.toFixed(1),
