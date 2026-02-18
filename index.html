@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.2.0 - SPEC 4 No-Changes Path</title>
+    <title>Daily Insulin Settings Review v3.3.1 - Review Guidance Debug</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4448,6 +4448,15 @@
             // Generate contextual prompts for Claude review
             generateClaudeReviewPrompts(findings, bundles, signalAnalysis, bodyState, agpData = null, historyEntries = []) {
                 // AGP-first review guidance implementation
+                console.log('=== generateClaudeReviewPrompts DEBUG ===');
+                console.log('Input params:', {
+                    findingsCount: findings?.length,
+                    bundlesCount: bundles?.length,
+                    hasSignalAnalysis: !!signalAnalysis,
+                    hasAgpData: !!agpData,
+                    agpDataHasHourlyStats: !!agpData?.hourlyStats,
+                    historyEntriesCount: historyEntries?.length
+                });
                 
                 const prompts = {
                     turn1ContextByPeriod: [],
@@ -4502,7 +4511,11 @@
                 
                 // ===== TURN 1: CONTEXT BY PROBLEM PERIOD =====
                 const agpPriorities = getAGPPriority();
+                console.log('AGP Priorities:', agpPriorities);
+                
                 const problemPeriods = agpPriorities.filter(p => p.avgTIR < 70);
+                console.log('Problem periods (TIR < 70%):', problemPeriods);
+                console.log('Total bundles to search:', bundles.length);
                 
                 for (const period of problemPeriods) {
                     const periodContext = {
@@ -4522,6 +4535,11 @@
                     const periodBundles = bundles.filter(b => {
                         const mappedPeriod = mapTimeBlockToPeriod(b.timeBlock);
                         return mappedPeriod === period.period;
+                    });
+                    
+                    console.log(`Period ${period.period} (${period.avgTIR}% TIR):`, {
+                        bundlesFound: periodBundles.length,
+                        bundleNames: periodBundles.map(b => `${b.name} [${b.timeBlock}]`)
                     });
                     
                     // Generate context questions for this period
@@ -4572,8 +4590,16 @@
                         }
                     }
                     
+                    console.log(`Period ${period.period} generated:`, {
+                        questionsCount: periodContext.questions.length,
+                        hasDivergence: !!periodContext.divergence
+                    });
+                    
                     if (periodContext.questions.length > 0 || periodContext.divergence) {
+                        console.log(`✓ Adding ${period.period} to turn1ContextByPeriod`);
                         prompts.turn1ContextByPeriod.push(periodContext);
+                    } else {
+                        console.log(`✗ Skipping ${period.period} - no questions or divergence`);
                     }
                 }
                 
@@ -4690,6 +4716,12 @@
                     isLogLine: true,
                     template: `Decision log: "Today: ________. Worst period: ${problemPeriods[0]?.period || 'N/A'} (${problemPeriods[0]?.avgTIR || '?'}% TIR). Rerun: ________."`
                 });
+                
+                console.log('=== Final prompts structure ===');
+                console.log('turn1ContextByPeriod count:', prompts.turn1ContextByPeriod.length);
+                console.log('sessionContinuity.manualLogged count:', prompts.sessionContinuity.manualLogged.length);
+                console.log('sessionContinuity.periodTrends count:', prompts.sessionContinuity.periodTrends.length);
+                console.log('decisionMap count:', prompts.decisionMap.length);
                 
                 return prompts;
             },
