@@ -1,9 +1,10 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.3.2 - Review Guidance Fixed</title>
+    <title>Daily Insulin Settings Review v3.3.3 - Review Guidance Question Fix</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4529,6 +4530,11 @@
                     
                     // Get divergence for this period
                     const periodData = signalAnalysis?.periods?.find(p => p.name === period.period);
+                    console.log(`Checking divergence for ${period.period}:`, {
+                        periodDataFound: !!periodData,
+                        hasDivergence: !!periodData?.divergence,
+                        divergence: periodData?.divergence
+                    });
                     if (periodData?.divergence) {
                         periodContext.divergence = periodData.divergence;
                     }
@@ -4548,11 +4554,11 @@
                     for (const bundle of periodBundles) {
                         // Post-meal highs
                         if (bundle.detector === 'post_meal_high') {
-                            const finding = bundle.findings?.[0];
-                            if (finding?.eventsLast24h > 0) {
-                                const carbMatch = finding.details?.match(/(\d+)g/);
-                                const peakMatch = finding.details?.match(/Peak (\d+)/);
-                                const timeMatch = finding.details?.match(/Meal at ([^(]+)/);
+                            if (bundle.evidence?.eventsLast24h > 0) {
+                                const event = bundle.evidence?.events?.[0];
+                                const carbMatch = event?.context?.match(/(\d+)g/);
+                                const peakMatch = event?.context?.match(/Peak (\d+)/);
+                                const timeMatch = event?.context?.match(/Meal at ([^(]+)/);
                                 periodContext.questions.push({
                                     q: `Meal at ${timeMatch?.[1]?.trim() || bundle.scheduleTime} (${carbMatch?.[1] || '?'}g → ${peakMatch?.[1] || '?'} peak). What was eaten? Pre-bolus timing?`,
                                     impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.param}`).join(', ') || 'meal management'
@@ -4562,9 +4568,9 @@
                         
                         // Unexplained lows
                         if (bundle.detector === 'unexplained_low') {
-                            const finding = bundle.findings?.[0];
-                            if (finding?.eventsLast24h > 0) {
-                                const timeMatch = finding.details?.match(/at (\d{1,2}:\d{2} [AP]M)/);
+                            if (bundle.evidence?.eventsLast24h > 0) {
+                                const event = bundle.evidence?.events?.[0];
+                                const timeMatch = event?.context?.match(/at (\d{1,2}:\d{2} [AP]M)/);
                                 periodContext.questions.push({
                                     q: `Unexplained low at ${timeMatch?.[1] || bundle.scheduleTime}. Any skipped snack or extra activity?`,
                                     impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.param}`).join(', ') || 'basal timing'
@@ -4574,8 +4580,7 @@
                         
                         // Direct meal lows
                         if (bundle.detector === 'direct_meal_low') {
-                            const finding = bundle.findings?.[0];
-                            if (finding?.eventsLast24h > 0) {
+                            if (bundle.evidence?.eventsLast24h > 0) {
                                 periodContext.questions.push({
                                     q: `Meal-induced low in ${period.period}. Carb count accurate? Meal timing consistent?`,
                                     impacts: `${bundle.scheduleTime} CR`
