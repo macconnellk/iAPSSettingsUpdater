@@ -1,10 +1,9 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.3.3 - Review Guidance Question Fix</title>
+    <title>Daily Insulin Settings Review v3.3.4 - Detailed Debug Logging</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4532,10 +4531,14 @@
                     const periodData = signalAnalysis?.periods?.find(p => p.name === period.period);
                     console.log(`Checking divergence for ${period.period}:`, {
                         periodDataFound: !!periodData,
+                        periodDataName: periodData?.name,
                         hasDivergence: !!periodData?.divergence,
-                        divergence: periodData?.divergence
+                        divergence: periodData?.divergence,
+                        divergenceType: periodData?.divergence?.type,
+                        divergenceRec: periodData?.divergence?.recommendation
                     });
                     if (periodData?.divergence) {
+                        console.log(`  → Adding divergence to periodContext`);
                         periodContext.divergence = periodData.divergence;
                     }
                     
@@ -4552,9 +4555,19 @@
                     
                     // Generate context questions for this period
                     for (const bundle of periodBundles) {
+                        console.log(`  Processing bundle: ${bundle.name}`, {
+                            detector: bundle.detector,
+                            hasEvidence: !!bundle.evidence,
+                            eventsLast24h: bundle.evidence?.eventsLast24h,
+                            eventsCount: bundle.evidence?.events?.length,
+                            isSlotConflict: bundle.isSlotConflict
+                        });
+                        
                         // Post-meal highs
                         if (bundle.detector === 'post_meal_high') {
+                            console.log(`    → post_meal_high detector matched`);
                             if (bundle.evidence?.eventsLast24h > 0) {
+                                console.log(`    → eventsLast24h > 0, generating question`);
                                 const event = bundle.evidence?.events?.[0];
                                 const carbMatch = event?.context?.match(/(\d+)g/);
                                 const peakMatch = event?.context?.match(/Peak (\d+)/);
@@ -4563,6 +4576,9 @@
                                     q: `Meal at ${timeMatch?.[1]?.trim() || bundle.scheduleTime} (${carbMatch?.[1] || '?'}g → ${peakMatch?.[1] || '?'} peak). What was eaten? Pre-bolus timing?`,
                                     impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.param}`).join(', ') || 'meal management'
                                 });
+                                console.log(`    → Question added`);
+                            } else {
+                                console.log(`    → eventsLast24h NOT > 0, skipping`);
                             }
                         }
                         
