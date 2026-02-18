@@ -1,10 +1,9 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.1.8 - Delta Cache Fixed</title>
+    <title>Daily Insulin Settings Review v3.2.0 - SPEC 4 No-Changes Path</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -3311,13 +3310,33 @@
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
                 });
                 
-                // Calculate AGP early so it's available for Signal/AGP reconciliation
+                // Calculate AGP early so it's available for Signal/AGP reconciliation and no-changes check
                 const agp7day = analysisResults.nightscoutData?.glucose 
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7) 
                     : null;
                 const agp48h = analysisResults.nightscoutData?.glucose
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
                     : null;
+                
+                // SPEC 4: Check for "No Changes Needed" fast path
+                const primaryBundlesCheck = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
+                const hasUrgent = bundles.some(b => b.isUrgent);
+                const basalRatioOk = !analysisResults.basalRatioInfo?.exceedsCap;
+                const tirOk = agp7day?.overall?.tir?.inRange >= 80;
+                const veryLowOk = agp7day?.overall?.tir?.veryLow < 1;
+                
+                // Check for significant period signals (worse than ±15 mg/dL)
+                const hasSignificantSignals = analysisResults.signalAnalysis?.periods?.some(p => 
+                    p.medianDeviation !== null && Math.abs(p.medianDeviation) > 15
+                );
+                
+                // Check for Signal/AGP divergences
+                const hasDivergences = analysisResults.signalAnalysis?.periods?.some(p => p.divergence);
+                
+                if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
+                    console.log('SPEC 4: No changes needed - using short-form report');
+                    return this.formatNoChangesReport(analysisResults, bodyState, bundles, agp7day, agp48h, dateStr);
+                }
                 
                 let output = `# Daily Insulin Settings Review\n`;
                 output += `**Date:** ${dateStr}\n`;
@@ -3994,6 +4013,63 @@
                 return output;
             },
             
+            // SPEC 4: Format short "No Changes Needed" report
+            formatNoChangesReport(analysisResults, bodyState, bundles, agp7day, agp48h, dateStr) {
+                let output = `# Daily Insulin Settings Review\n`;
+                output += `**Date:** ${dateStr}\n`;
+                
+                const stateInfo = bodyState.state === BodyStateType.OVERRIDE_ACTIVE
+                    ? `Override ${bodyState.overridePercent || 100}%`
+                    : `Day ${bodyState.daysInState}`;
+                output += `**State:** ${this.formatStateName(bodyState.state)} (${stateInfo})\n\n`;
+                output += `---\n\n`;
+                
+                output += `## ✓ No Changes Recommended\n\n`;
+                output += `Your parameters look well-tuned today.\n\n`;
+                
+                // Metrics table
+                const tir = agp7day?.overall?.tir?.inRange || 0;
+                const gmi = agp7day?.overall?.gmi || 0;
+                const cv = agp7day?.overall?.cv || 0;
+                const lowPct = agp7day?.overall?.tir?.low || 0;
+                const veryLowPct = agp7day?.overall?.tir?.veryLow || 0;
+                
+                output += `| Metric | Value | Target | Status |\n`;
+                output += `|--------|-------|--------|--------|\n`;
+                output += `| TIR (7d) | ${tir.toFixed(0)}% | ≥80% | ${tir >= 80 ? '✓ Good' : '⚠ Below target'} |\n`;
+                output += `| GMI | ${gmi.toFixed(1)}% | <7% | ${gmi < 7 ? '✓ Good' : '⚠ Above target'} |\n`;
+                output += `| CV | ${cv.toFixed(0)}% | <36% | ${cv < 36 ? '✓ Good' : '⚠ Above target'} |\n`;
+                output += `| Low | ${lowPct.toFixed(1)}% | <3% | ${lowPct < 3 ? '✓ Good' : '⚠ Above target'} |\n`;
+                output += `| Very Low | ${veryLowPct.toFixed(1)}% | <1% | ${veryLowPct < 1 ? '✓ Good' : '⚠ Above target'} |\n\n`;
+                
+                // Watch list summary
+                const watchCount = bundles.filter(b => b.priority === 'REFERENCE').length;
+                if (watchCount > 0) {
+                    output += `**Watch List:** ${watchCount} items monitoring — no action needed yet.\n\n`;
+                }
+                
+                // Signal check
+                const weightedDev = analysisResults.signalAnalysis?.weightedDeviation || 0;
+                output += `**Signal Check:** All periods within ±15 mg/dL. Weighted deviation: ${weightedDev.toFixed(1)} mg/dL.\n\n`;
+                
+                // Trend
+                const tir48h = agp48h?.overall?.tir?.inRange || tir;
+                const tirDelta = tir48h - tir;
+                const tirTrend = Math.abs(tirDelta) < 2 ? 'stable' : (tirDelta > 0 ? 'improving' : 'declining');
+                const tirArrow = tirTrend === 'improving' ? '↑' : (tirTrend === 'declining' ? '↓' : '→');
+                
+                output += `**Trend:** TIR ${tirTrend} `;
+                if (Math.abs(tirDelta) >= 2) {
+                    output += `(${tir.toFixed(0)}% → ${tir48h.toFixed(0)}% ${tirArrow}) over last 48h. `;
+                }
+                output += `Continue current settings.\n\n`;
+                
+                output += `---\n\n`;
+                output += `_Next review: Tomorrow. Rerun sooner if you notice unexpected lows or persistent highs >200._\n`;
+                
+                return output;
+            },
+            
             // Generate structured JSON export for Claude analysis
             generateStructuredExport(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], yesterdayEntry = null) {
                 // Calculate AGP (same as formatForClaude)
@@ -4003,6 +4079,50 @@
                 const agp48h = analysisResults.nightscoutData?.glucose
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
                     : null;
+                
+                // SPEC 4: Check for no-changes case and return short-form JSON
+                const primaryBundlesCheck = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
+                const hasUrgent = bundles.some(b => b.isUrgent);
+                const basalRatioOk = !analysisResults.basalRatioInfo?.exceedsCap;
+                const tirOk = agp7day?.overall?.tir?.inRange >= 80;
+                const veryLowOk = agp7day?.overall?.tir?.veryLow < 1;
+                const hasSignificantSignals = analysisResults.signalAnalysis?.periods?.some(p => 
+                    p.medianDeviation !== null && Math.abs(p.medianDeviation) > 15
+                );
+                const hasDivergences = analysisResults.signalAnalysis?.periods?.some(p => p.divergence);
+                
+                if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
+                    return {
+                        meta: {
+                            version: '2.3.1',
+                            timestamp: new Date().toISOString(),
+                            analysisWindow: config.basalSignalWindow || 7,
+                            dataQuality: {
+                                glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
+                                coveragePercent: analysisResults.signalAnalysis?.periods?.reduce((sum, p) => 
+                                    sum + (p.cleanWindowCount || 0), 0) || 0,
+                                cleanWindows: analysisResults.signalAnalysis?.periods?.reduce((sum, p) => 
+                                    sum + (p.cleanWindowCount || 0), 0) || 0
+                            }
+                        },
+                        recommendation: 'NO_CHANGES',
+                        summary: {
+                            tir: agp7day?.overall?.tir?.inRange || 0,
+                            gmi: agp7day?.overall?.gmi || 0,
+                            cv: agp7day?.overall?.cv || 0,
+                            lowPct: agp7day?.overall?.tir?.low || 0,
+                            veryLowPct: agp7day?.overall?.tir?.veryLow || 0,
+                            weightedDeviation: analysisResults.signalAnalysis?.weightedDeviation || 0,
+                            watchListCount: bundles.filter(b => b.priority === 'REFERENCE').length,
+                            trend: (() => {
+                                const tir = agp7day?.overall?.tir?.inRange || 0;
+                                const tir48h = agp48h?.overall?.tir?.inRange || tir;
+                                const tirDelta = tir48h - tir;
+                                return Math.abs(tirDelta) < 2 ? 'stable' : (tirDelta > 0 ? 'improving' : 'declining');
+                            })()
+                        }
+                    };
+                }
                 
                 // Helper: AGP check for a period (mirrors formatForClaude logic)
                 const getAGPCheckForPeriod = (periodName) => {
