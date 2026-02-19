@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.4.0 - Added Target BG Schedule (SPEC 6)</title>
+    <title>Daily Insulin Settings Review v3.4.1 - Target BG Schedule (SPEC 6 - Fixed)</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -5745,6 +5745,8 @@
                 { time: '23:00', value: 0.10 }
             ]);
             
+            const [targetBGSchedule, setTargetBGSchedule] = useState([]);
+            
             const updateNsConfig = (newConfig) => {
                 setNsConfig(newConfig);
                 try {
@@ -6542,6 +6544,7 @@
                                 activeSchedules.basal = parsedProfile.basal;
                             }
                             if (parsedProfile.targetBG && parsedProfile.targetBG.length > 0) {
+                                setTargetBGSchedule(parsedProfile.targetBG);
                                 activeSchedules.targetBG = parsedProfile.targetBG;
                                 console.log('Target BG schedule loaded from profile:', parsedProfile.targetBG.length, 'entries');
                             }
@@ -7121,7 +7124,7 @@
                 }
                 
                 try {
-                    const schedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule, targetBG: activeSchedules.targetBG || [] };
+                    const schedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule, targetBG: targetBGSchedule };
                     console.log('Calling OutputFormatter.formatForClaude with:', {
                         hasAnalysisResults: !!analysisResults,
                         hasBodyState: !!bodyState,
