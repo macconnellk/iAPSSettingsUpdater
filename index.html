@@ -1,9 +1,10 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.3.4 - Detailed Debug Logging</title>
+    <title>Daily Insulin Settings Review v3.3.5 - Fixed Bundle Property Access</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4527,19 +4528,47 @@
                         questions: []
                     };
                     
-                    // Get divergence for this period
+                    // Get/compute divergence for this period
                     const periodData = signalAnalysis?.periods?.find(p => p.name === period.period);
+                    
+                    // Compute divergence (same logic as generateStructuredExport)
+                    let divergence = null;
+                    if (periodData && agp7day?.hourlyStats) {
+                        const periodHoursMap = {
+                            'Deep Sleep': [0, 1, 2, 3],
+                            'Dawn': [4, 5, 6, 7],
+                            'Morning': [8, 9, 10, 11],
+                            'Afternoon': [12, 13, 14, 15, 16],
+                            'Evening': [17, 18, 19, 20],
+                            'Sleep Onset': [21, 22, 23]
+                        };
+                        const hours = periodHoursMap[period.period];
+                        if (hours) {
+                            const periodStats = hours.map(h => agp7day.hourlyStats[h]).filter(s => s !== null);
+                            if (periodStats.length > 0) {
+                                const avgHigh = periodStats.reduce((sum, s) => sum + s.tir.high + s.tir.veryHigh, 0) / periodStats.length;
+                                const agpStatus = avgHigh > 25 ? 'HIGH' : 'OK';
+                                const signalDir = periodData.medianDeviation < -10 ? 'LOW' : periodData.medianDeviation > 10 ? 'HIGH' : 'NEUTRAL';
+                                
+                                if (signalDir === 'LOW' && agpStatus === 'HIGH') {
+                                    divergence = { type: 'SIGNAL_LOW_AGP_HIGH', recommendation: 'CR/timing issue, NOT basal' };
+                                }
+                            }
+                        }
+                    }
+                    
                     console.log(`Checking divergence for ${period.period}:`, {
                         periodDataFound: !!periodData,
                         periodDataName: periodData?.name,
-                        hasDivergence: !!periodData?.divergence,
-                        divergence: periodData?.divergence,
-                        divergenceType: periodData?.divergence?.type,
-                        divergenceRec: periodData?.divergence?.recommendation
+                        hasDivergence: !!divergence,
+                        divergence: divergence,
+                        divergenceType: divergence?.type,
+                        divergenceRec: divergence?.recommendation
                     });
-                    if (periodData?.divergence) {
+                    
+                    if (divergence) {
                         console.log(`  → Adding divergence to periodContext`);
-                        periodContext.divergence = periodData.divergence;
+                        periodContext.divergence = divergence;
                     }
                     
                     // Find bundles/findings for this period
@@ -4555,26 +4584,28 @@
                     
                     // Generate context questions for this period
                     for (const bundle of periodBundles) {
+                        const finding = bundle.findings?.[0];  // Get first finding
+                        
                         console.log(`  Processing bundle: ${bundle.name}`, {
-                            detector: bundle.detector,
-                            hasEvidence: !!bundle.evidence,
-                            eventsLast24h: bundle.evidence?.eventsLast24h,
-                            eventsCount: bundle.evidence?.events?.length,
+                            detector: finding?.type,
+                            hasFindings: !!bundle.findings,
+                            eventsLast24h: finding?.eventsLast24h,
+                            eventsCount: finding?.events?.length,
                             isSlotConflict: bundle.isSlotConflict
                         });
                         
                         // Post-meal highs
-                        if (bundle.detector === 'post_meal_high') {
+                        if (finding?.type === 'post_meal_high') {
                             console.log(`    → post_meal_high detector matched`);
-                            if (bundle.evidence?.eventsLast24h > 0) {
+                            if (finding.eventsLast24h > 0) {
                                 console.log(`    → eventsLast24h > 0, generating question`);
-                                const event = bundle.evidence?.events?.[0];
-                                const carbMatch = event?.context?.match(/(\d+)g/);
-                                const peakMatch = event?.context?.match(/Peak (\d+)/);
-                                const timeMatch = event?.context?.match(/Meal at ([^(]+)/);
+                                const event = finding.events?.[0];
+                                const carbMatch = event?.details?.match(/(\d+)g/);
+                                const peakMatch = event?.details?.match(/Peak (\d+)/);
+                                const timeMatch = event?.details?.match(/Meal at ([^(]+)/);
                                 periodContext.questions.push({
                                     q: `Meal at ${timeMatch?.[1]?.trim() || bundle.scheduleTime} (${carbMatch?.[1] || '?'}g → ${peakMatch?.[1] || '?'} peak). What was eaten? Pre-bolus timing?`,
-                                    impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.param}`).join(', ') || 'meal management'
+                                    impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.parameter}`).join(', ') || 'meal management'
                                 });
                                 console.log(`    → Question added`);
                             } else {
@@ -4583,20 +4614,20 @@
                         }
                         
                         // Unexplained lows
-                        if (bundle.detector === 'unexplained_low') {
-                            if (bundle.evidence?.eventsLast24h > 0) {
-                                const event = bundle.evidence?.events?.[0];
-                                const timeMatch = event?.context?.match(/at (\d{1,2}:\d{2} [AP]M)/);
+                        if (finding?.type === 'unexplained_low') {
+                            if (finding.eventsLast24h > 0) {
+                                const event = finding.events?.[0];
+                                const timeMatch = event?.details?.match(/at (\d{1,2}:\d{2} [AP]M)/);
                                 periodContext.questions.push({
                                     q: `Unexplained low at ${timeMatch?.[1] || bundle.scheduleTime}. Any skipped snack or extra activity?`,
-                                    impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.param}`).join(', ') || 'basal timing'
+                                    impacts: bundle.recommendations?.map(r => `${r.scheduleTime} ${r.parameter}`).join(', ') || 'basal timing'
                                 });
                             }
                         }
                         
                         // Direct meal lows
-                        if (bundle.detector === 'direct_meal_low') {
-                            if (bundle.evidence?.eventsLast24h > 0) {
+                        if (finding?.type === 'direct_meal_low') {
+                            if (finding.eventsLast24h > 0) {
                                 periodContext.questions.push({
                                     q: `Meal-induced low in ${period.period}. Carb count accurate? Meal timing consistent?`,
                                     impacts: `${bundle.scheduleTime} CR`
