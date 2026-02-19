@@ -1,10 +1,9 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.3.5 - Fixed Bundle Property Access</title>
+    <title>Daily Insulin Settings Review v3.3.6 - Fixed agpData Reference</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4533,7 +4532,7 @@
                     
                     // Compute divergence (same logic as generateStructuredExport)
                     let divergence = null;
-                    if (periodData && agp7day?.hourlyStats) {
+                    if (periodData && agpData?.hourlyStats) {
                         const periodHoursMap = {
                             'Deep Sleep': [0, 1, 2, 3],
                             'Dawn': [4, 5, 6, 7],
@@ -4544,7 +4543,7 @@
                         };
                         const hours = periodHoursMap[period.period];
                         if (hours) {
-                            const periodStats = hours.map(h => agp7day.hourlyStats[h]).filter(s => s !== null);
+                            const periodStats = hours.map(h => agpData.hourlyStats[h]).filter(s => s !== null);
                             if (periodStats.length > 0) {
                                 const avgHigh = periodStats.reduce((sum, s) => sum + s.tir.high + s.tir.veryHigh, 0) / periodStats.length;
                                 const agpStatus = avgHigh > 25 ? 'HIGH' : 'OK';
