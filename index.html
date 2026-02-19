@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.3.10 - Log Event Object Keys</title>
+    <title>Daily Insulin Settings Review v3.3.11 - Fixed Event Property Access (WORKING!)</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4595,19 +4595,11 @@
                         
                         // Post-meal highs
                         if (finding?.type === 'post_meal_high') {
-                            console.log(`    → post_meal_high detector matched`);
                             if (finding.eventsLast24h > 0) {
-                                console.log(`    → eventsLast24h > 0, generating question`);
                                 const event = finding.events?.[0];
-                                console.log(`    → post_meal_high: event object:`, event);
-                                console.log(`    → event keys:`, event ? Object.keys(event) : 'no event');
-                                console.log(`    → event?.context:`, event?.context);
-                                console.log(`    → event?.details:`, event?.details);
-                                
-                                const carbMatch = event?.context?.match(/(\d+)g/);
-                                const peakMatch = event?.context?.match(/Peak (\d+)/);
-                                const timeMatch = event?.context?.match(/Meal at ([^(]+)/);
-                                console.log(`    → carbMatch:`, carbMatch, `peakMatch:`, peakMatch, `timeMatch:`, timeMatch);
+                                const mealTime = event?.time || bundle.scheduleTime;
+                                const carbs = event?.mealCarbs || '?';
+                                const peak = event?.peakBG || '?';
                                 
                                 // Get impacts from recommendations
                                 let impacts = 'meal management';
@@ -4620,12 +4612,9 @@
                                 }
                                 
                                 periodContext.questions.push({
-                                    q: `Meal at ${timeMatch?.[1]?.trim() || bundle.scheduleTime} (${carbMatch?.[1] || '?'}g → ${peakMatch?.[1] || '?'} peak). What was eaten? Pre-bolus timing?`,
+                                    q: `Meal at ${mealTime} (${carbs}g → ${peak} peak). What was eaten? Pre-bolus timing?`,
                                     impacts: impacts
                                 });
-                                console.log(`    → Question added`);
-                            } else {
-                                console.log(`    → eventsLast24h NOT > 0, skipping`);
                             }
                         }
                         
@@ -4633,13 +4622,7 @@
                         if (finding?.type === 'unexplained_low') {
                             if (finding.eventsLast24h > 0) {
                                 const event = finding.events?.[0];
-                                console.log(`    → unexplained_low: event object:`, event);
-                                console.log(`    → event keys:`, event ? Object.keys(event) : 'no event');
-                                console.log(`    → event?.context:`, event?.context);
-                                console.log(`    → event?.details:`, event?.details);
-                                
-                                const timeMatch = event?.context?.match(/at (\d{1,2}:\d{2} [AP]M)/);
-                                console.log(`    → timeMatch result:`, timeMatch);
+                                const timeStr = event?.time || bundle.scheduleTime;
                                 
                                 // Get impacts from recommendations
                                 let impacts = 'basal timing';
@@ -4652,7 +4635,7 @@
                                 }
                                 
                                 periodContext.questions.push({
-                                    q: `Unexplained low at ${timeMatch?.[1] || bundle.scheduleTime}. Any skipped snack or extra activity?`,
+                                    q: `Unexplained low at ${timeStr}. Any skipped snack or extra activity?`,
                                     impacts: impacts
                                 });
                             }
@@ -4661,8 +4644,11 @@
                         // Direct meal lows
                         if (finding?.type === 'direct_meal_low') {
                             if (finding.eventsLast24h > 0) {
+                                const event = finding.events?.[0];
+                                const mealTime = event?.time || bundle.scheduleTime;
+                                
                                 periodContext.questions.push({
-                                    q: `Meal-induced low in ${period.period}. Carb count accurate? Meal timing consistent?`,
+                                    q: `Meal at ${mealTime} caused low. Carb count accurate? Meal timing consistent?`,
                                     impacts: `${bundle.scheduleTime} CR`
                                 });
                             }
@@ -4698,20 +4684,11 @@
                 );
                 
                 if (recurringSevereLows.length > 0) {
-                    console.log(`Safety fast-track: Found ${recurringSevereLows.length} recurring severe lows`);
-                    recurringSevereLows.forEach((f, idx) => {
-                        console.log(`  Severe low ${idx}:`, f);
-                        console.log(`    events[0]:`, f.events?.[0]);
-                        console.log(`    events[0] keys:`, f.events?.[0] ? Object.keys(f.events[0]) : 'no event');
-                        console.log(`    events[0]?.context:`, f.events?.[0]?.context);
-                        console.log(`    events[0]?.details:`, f.events?.[0]?.details);
-                    });
-                    
                     prompts.turn1ContextByPeriod.push({
                         period: 'Safety',
                         isSafety: true,
                         questions: recurringSevereLows.map(f => ({
-                            q: `Recurring severe low: ${f.events?.[0]?.context || 'details unavailable'}. Any pattern to timing or activities?`,
+                            q: `Recurring severe low: ${f.details || 'details unavailable'}. Any pattern to timing or activities?`,
                             impacts: 'immediate safety concern'
                         }))
                     });
