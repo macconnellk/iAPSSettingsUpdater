@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.3.8 - Fixed Event Context & Recommendations</title>
+    <title>Daily Insulin Settings Review v3.3.10 - Log Event Object Keys</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4600,7 +4600,9 @@
                                 console.log(`    → eventsLast24h > 0, generating question`);
                                 const event = finding.events?.[0];
                                 console.log(`    → post_meal_high: event object:`, event);
+                                console.log(`    → event keys:`, event ? Object.keys(event) : 'no event');
                                 console.log(`    → event?.context:`, event?.context);
+                                console.log(`    → event?.details:`, event?.details);
                                 
                                 const carbMatch = event?.context?.match(/(\d+)g/);
                                 const peakMatch = event?.context?.match(/Peak (\d+)/);
@@ -4632,7 +4634,9 @@
                             if (finding.eventsLast24h > 0) {
                                 const event = finding.events?.[0];
                                 console.log(`    → unexplained_low: event object:`, event);
+                                console.log(`    → event keys:`, event ? Object.keys(event) : 'no event');
                                 console.log(`    → event?.context:`, event?.context);
+                                console.log(`    → event?.details:`, event?.details);
                                 
                                 const timeMatch = event?.context?.match(/at (\d{1,2}:\d{2} [AP]M)/);
                                 console.log(`    → timeMatch result:`, timeMatch);
@@ -4698,7 +4702,9 @@
                     recurringSevereLows.forEach((f, idx) => {
                         console.log(`  Severe low ${idx}:`, f);
                         console.log(`    events[0]:`, f.events?.[0]);
+                        console.log(`    events[0] keys:`, f.events?.[0] ? Object.keys(f.events[0]) : 'no event');
                         console.log(`    events[0]?.context:`, f.events?.[0]?.context);
+                        console.log(`    events[0]?.details:`, f.events?.[0]?.details);
                     });
                     
                     prompts.turn1ContextByPeriod.push({
