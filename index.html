@@ -6187,7 +6187,7 @@
             };
             
             // Auto-log to Google Sheets after analysis
-            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules, processedBundles = []) => {
+            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules, processedBundles = [], carbAdjSensitivity = null) => {
                 console.log('=== attemptAutoLog called ===');
                 console.log('Sheets URL:', sheetsWebAppUrl);
                 console.log('State:', state.state);
@@ -6350,6 +6350,7 @@
                     tdd24h: tdd24h ? tdd24h.toFixed(1) : '',
                     tdd2wk: tdd2Week ? tdd2Week.toFixed(1) : '',
                     carbs24h: totalCarbs24h ? totalCarbs24h.toFixed(0) : '',
+                    carbAdjSensitivity: carbAdjSensitivity ? carbAdjSensitivity.toFixed(2) : '',
                     // Schedule snapshots for change detection (FEATURE-004)
                     // Use activeSchedules (fresh from Nightscout) not React state (stale)
                     schedules: {
@@ -6984,7 +6985,7 @@
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
-                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles);
+                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity);
                     
                 } catch (err) {
                     console.error('Analysis error:', err);
