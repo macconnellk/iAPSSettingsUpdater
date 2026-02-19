@@ -7458,6 +7458,7 @@
                     // Required for Insulin_per_Carb and Carb_Adj_Sensitivity columns (BUG-FIX: missing fields)
                     tdd24h: analysisResults?.tdd24h ? parseFloat(analysisResults.tdd24h).toFixed(1) : (tdd ? tdd.toFixed(1) : ''),
                     carbs24h: analysisResults?.totalCarbs24h ? parseFloat(analysisResults.totalCarbs24h).toFixed(0) : '',
+                    carbAdjSensitivity: analysisResults?.carbAdjSensitivity || '',
                     signalPercent: signalPercent?.toFixed?.(1) || String(signalPercent) || '',
                     targetPercent: targetPercent,
                     gap: gap.toFixed(1),
