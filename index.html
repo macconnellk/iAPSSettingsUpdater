@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.3.11 - Fixed Event Property Access (WORKING!)</title>
+    <title>Daily Insulin Settings Review v3.4.0 - Added Target BG Schedule (SPEC 6)</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4428,7 +4428,14 @@
                     schedules: {
                         cr: schedules.cr || [],
                         isf: schedules.isf || [],
-                        basal: schedules.basal || []
+                        basal: schedules.basal || [],
+                        targetBG: (schedules.targetBG || []).map(s => ({
+                            time: s.time,
+                            timeAsSeconds: s.timeAsSeconds,
+                            targetLow: s.targetLow,
+                            targetHigh: s.targetHigh,
+                            midpoint: s.midpoint
+                        }))
                     }
                 };
                 
@@ -5885,10 +5892,35 @@
                     });
                 }
                 
+                // Parse target BG schedule
+                const targetBGSchedule = [];
+                try {
+                    if (store.target_low && store.target_low.length > 0) {
+                        store.target_low.forEach(entry => {
+                            const hours = Math.floor(entry.timeAsSeconds / 3600);
+                            const minutes = Math.floor((entry.timeAsSeconds % 3600) / 60);
+                            const highEntry = store.target_high?.find(h => h.timeAsSeconds === entry.timeAsSeconds);
+                            const low = entry.value;
+                            const high = highEntry ? highEntry.value : entry.value;
+                            targetBGSchedule.push({
+                                time: `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`,
+                                timeAsSeconds: entry.timeAsSeconds,
+                                targetLow: low,
+                                targetHigh: high,
+                                midpoint: Math.round((low + high) / 2)
+                            });
+                        });
+                    }
+                } catch(e) {
+                    console.warn('Target BG schedule parsing failed:', e);
+                }
+                console.log('Target BG Schedule:', targetBGSchedule);
+                
                 return {
                     cr: crSchedule.length > 0 ? crSchedule : null,
                     isf: isfSchedule.length > 0 ? isfSchedule : null,
                     basal: basalSchedule.length > 0 ? basalSchedule : null,
+                    targetBG: targetBGSchedule.length > 0 ? targetBGSchedule : null,
                     targetLow: store.target_low?.[0]?.value,
                     targetHigh: store.target_high?.[0]?.value
                 };
@@ -6509,6 +6541,10 @@
                                 setBasalSchedule(parsedProfile.basal);
                                 activeSchedules.basal = parsedProfile.basal;
                             }
+                            if (parsedProfile.targetBG && parsedProfile.targetBG.length > 0) {
+                                activeSchedules.targetBG = parsedProfile.targetBG;
+                                console.log('Target BG schedule loaded from profile:', parsedProfile.targetBG.length, 'entries');
+                            }
                             console.log('Loaded profile from Nightscout:', parsedProfile);
                         }
                     } else {
@@ -7085,7 +7121,7 @@
                 }
                 
                 try {
-                    const schedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule };
+                    const schedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule, targetBG: activeSchedules.targetBG || [] };
                     console.log('Calling OutputFormatter.formatForClaude with:', {
                         hasAnalysisResults: !!analysisResults,
                         hasBodyState: !!bodyState,
