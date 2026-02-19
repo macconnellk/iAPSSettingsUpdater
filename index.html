@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4600,9 +4599,13 @@
                             if (finding.eventsLast24h > 0) {
                                 console.log(`    → eventsLast24h > 0, generating question`);
                                 const event = finding.events?.[0];
+                                console.log(`    → post_meal_high: event object:`, event);
+                                console.log(`    → event?.context:`, event?.context);
+                                
                                 const carbMatch = event?.context?.match(/(\d+)g/);
                                 const peakMatch = event?.context?.match(/Peak (\d+)/);
                                 const timeMatch = event?.context?.match(/Meal at ([^(]+)/);
+                                console.log(`    → carbMatch:`, carbMatch, `peakMatch:`, peakMatch, `timeMatch:`, timeMatch);
                                 
                                 // Get impacts from recommendations
                                 let impacts = 'meal management';
@@ -4628,7 +4631,11 @@
                         if (finding?.type === 'unexplained_low') {
                             if (finding.eventsLast24h > 0) {
                                 const event = finding.events?.[0];
+                                console.log(`    → unexplained_low: event object:`, event);
+                                console.log(`    → event?.context:`, event?.context);
+                                
                                 const timeMatch = event?.context?.match(/at (\d{1,2}:\d{2} [AP]M)/);
+                                console.log(`    → timeMatch result:`, timeMatch);
                                 
                                 // Get impacts from recommendations
                                 let impacts = 'basal timing';
@@ -4687,6 +4694,13 @@
                 );
                 
                 if (recurringSevereLows.length > 0) {
+                    console.log(`Safety fast-track: Found ${recurringSevereLows.length} recurring severe lows`);
+                    recurringSevereLows.forEach((f, idx) => {
+                        console.log(`  Severe low ${idx}:`, f);
+                        console.log(`    events[0]:`, f.events?.[0]);
+                        console.log(`    events[0]?.context:`, f.events?.[0]?.context);
+                    });
+                    
                     prompts.turn1ContextByPeriod.push({
                         period: 'Safety',
                         isSafety: true,
