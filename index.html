@@ -6432,6 +6432,7 @@
                     })()
                 };
                 
+                console.log('=== AUTOLOG RECEIVED carbAdjSensitivity ===', carbAdjSensitivity, '=> payload value:', payload.carbAdjSensitivity);
                 console.log('Auto-log payload:', payload);
                 
                 // Attempt to log
@@ -6985,6 +6986,7 @@
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
+                    console.log('=== PRE-AUTOLOG carbAdjSensitivity DEBUG ===', { carbAdjSensitivity, tdd24h, totalCarbs24h, hasSheetsUrl: !!sheetsWebAppUrl });
                     attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity);
                     
                 } catch (err) {
