@@ -4794,7 +4794,7 @@
                 // Add decision log line
                 prompts.decisionMap.push({
                     isLogLine: true,
-                    template: `Decision log: "Today: ________. Worst period: ${problemPeriods[0]?.period || 'N/A'} (${problemPeriods[0]?.avgTIR || '?'}% TIR). Rerun: ________."`
+                    template: `Decision log: "Worst period: ${problemPeriods[0]?.period || 'N/A'} (${problemPeriods[0]?.avgTIR || '?'}% TIR). Rerun: ________."`
                 });
                 
                 console.log('=== Final prompts structure ===');
