@@ -5352,6 +5352,23 @@
                     }
                 }
                 
+                // === Decision Log History ===
+                const entriesWithLogs = entries
+                    .filter(e => e.decisionLog && String(e.decisionLog).trim().length > 0)
+                    .slice()
+                    .reverse(); // most recent first
+                
+                if (entriesWithLogs.length > 0) {
+                    output += '## Decision Log History\n\n';
+                    output += '_Prior session notes and override context — use to interpret anomalous rows above._\n\n';
+                    for (const e of entriesWithLogs) {
+                        const date = e.date ? new Date(e.date).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '?';
+                        const log = String(e.decisionLog).trim();
+                        output += `- **${date}:** ${log}\n`;
+                    }
+                    output += '\n';
+                }
+
                 // === Summary Stats ===
                 const tirValues = entries.map(e => e.tir7d ? parseFloat(e.tir7d) : null).filter(v => v !== null);
                 const tddValues = entries.map(e => e.tdd24h ? parseFloat(e.tdd24h) : null).filter(v => v !== null);
@@ -5693,6 +5710,8 @@
             const [loggingNotes, setLoggingNotes] = useState('');
             const [logStatus, setLogStatus] = useState('idle'); // idle, logging, success, error
             const [logMessage, setLogMessage] = useState('');
+            const [decisionLog, setDecisionLog] = useState('');
+            const [decisionLogStatus, setDecisionLogStatus] = useState('idle'); // idle, saving, success, error
             
             // Save sheets URL to localStorage
             const updateSheetsUrl = (url) => {
@@ -6432,7 +6451,6 @@
                     })()
                 };
                 
-                console.log('=== AUTOLOG RECEIVED carbAdjSensitivity ===', carbAdjSensitivity, '=> payload value:', payload.carbAdjSensitivity);
                 console.log('Auto-log payload:', payload);
                 
                 // Attempt to log
@@ -6986,7 +7004,6 @@
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
-                    console.log('=== PRE-AUTOLOG carbAdjSensitivity DEBUG ===', { carbAdjSensitivity, tdd24h, totalCarbs24h, hasSheetsUrl: !!sheetsWebAppUrl });
                     attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity);
                     
                 } catch (err) {
@@ -7366,6 +7383,34 @@
             const [detectedChanges, setDetectedChanges] = useState([]);
             const [yesterdayScheduleDate, setYesterdayScheduleDate] = useState(null);
             
+            // Save Decision Log to Google Sheets (standalone - only writes Decision_Log column)
+            const saveDecisionLog = async () => {
+                if (!sheetsWebAppUrl) return;
+                if (!decisionLog.trim()) {
+                    setDecisionLogStatus('error');
+                    setTimeout(() => setDecisionLogStatus('idle'), 2000);
+                    return;
+                }
+                setDecisionLogStatus('saving');
+                try {
+                    await fetch(sheetsWebAppUrl, {
+                        method: 'POST',
+                        mode: 'no-cors',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            date: getLocalDateString(),
+                            decisionLogOnly: true,
+                            decisionLog: decisionLog.trim()
+                        })
+                    });
+                    setDecisionLogStatus('success');
+                    setTimeout(() => setDecisionLogStatus('idle'), 3000);
+                } catch (err) {
+                    setDecisionLogStatus('error');
+                    setTimeout(() => setDecisionLogStatus('idle'), 3000);
+                }
+            };
+
             // Log to Google Sheets
             const logToGoogleSheets = async () => {
                 if (!sheetsWebAppUrl) {
@@ -8485,6 +8530,39 @@
                                             {logMessage && logStatus === 'error' && (
                                                 <p className="text-red-400 text-xs mt-2">{logMessage}</p>
                                             )}
+                                        </div>
+
+                                        {/* Decision Log */}
+                                        <div className="border-t border-gray-700 pt-4 mt-4">
+                                            <div className="flex items-center gap-2 mb-2">
+                                                <span className="text-gray-300 text-sm font-medium">📝 Decision Log</span>
+                                                <span className="text-gray-500 text-xs">Paste Claude's decision log output below</span>
+                                            </div>
+                                            <textarea
+                                                placeholder={`${getLocalDateString()}: `}
+                                                value={decisionLog}
+                                                onChange={(e) => setDecisionLog(e.target.value)}
+                                                rows={3}
+                                                className="w-full bg-gray-800/50 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500 resize-none mb-2"
+                                            />
+                                            <button
+                                                onClick={saveDecisionLog}
+                                                disabled={decisionLogStatus === 'saving'}
+                                                className={`w-full px-4 py-2 rounded-xl font-medium transition-all text-sm ${
+                                                    decisionLogStatus === 'success'
+                                                        ? 'bg-green-600/20 text-green-400 border border-green-500/30'
+                                                        : decisionLogStatus === 'error'
+                                                        ? 'bg-red-600/20 text-red-400 border border-red-500/30'
+                                                        : decisionLogStatus === 'saving'
+                                                        ? 'bg-gray-600/20 text-gray-400 border border-gray-500/30 cursor-wait'
+                                                        : 'bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 border border-amber-500/30'
+                                                }`}
+                                            >
+                                                {decisionLogStatus === 'saving' ? '⏳ Saving...' :
+                                                 decisionLogStatus === 'success' ? '✓ Saved to Sheet!' :
+                                                 decisionLogStatus === 'error' ? '✗ Failed (enter text first)' :
+                                                 '💾 Save Decision Log'}
+                                            </button>
                                         </div>
                                     )}
                                 </div>
