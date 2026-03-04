@@ -6771,11 +6771,13 @@
                                 continue;
                             }
 
-                            // Check if a logged carb entry already covers this hypo period
-                            // (e.g. a meal eaten during a low). If logged carbs exist within
-                            // the event window +15 min, assume they already account for treatment.
+                            // Check if a logged carb entry covers this hypo period.
+                            // Look back 60 minutes before hypo onset — a meal within that window
+                            // is likely the cause of the low (post-meal nadir), meaning no glucose
+                            // treatment would be given. Also look forward 15 min after the last
+                            // sub-70 reading to catch carbs logged during an active low.
                             const alreadyLogged = loggedCarbTimes.some(lt =>
-                                lt.time >= group.startMs - 5 * 60 * 1000 &&
+                                lt.time >= group.startMs - 20 * 60 * 1000 &&
                                 lt.time <= eventEndMs + 15 * 60 * 1000
                             );
 
