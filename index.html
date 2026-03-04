@@ -6665,7 +6665,138 @@
                         });
                     }
                     
-                    console.log('Total carbs (24h):', totalCarbs24h);
+                    console.log('Total logged carbs (24h):', totalCarbs24h);
+                    
+                    // ── Hypo Treatment Carb Estimation ──────────────────────────────────────
+                    // B doesn't log glucose tab / juice treatments in Nightscout.
+                    // Infer treatment carbs from CGM recovery patterns.
+                    //
+                    // Thresholds (conservative, based on clinical practice):
+                    //   Nadir 65–70 mg/dL → 6g  (4–8g range, midpoint)
+                    //   Nadir 60–65 mg/dL → 8g
+                    //   Nadir 50–60 mg/dL → 15g
+                    //   Nadir  < 50 mg/dL → 30g
+                    //
+                    // Confirmation gate: BG must recover above 70 within 45 min of the last
+                    // sub-70 reading — confirms a treatment was actually given.
+                    let estimatedTreatmentCarbs = 0;
+                    const hypoTreatmentEvents = [];
+
+                    if (nightscoutData.glucose && nightscoutData.glucose.length > 0) {
+                        const now = new Date();
+                        const yesterday = new Date(now - 24 * 60 * 60 * 1000);
+
+                        // Sort ascending so we can walk forward in time
+                        const recentGlucose = [...nightscoutData.glucose]
+                            .filter(r => {
+                                const t = new Date(r.dateString);
+                                return t >= yesterday && t <= now && r.sgv > 20 && r.sgv < 500;
+                            })
+                            .sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
+
+                        // Group consecutive <70 readings into discrete hypo events.
+                        // A gap of >20 min between sub-70 readings = separate event.
+                        const GAP_THRESHOLD_MS = 20 * 60 * 1000;
+                        const RECOVERY_WINDOW_MS = 45 * 60 * 1000;
+                        const RECOVERY_BG = 70;
+
+                        const hypoGroups = [];
+                        let currentGroup = null;
+
+                        for (const reading of recentGlucose) {
+                            if (reading.sgv < RECOVERY_BG) {
+                                const readingTime = new Date(reading.dateString).getTime();
+                                if (!currentGroup) {
+                                    currentGroup = { readings: [reading], startMs: readingTime, endMs: readingTime };
+                                } else {
+                                    const gap = readingTime - currentGroup.endMs;
+                                    if (gap <= GAP_THRESHOLD_MS) {
+                                        currentGroup.readings.push(reading);
+                                        currentGroup.endMs = readingTime;
+                                    } else {
+                                        hypoGroups.push(currentGroup);
+                                        currentGroup = { readings: [reading], startMs: readingTime, endMs: readingTime };
+                                    }
+                                }
+                            } else {
+                                if (currentGroup) {
+                                    hypoGroups.push(currentGroup);
+                                    currentGroup = null;
+                                }
+                            }
+                        }
+                        if (currentGroup) hypoGroups.push(currentGroup);
+
+                        // Also find readings logged in Nightscout that are in hypo period
+                        // so we don't double-count actual logged carbs (meals eaten during a low)
+                        const loggedCarbTimes = [];
+                        if (nightscoutData.treatments) {
+                            nightscoutData.treatments.forEach(t => {
+                                if (t.carbs && t.carbs > 0 && t.created_at) {
+                                    const treatmentTime = new Date(t.created_at);
+                                    if (treatmentTime >= yesterday && treatmentTime <= now) {
+                                        loggedCarbTimes.push({ time: treatmentTime.getTime(), carbs: t.carbs });
+                                    }
+                                }
+                            });
+                        }
+
+                        for (const group of hypoGroups) {
+                            const nadir = Math.min(...group.readings.map(r => r.sgv));
+                            const eventEndMs = group.endMs;
+
+                            // Check for BG recovery above 70 within 45 min of last sub-70 reading
+                            const recoveryReadings = recentGlucose.filter(r => {
+                                const t = new Date(r.dateString).getTime();
+                                return t > eventEndMs &&
+                                       t <= eventEndMs + RECOVERY_WINDOW_MS &&
+                                       r.sgv >= RECOVERY_BG;
+                            });
+
+                            if (recoveryReadings.length === 0) {
+                                // No confirmed recovery — skip, don't estimate treatment
+                                console.log(`Hypo event nadir ${nadir}: no recovery detected, skipping`);
+                                continue;
+                            }
+
+                            // Check if a logged carb entry already covers this hypo period
+                            // (e.g. a meal eaten during a low). If logged carbs exist within
+                            // the event window +15 min, assume they already account for treatment.
+                            const alreadyLogged = loggedCarbTimes.some(lt =>
+                                lt.time >= group.startMs - 5 * 60 * 1000 &&
+                                lt.time <= eventEndMs + 15 * 60 * 1000
+                            );
+
+                            if (alreadyLogged) {
+                                console.log(`Hypo event nadir ${nadir}: carbs already logged nearby, skipping estimation`);
+                                continue;
+                            }
+
+                            // Map nadir to estimated treatment carbs
+                            let treatCarbs;
+                            if (nadir < 50)       treatCarbs = 30;
+                            else if (nadir < 60)  treatCarbs = 15;
+                            else if (nadir < 65)  treatCarbs = 8;
+                            else                  treatCarbs = 6; // 65–70
+
+                            estimatedTreatmentCarbs += treatCarbs;
+                            hypoTreatmentEvents.push({
+                                nadir,
+                                time: new Date(group.startMs).toISOString(),
+                                recoveredAt: new Date(recoveryReadings[0].dateString).toISOString(),
+                                estimatedCarbs: treatCarbs
+                            });
+
+                            console.log(`Hypo event: nadir ${nadir} mg/dL → +${treatCarbs}g estimated treatment carbs`);
+                        }
+
+                        if (estimatedTreatmentCarbs > 0) {
+                            console.log(`Estimated treatment carbs: +${estimatedTreatmentCarbs}g across ${hypoTreatmentEvents.length} hypo event(s)`);
+                            totalCarbs24h += estimatedTreatmentCarbs;
+                            console.log(`Adjusted total carbs (24h): ${totalCarbs24h}g (logged + estimated treatment)`);
+                        }
+                    }
+                    // ── End Hypo Treatment Estimation ────────────────────────────────────────
                     
                     // Calculate Carb-Adjusted Sensitivity from Sheets history
                     let carbAdjSensitivity = null;
@@ -6995,7 +7126,9 @@
                         tdd: tddForSignal,  // For calculations (2-week preferred)
                         tdd24h: tdd24h,     // 24-hour TDD for trend comparison
                         tdd2Week: tdd2Week, // 2-week TDD for stable baseline
-                        totalCarbs24h: totalCarbs24h,  // Total carbs in last 24h
+                        totalCarbs24h: totalCarbs24h,  // Total carbs in last 24h (logged + estimated treatment)
+                        estimatedTreatmentCarbs: estimatedTreatmentCarbs > 0 ? estimatedTreatmentCarbs : null,
+                        hypoTreatmentEvents: hypoTreatmentEvents.length > 0 ? hypoTreatmentEvents : null,
                         insulinPerCarb: (tdd24h && totalCarbs24h > 0) ? (tdd24h / totalCarbs24h).toFixed(3) : null,
                         carbAdjSensitivity: carbAdjSensitivity ? carbAdjSensitivity.toFixed(2) : null
                     });
@@ -8446,6 +8579,25 @@
                                                             })()
                                                             : 'Needs 3+ days history'}
                                                     </div>
+                                                    {/* Hypo treatment carb breakdown */}
+                                                    {analysisResults.estimatedTreatmentCarbs && (
+                                                        <div className="mt-2 pt-2 border-t border-gray-700">
+                                                            <div className="text-amber-400 text-xs font-medium mb-1">
+                                                                ⚡ Carbs adjusted for {analysisResults.hypoTreatmentEvents?.length} hypo treatment{analysisResults.hypoTreatmentEvents?.length !== 1 ? 's' : ''}
+                                                            </div>
+                                                            <div className="text-gray-500 text-xs">
+                                                                {(() => {
+                                                                    const logged = (analysisResults.totalCarbs24h || 0) - (analysisResults.estimatedTreatmentCarbs || 0);
+                                                                    return `${logged.toFixed(0)}g logged + ${analysisResults.estimatedTreatmentCarbs}g est. treatment`;
+                                                                })()}
+                                                            </div>
+                                                            {analysisResults.hypoTreatmentEvents?.map((evt, i) => (
+                                                                <div key={i} className="text-gray-600 text-xs mt-0.5">
+                                                                    {`${new Date(evt.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}: ${evt.nadir} mg/dL nadir → ${evt.estimatedCarbs}g`}
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    )}
                                                 </div>
                                             </div>
                                         )}
