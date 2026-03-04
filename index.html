@@ -3637,7 +3637,19 @@
                     
                     // Display 24h carbs and key metrics
                     if (analysisResults.totalCarbs24h !== undefined && analysisResults.totalCarbs24h !== null) {
-                        output += `**Carbs (24h):** ${analysisResults.totalCarbs24h.toFixed(0)}g\n`;
+                        output += `**Carbs (24h):** ${analysisResults.totalCarbs24h.toFixed(0)}g`;
+                        if (analysisResults.estimatedTreatmentCarbs) {
+                            const loggedCarbs = analysisResults.totalCarbs24h - analysisResults.estimatedTreatmentCarbs;
+                            output += ` (${loggedCarbs.toFixed(0)}g logged meals + ${analysisResults.estimatedTreatmentCarbs}g estimated hypo treatment`;
+                            if (analysisResults.hypoTreatmentEvents?.length) {
+                                const eventSummary = analysisResults.hypoTreatmentEvents
+                                    .map(e => `${new Date(e.time).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})} nadir ${e.nadir} mg/dL → ${e.estimatedCarbs}g`)
+                                    .join('; ');
+                                output += `: ${eventSummary}`;
+                            }
+                            output += `)`;
+                        }
+                        output += `\n`;
                     }
                     if (analysisResults.insulinPerCarb) {
                         output += `**Insulin per Carb:** ${analysisResults.insulinPerCarb} U/g\n`;
