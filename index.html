@@ -1005,7 +1005,8 @@
                 // must be bundled individually — they answer a different clinical question
                 // (resting basal adequacy) than event-driven findings and must not be merged
                 // with correction or meal findings even when scheduleTime collides.
-                const signalTypes = [FindingType.BASAL_SIGNAL_HIGH, FindingType.BASAL_SIGNAL_LOW];
+                // BASAL_SIGNAL_LOW is handled via isSafetyFinding path -- exclude here to prevent duplicate bundles
+                const signalTypes = [FindingType.BASAL_SIGNAL_HIGH];
                 const signalFindings = findings.filter(f => signalTypes.includes(f.type));
                 const nonSafetyNonSignalFindings = findings.filter(f => !this.isSafetyFinding(f) && !signalTypes.includes(f.type));
 
