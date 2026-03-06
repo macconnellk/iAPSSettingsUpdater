@@ -75,14 +75,14 @@
         
         const FindingType = {
             DIRECT_MEAL_LOW: 'direct_meal_low',
-            TRANSIENT_HIGH_CRASH: 'transient_high_crash',
-            TRANSIENT_HIGH_LOW: 'transient_high_low', // Meal â†’ Brief spike â†’ Crash (no corrections)
+            // TRANSIENT_HIGH_CRASH removed -- dead code, no detector produced this type
+            TRANSIENT_HIGH_LOW: 'transient_high_low', // Meal â†’ Brief spike â†’ Crash (no corrections) -- Detector 1b
             ISF_INDUCED_LOW: 'isf_induced_low',
             UNEXPLAINED_LOW: 'unexplained_low',
-            RESISTANT_LOW: 'resistant_low',
+            RESISTANT_LOW: 'resistant_low', // Low with IOB<0.2 -- not insulin-caused; Detector 5 Path A
             POST_MEAL_HIGH: 'post_meal_high',
             CORRECTION_INEFFECTIVE: 'correction_ineffective',
-            FASTING_DRIFT_HIGH: 'fasting_drift_high',
+            // FASTING_DRIFT_HIGH removed -- dead code, no detector produced this type
             BASAL_SIGNAL_HIGH: 'basal_signal_high',
             BASAL_SIGNAL_LOW: 'basal_signal_low',
             BASAL_RATIO_EXCEEDED: 'basal_ratio_exceeded',
@@ -853,7 +853,7 @@
                 const strengthenTypes = [
                     FindingType.POST_MEAL_HIGH,
                     FindingType.CORRECTION_INEFFECTIVE,
-                    FindingType.FASTING_DRIFT_HIGH,
+                    // FASTING_DRIFT_HIGH removed -- dead code
                     FindingType.BASAL_SIGNAL_HIGH
                 ];
                 return strengthenTypes.includes(finding.type);
@@ -1071,8 +1071,9 @@
                     case FindingType.UNEXPLAINED_LOW:
                         // Include both time and period for clarity
                         return `Safety: ${time} Unexplained Low (${period})`;
-                    case FindingType.TRANSIENT_HIGH_CRASH:
-                        return `Safety: ${time} Spike & Crash`;
+                    case FindingType.RESISTANT_LOW:
+                        // Explicitly labelled so instructions-level handling rule is actionable
+                        return `Safety: ${time} RESISTANT LOW (${period}) -- External Cause`;
                     case FindingType.BASAL_SIGNAL_LOW:
                         // Basal signal findings may not have specific time, use period
                         return time !== 'Unknown' 
@@ -1087,7 +1088,7 @@
                 const safetyTypes = [
                     FindingType.DIRECT_MEAL_LOW,
                     FindingType.TRANSIENT_HIGH_LOW,
-                    FindingType.TRANSIENT_HIGH_CRASH,
+                    // TRANSIENT_HIGH_CRASH removed -- dead code
                     FindingType.ISF_INDUCED_LOW,
                     FindingType.UNEXPLAINED_LOW,
                     FindingType.RESISTANT_LOW,
@@ -1292,6 +1293,9 @@
                 }
                 if (types.includes(FindingType.BASAL_SIGNAL_LOW)) {
                     return 'Fasting BG trending low - basal too high';
+                }
+                if (types.includes(FindingType.RESISTANT_LOW)) {
+                    return 'RESISTANT LOW: IOB was near-zero at time of low. Not caused by insulin -- check activity, alcohol, hormonal, or other external factors. No parameter change indicated.';
                 }
                 
                 return 'Mixed patterns detected';
@@ -1742,25 +1746,81 @@
             return weight;
         };
         
-        const isTrueCorrection = (treatment, allTreatments) => {
+        /**
+         * isTrueCorrection -- Meal-insulin-budget classifier (replaces fixed 1-hour window)
+         *
+         * SMB classification strategy:
+         *   1. No meal in 3-hour lookback window --> TRUE correction
+         *   2. Meal found: derive expected insulin budget for that meal
+         *        a. If crSchedule provided: budget = carbs / CR
+         *        b. Else if meal had upfront bolus: budget = mealInsulin / 0.40
+         *           (iAPS delivers ~40% upfront; SMBs cover the remaining ~60%)
+         *        c. Otherwise: conservative fallback -- treat all SMBs within 3h as meal insulin
+         *   3. Sum all insulin delivered since meal start (upfront + prior SMBs)
+         *   4. If cumulative < budget x 1.10 --> still within meal budget --> NOT a correction
+         *      If cumulative >= budget --> budget exhausted --> IS a true correction
+         *
+         * @param {object} treatment     Treatment to classify
+         * @param {Array}  allTreatments Full treatment list for context
+         * @param {Array}  [crSchedule]  Optional CR schedule for accurate budget calc
+         */
+        const isTrueCorrection = (treatment, allTreatments, crSchedule = null) => {
             if (treatment.carbs && treatment.carbs > 0) return false;
             if (!treatment.insulin || treatment.insulin <= 0) return false;
             
             if (treatment.eventType && treatment.eventType.includes('SMB')) {
                 const smbTime = new Date(treatment.created_at);
-                const oneHourAgo = new Date(smbTime - 1 * 60 * 60 * 1000);
+                // Extended from 1h to 3h to cover full iAPS post-meal SMB delivery window
+                const MEAL_WINDOW_HOURS = 3;
+                const windowStart = new Date(smbTime - MEAL_WINDOW_HOURS * 60 * 60 * 1000);
                 
                 const recentMeals = allTreatments.filter(t => {
                     if (!t.carbs || t.carbs <= 0) return false;
                     if (!t.created_at) return false;
-                    const mealTime = new Date(t.created_at);
-                    return mealTime >= oneHourAgo && mealTime <= smbTime;
+                    const tTime = new Date(t.created_at);
+                    return tTime >= windowStart && tTime <= smbTime;
                 });
                 
-                if (recentMeals.length > 0) return false;
-                return true;
+                if (recentMeals.length === 0) return true; // No meal --> true correction
+                
+                // Use most recent meal as budget reference
+                const newestMeal = recentMeals.reduce((latest, t) =>
+                    new Date(t.created_at) > new Date(latest.created_at) ? t : latest
+                );
+                const mealTime = new Date(newestMeal.created_at);
+                
+                // Derive expected insulin budget for this meal
+                let expectedBudget = 0;
+                if (crSchedule) {
+                    const crEntry = getCRForTime(newestMeal.created_at, crSchedule);
+                    if (crEntry && crEntry.value > 0) {
+                        expectedBudget = newestMeal.carbs / crEntry.value;
+                    }
+                }
+                if (expectedBudget === 0 && newestMeal.insulin > 0) {
+                    // iAPS delivers ~40% upfront; extrapolate full budget from logged bolus
+                    expectedBudget = newestMeal.insulin / 0.40;
+                }
+                if (expectedBudget === 0) {
+                    // Conservative fallback: no budget info; assume meal insulin still active
+                    return false;
+                }
+                
+                // Sum all insulin delivered since meal (upfront + SMBs) up to (not including) this SMB
+                const insulinSinceMeal = allTreatments.filter(t => {
+                    if (!t.insulin || t.insulin <= 0) return false;
+                    if (!t.created_at) return false;
+                    const tTime = new Date(t.created_at);
+                    return tTime >= mealTime && tTime < smbTime;
+                }).reduce((sum, t) => sum + (t.insulin || 0), 0);
+                
+                // Within budget (10% tolerance) --> meal insulin, not a correction
+                if (insulinSinceMeal < expectedBudget * 1.10) return false;
+                
+                return true; // Budget exhausted --> true correction
             }
             
+            // Non-SMB boluses: require no simultaneous carb entry (within +/-2 min)
             const treatmentTime = new Date(treatment.created_at);
             const twoMinutesBefore = new Date(treatmentTime - 2 * 60 * 1000);
             const twoMinutesAfter = new Date(treatmentTime + 2 * 60 * 1000);
@@ -1852,7 +1912,7 @@
                         // Check for corrections between high and low - if corrections were given, skip
                         // (Let Detector 2 handle correction overcorrection)
                         const correctionsDuringPeriod = nightscoutData.treatments.filter(t => {
-                            if (!isTrueCorrection(t, nightscoutData.treatments)) return false;
+                            if (!isTrueCorrection(t, nightscoutData.treatments, crSchedule)) return false;
                             const tTime = new Date(t.created_at);
                             return tTime >= firstHighTime && tTime <= lowTime;
                         });
@@ -2065,7 +2125,7 @@
                     
                     // Find corrections in 1-3 hour lookback window (v25 used this tighter window)
                     const recentCorrections = nightscoutData.treatments.filter(t => {
-                        if (!isTrueCorrection(t, nightscoutData.treatments)) return false;
+                        if (!isTrueCorrection(t, nightscoutData.treatments, crSchedule)) return false;
                         const tTime = new Date(t.created_at);
                         return tTime >= oneHourAgo && tTime < lowTime;
                     });
@@ -2421,7 +2481,7 @@
                 
                 signalAnalysis.periods.forEach(period => {
                     if (!period.hasSufficientData) return;
-                    if (period.cleanWindowCount < 5) return;
+                    if (period.cleanWindowCount < CONFIG.minEventsHighConfidence) return; // Synced with SignalAnalysis threshold
                     
                     const deviation = period.medianDeviation;
                     if (Math.abs(deviation) < 8) return; // Within acceptable range
@@ -2467,9 +2527,26 @@
             },
 
             /**
-             * DETECTOR 5: Unexplained Lows (Regular Lows)
-             * Pattern: Lows not attributed to meals or corrections
-             * Output: Finding of type UNEXPLAINED_LOW
+             * DETECTOR 5: Unclaimed Lows
+             * Pattern: Lows not attributed to meals or corrections (Detectors 1-3)
+             *
+             * TWO MUTUALLY EXCLUSIVE PATHS (only one fires per event):
+             *
+             * PATH A -- RESISTANT_LOW (IOB < 0.2 U at time of low)
+             *   - Low is insulin-independent (activity, alcohol, hormonal, etc.)
+             *   - primaryParameter = null; suggestedChangePercent = 0
+             *   - NO basal reduction recommended
+             *   - Sets PROTECTED status on adjacent parameters
+             *   - Output: FindingType.RESISTANT_LOW
+             *
+             * PATH B -- UNEXPLAINED_LOW (IOB >= 0.2 U or IOB data unavailable)
+             *   - Low likely caused by excess basal
+             *   - primaryParameter = 'basal'; suggestedChangePercent = negative
+             *   - Basal REDUCTION recommended (-5% to -10% by severity)
+             *   - Output: FindingType.UNEXPLAINED_LOW
+             *
+             * When IOB data is unavailable the code defaults to PATH B (conservative).
+             * This is the correct behavior: if we cannot rule out excess basal, we flag it.
              */
             detectUnexplainedLows(lowProblems, nightscoutData, basalSchedule, claimedEvents, analysisWindow) {
                 const findings = [];
@@ -2863,7 +2940,7 @@
                         return hour >= period.startHour && hour < period.endHour;
                     });
                     
-                    const hasSufficientData = windowsInPeriod.length >= 5;
+                    const hasSufficientData = windowsInPeriod.length >= CONFIG.minEventsHighConfidence; // Synced with CONFIG
                     const deviations = windowsInPeriod.map(w => w.deviation).sort((a, b) => a - b);
                     const medianDeviation = hasSufficientData 
                         ? deviations[Math.floor(deviations.length / 2)]
@@ -8265,6 +8342,98 @@
                                     </div>
                                 )}
                                 
+                                {/* Actions */}
+                                <div className="glass-card rounded-2xl p-6">
+                                    <div className="flex flex-wrap gap-3 mb-4">
+                                        <button
+                                            onClick={copyForClaudeReview}
+                                            className={`flex-1 px-4 py-3 rounded-xl font-medium transition-all ${
+                                                copyStatus === 'copied'
+                                                    ? 'bg-green-600/20 text-green-400 border border-green-500/30'
+                                                    : 'bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/30'
+                                            }`}
+                                        >
+                                            {copyStatus === 'copied' ? 'âœ“ Copied!' : 'ðŸ“‹ Copy for Claude Review'}
+                                        </button>
+                                        <button
+                                            onClick={() => setStep('config')}
+                                            className="px-4 py-3 bg-gray-700/50 hover:bg-gray-700 text-gray-300 rounded-xl transition-colors"
+                                        >
+                                            â† Back
+                                        </button>
+                                    </div>
+                                    
+                                    {/* Google Sheets Logging */}
+                                    {sheetsWebAppUrl && (
+                                        <>
+                                        <div className="border-t border-gray-700 pt-4 mt-4">
+                                            <div className="flex items-center gap-3">
+                                                <input
+                                                    type="text"
+                                                    placeholder="Add notes (optional)..."
+                                                    value={loggingNotes}
+                                                    onChange={(e) => setLoggingNotes(e.target.value)}
+                                                    className="flex-1 bg-gray-800/50 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500"
+                                                />
+                                                <button
+                                                    onClick={logToGoogleSheets}
+                                                    disabled={logStatus === 'logging'}
+                                                    className={`px-4 py-2 rounded-xl font-medium transition-all ${
+                                                        logStatus === 'success'
+                                                            ? 'bg-green-600/20 text-green-400 border border-green-500/30'
+                                                            : logStatus === 'error'
+                                                            ? 'bg-red-600/20 text-red-400 border border-red-500/30'
+                                                            : logStatus === 'logging'
+                                                            ? 'bg-gray-600/20 text-gray-400 border border-gray-500/30 cursor-wait'
+                                                            : 'bg-purple-600/20 hover:bg-purple-600/30 text-purple-400 border border-purple-500/30'
+                                                    }`}
+                                                >
+                                                    {logStatus === 'logging' ? 'â³ Logging...' :
+                                                     logStatus === 'success' ? 'âœ“ Logged!' :
+                                                     logStatus === 'error' ? 'âœ— Failed' :
+                                                     'ðŸ“Š Log to Sheets'}
+                                                </button>
+                                            </div>
+                                            {logMessage && logStatus === 'error' && (
+                                                <p className="text-red-400 text-xs mt-2">{logMessage}</p>
+                                            )}
+                                        </div>
+
+                                        {/* Decision Log */}
+                                        <div className="border-t border-gray-700 pt-4 mt-4">
+                                            <div className="flex items-center gap-2 mb-2">
+                                                <span className="text-gray-300 text-sm font-medium">📝 Decision Log</span>
+                                                <span className="text-gray-500 text-xs">Paste Claude's decision log output below</span>
+                                            </div>
+                                            <textarea
+                                                placeholder={`${getLocalDateString()}: `}
+                                                value={decisionLog}
+                                                onChange={(e) => setDecisionLog(e.target.value)}
+                                                rows={3}
+                                                className="w-full bg-gray-800/50 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500 resize-none mb-2"
+                                            />
+                                            <button
+                                                onClick={saveDecisionLog}
+                                                disabled={decisionLogStatus === 'saving'}
+                                                className={`w-full px-4 py-2 rounded-xl font-medium transition-all text-sm ${
+                                                    decisionLogStatus === 'success'
+                                                        ? 'bg-green-600/20 text-green-400 border border-green-500/30'
+                                                        : decisionLogStatus === 'error'
+                                                        ? 'bg-red-600/20 text-red-400 border border-red-500/30'
+                                                        : decisionLogStatus === 'saving'
+                                                        ? 'bg-gray-600/20 text-gray-400 border border-gray-500/30 cursor-wait'
+                                                        : 'bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 border border-amber-500/30'
+                                                }`}
+                                            >
+                                                {decisionLogStatus === 'saving' ? '⏳ Saving...' :
+                                                 decisionLogStatus === 'success' ? '✓ Saved to Sheet!' :
+                                                 decisionLogStatus === 'error' ? '✗ Failed (enter text first)' :
+                                                 '💾 Save Decision Log'}
+                                            </button>
+                                        </div>
+                                        </>
+                                    )}
+                                </div>
                                 {/* Tonight's Action - now supports multiple PRIMARY bundles */}
                                 <div className="glass-card rounded-2xl p-6">
                                     <h2 className="text-xl font-bold text-white mb-4">Tonight's Action</h2>
@@ -8642,98 +8811,7 @@
                                     </div>
                                 )}
                                 
-                                {/* Actions */}
-                                <div className="glass-card rounded-2xl p-6">
-                                    <div className="flex flex-wrap gap-3 mb-4">
-                                        <button
-                                            onClick={copyForClaudeReview}
-                                            className={`flex-1 px-4 py-3 rounded-xl font-medium transition-all ${
-                                                copyStatus === 'copied'
-                                                    ? 'bg-green-600/20 text-green-400 border border-green-500/30'
-                                                    : 'bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 border border-blue-500/30'
-                                            }`}
-                                        >
-                                            {copyStatus === 'copied' ? 'âœ“ Copied!' : 'ðŸ“‹ Copy for Claude Review'}
-                                        </button>
-                                        <button
-                                            onClick={() => setStep('config')}
-                                            className="px-4 py-3 bg-gray-700/50 hover:bg-gray-700 text-gray-300 rounded-xl transition-colors"
-                                        >
-                                            â† Back
-                                        </button>
-                                    </div>
-                                    
-                                    {/* Google Sheets Logging */}
-                                    {sheetsWebAppUrl && (
-                                        <>
-                                        <div className="border-t border-gray-700 pt-4 mt-4">
-                                            <div className="flex items-center gap-3">
-                                                <input
-                                                    type="text"
-                                                    placeholder="Add notes (optional)..."
-                                                    value={loggingNotes}
-                                                    onChange={(e) => setLoggingNotes(e.target.value)}
-                                                    className="flex-1 bg-gray-800/50 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500"
-                                                />
-                                                <button
-                                                    onClick={logToGoogleSheets}
-                                                    disabled={logStatus === 'logging'}
-                                                    className={`px-4 py-2 rounded-xl font-medium transition-all ${
-                                                        logStatus === 'success'
-                                                            ? 'bg-green-600/20 text-green-400 border border-green-500/30'
-                                                            : logStatus === 'error'
-                                                            ? 'bg-red-600/20 text-red-400 border border-red-500/30'
-                                                            : logStatus === 'logging'
-                                                            ? 'bg-gray-600/20 text-gray-400 border border-gray-500/30 cursor-wait'
-                                                            : 'bg-purple-600/20 hover:bg-purple-600/30 text-purple-400 border border-purple-500/30'
-                                                    }`}
-                                                >
-                                                    {logStatus === 'logging' ? 'â³ Logging...' :
-                                                     logStatus === 'success' ? 'âœ“ Logged!' :
-                                                     logStatus === 'error' ? 'âœ— Failed' :
-                                                     'ðŸ“Š Log to Sheets'}
-                                                </button>
-                                            </div>
-                                            {logMessage && logStatus === 'error' && (
-                                                <p className="text-red-400 text-xs mt-2">{logMessage}</p>
-                                            )}
-                                        </div>
 
-                                        {/* Decision Log */}
-                                        <div className="border-t border-gray-700 pt-4 mt-4">
-                                            <div className="flex items-center gap-2 mb-2">
-                                                <span className="text-gray-300 text-sm font-medium">📝 Decision Log</span>
-                                                <span className="text-gray-500 text-xs">Paste Claude's decision log output below</span>
-                                            </div>
-                                            <textarea
-                                                placeholder={`${getLocalDateString()}: `}
-                                                value={decisionLog}
-                                                onChange={(e) => setDecisionLog(e.target.value)}
-                                                rows={3}
-                                                className="w-full bg-gray-800/50 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500 resize-none mb-2"
-                                            />
-                                            <button
-                                                onClick={saveDecisionLog}
-                                                disabled={decisionLogStatus === 'saving'}
-                                                className={`w-full px-4 py-2 rounded-xl font-medium transition-all text-sm ${
-                                                    decisionLogStatus === 'success'
-                                                        ? 'bg-green-600/20 text-green-400 border border-green-500/30'
-                                                        : decisionLogStatus === 'error'
-                                                        ? 'bg-red-600/20 text-red-400 border border-red-500/30'
-                                                        : decisionLogStatus === 'saving'
-                                                        ? 'bg-gray-600/20 text-gray-400 border border-gray-500/30 cursor-wait'
-                                                        : 'bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 border border-amber-500/30'
-                                                }`}
-                                            >
-                                                {decisionLogStatus === 'saving' ? '⏳ Saving...' :
-                                                 decisionLogStatus === 'success' ? '✓ Saved to Sheet!' :
-                                                 decisionLogStatus === 'error' ? '✗ Failed (enter text first)' :
-                                                 '💾 Save Decision Log'}
-                                            </button>
-                                        </div>
-                                        </>
-                                    )}
-                                </div>
                             </div>
                         )}
                     </div>
