@@ -1001,9 +1001,35 @@
                     bundles.push(bundle);
                 });
                 
-                // Group remaining by time window
-                const nonSafetyFindings = findings.filter(f => !this.isSafetyFinding(f));
-                const byWindow = this.groupByTimeWindow(nonSafetyFindings);
+                // Signal findings (BASAL_SIGNAL_HIGH/LOW) are structural/fasting-derived and
+                // must be bundled individually — they answer a different clinical question
+                // (resting basal adequacy) than event-driven findings and must not be merged
+                // with correction or meal findings even when scheduleTime collides.
+                const signalTypes = [FindingType.BASAL_SIGNAL_HIGH, FindingType.BASAL_SIGNAL_LOW];
+                const signalFindings = findings.filter(f => signalTypes.includes(f.type));
+                const nonSafetyNonSignalFindings = findings.filter(f => !this.isSafetyFinding(f) && !signalTypes.includes(f.type));
+
+                signalFindings.forEach(finding => {
+                    const conflict = this.checkSignalConflict(finding, signalAnalysis);
+                    if (conflict) finding.conflictsWith.push(conflict);
+
+                    const bundle = this.createBundle(
+                        `bundle_signal_${finding.scheduleTime}_${finding.type}`,
+                        this.generateBundleName([finding], finding.scheduleTime),
+                        this.determineTier([finding]),
+                        [finding],
+                        schedules,
+                        basalRatioInfo
+                    );
+                    if (conflict) {
+                        bundle.signalConflict = conflict;
+                        bundle.blockedBy = conflict;
+                    }
+                    bundles.push(bundle);
+                });
+
+                // Group remaining event-driven findings by time window
+                const byWindow = this.groupByTimeWindow(nonSafetyNonSignalFindings);
                 
                 Object.entries(byWindow).forEach(([window, windowFindings]) => {
                     const tier = this.determineTier(windowFindings);
@@ -1128,10 +1154,7 @@
             },
             
             generateBundleName(findings, window) {
-                const param = findings[0]?.primaryParameter || 'Parameter';
-                const type = this.isStrengthening(findings[0]) ? 'Strengthening' : 'Weakening';
-                
-                // Try to create a descriptive name
+                // Named cases in priority order (matches generateRootCause and detector field)
                 if (findings.some(f => f.type === FindingType.POST_MEAL_HIGH)) {
                     return `${window} Post-Meal Highs`;
                 }
@@ -1141,7 +1164,17 @@
                 if (findings.some(f => f.type === FindingType.BASAL_SIGNAL_HIGH)) {
                     return `${window} Basal - Rising Pattern`;
                 }
+                if (findings.some(f => f.type === FindingType.REBOUND_HIGH)) {
+                    return `${window} Rebound High (Post-Low)`;
+                }
+                if (findings.some(f => f.type === FindingType.BASAL_RATIO_EXCEEDED)) {
+                    return 'Basal Ratio Warning';
+                }
                 
+                // Fallback: use dominant finding (first with a primaryParameter)
+                const dominant = findings.find(f => f.primaryParameter) || findings[0];
+                const param = dominant?.primaryParameter || 'Parameter';
+                const type = dominant ? (this.isStrengthening(dominant) ? 'Strengthening' : 'Weakening') : 'Adjustment';
                 return `${window} ${param.toUpperCase()} ${type}`;
             },
             
@@ -2484,7 +2517,7 @@
                     if (period.cleanWindowCount < CONFIG.minEventsHighConfidence) return; // Synced with SignalAnalysis threshold
                     
                     const deviation = period.medianDeviation;
-                    if (Math.abs(deviation) < 8) return; // Within acceptable range
+                    if (Math.abs(deviation) <= 10) return; // Only act on confirmed HIGH/LOW signal (aligns with signal label threshold)
                     
                     const type = deviation > 0 ? FindingType.BASAL_SIGNAL_HIGH : FindingType.BASAL_SIGNAL_LOW;
                     // BUG FIX: Correct the sign
