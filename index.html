@@ -2125,7 +2125,7 @@
                     
                     // Find corrections in 1-3 hour lookback window (v25 used this tighter window)
                     const recentCorrections = nightscoutData.treatments.filter(t => {
-                        if (!isTrueCorrection(t, nightscoutData.treatments, crSchedule)) return false;
+                        if (!isTrueCorrection(t, nightscoutData.treatments)) return false; // no crSchedule in this detector
                         const tTime = new Date(t.created_at);
                         return tTime >= oneHourAgo && tTime < lowTime;
                     });
@@ -2308,7 +2308,7 @@
                     
                     // Check for corrections
                     const correctionsAfterMeal = nightscoutData.treatments.filter(t => {
-                        if (!isTrueCorrection(t, nightscoutData.treatments)) return false;
+                        if (!isTrueCorrection(t, nightscoutData.treatments, crSchedule)) return false;
                         const tTime = new Date(t.created_at);
                         return tTime > mealTime && tTime <= threeHoursAfter;
                     });
