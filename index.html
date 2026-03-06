@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.4.1 - Target BG Schedule (SPEC 6 - Fixed)</title>
+    <title>Daily Insulin Settings Review v3.5.0</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -174,6 +174,39 @@
             const month = String(date.getMonth() + 1).padStart(2, '0');
             const day = String(date.getDate()).padStart(2, '0');
             return `${year}-${month}-${day}`;
+        };
+
+        // MIN-C: Debug flag — set to true during development to re-enable verbose logging
+        const DEBUG = false;
+        const log = (...args) => DEBUG && console.log(...args);
+
+        // BUG-A FIX: Duration-weighted basal daily total helper.
+        // The naïve reduce((sum, e) => sum + e.value) sums U/hr rates, not U/day.
+        // This function multiplies each rate by its active hours before summing.
+        const computeBasalDailyTotal = (schedule) => {
+            if (!schedule || !Array.isArray(schedule) || schedule.length === 0) return 0;
+            return schedule.reduce((sum, entry, idx, arr) => {
+                const nextIdx = (idx + 1) % arr.length;
+                const curHour = parseInt(entry.time.split(':')[0]);
+                const nextHour = nextIdx === 0 ? 24 : parseInt(arr[nextIdx].time.split(':')[0]);
+                return sum + entry.value * (nextHour - curHour);
+            }, 0);
+        };
+
+        // DQ-B FIX: Shared TDD extraction helper replaces 3 independent duplicate implementations.
+        // iAPS reason string format: "...2week TDD 18.5 ... Insulin 24h: 14.2..."
+        const extractTDDFromDeviceStatus = (deviceStatus, maxEntries = 5) => {
+            let tdd24h = null, tdd2Week = null;
+            for (let i = 0; i < Math.min(maxEntries, deviceStatus?.length || 0); i++) {
+                const reason = deviceStatus[i]?.openaps?.enacted?.reason;
+                if (!reason) continue;
+                const m2w = reason.match(/2week TDD (\d+\.?\d*)/);
+                const m24 = reason.match(/Insulin 24h: (\d+\.?\d*)/);
+                if (m2w) tdd2Week = parseFloat(m2w[1]);
+                if (m24) tdd24h = parseFloat(m24[1]);
+                if (tdd2Week || tdd24h) break;
+            }
+            return { tdd24h, tdd2Week, tddForSignal: tdd2Week || tdd24h };
         };
         
         const CIRCADIAN_PERIODS = [
@@ -2027,7 +2060,7 @@
                         }],
                         similarEventsCount: 1,
                         daysWithPattern: 1,
-                        primaryParameter: 'CR',
+                        primaryParameter: 'cr',
                         suggestedChangePercent: adjustmentPercent,
                         contributingFactors: ['strong_cr', 'spike_and_crash'],
                         claimedEventIds: [bestMatch.mealId, lowId, ...bestMatch.highReadings.map(getEventId)],
@@ -2126,7 +2159,7 @@
                         }],
                         similarEventsCount: 1,
                         daysWithPattern: 1,
-                        primaryParameter: 'CR',
+                        primaryParameter: 'cr',
                         suggestedChangePercent: adjustmentPercent,
                         contributingFactors: ['strong_cr'],
                         claimedEventIds: [mealId, lowId],
@@ -2146,7 +2179,7 @@
              * Also checks for meals between correction and low (stacking)
              * Output: Finding of type ISF_INDUCED_LOW
              */
-            detectISFInducedLows(lowProblems, nightscoutData, isfSchedule, claimedEvents, analysisWindow) {
+            detectISFInducedLows(lowProblems, nightscoutData, isfSchedule, claimedEvents, analysisWindow, crSchedule = null) { // DQ-D FIX: added crSchedule param
                 const findings = [];
                 
                 lowProblems.forEach(low => {
@@ -2159,7 +2192,7 @@
                     
                     // Find corrections in 1-3 hour lookback window (v25 used this tighter window)
                     const recentCorrections = nightscoutData.treatments.filter(t => {
-                        if (!isTrueCorrection(t, nightscoutData.treatments)) return false; // no crSchedule in this detector
+                        if (!isTrueCorrection(t, nightscoutData.treatments, crSchedule)) return false; // DQ-D FIX: pass crSchedule so budget logic works
                         const tTime = new Date(t.created_at);
                         return tTime >= oneHourAgo && tTime < lowTime;
                     });
@@ -2269,7 +2302,7 @@
                         }],
                         similarEventsCount: 1,
                         daysWithPattern: 1,
-                        primaryParameter: 'ISF',
+                        primaryParameter: 'isf',
                         suggestedChangePercent: adjustmentPercent,
                         contributingFactors: hasStacking ? ['strong_isf', 'insulin_stacking'] : ['strong_isf'],
                         claimedEventIds: [...recentCorrections.map(getEventId), ...highReadings.map(getEventId)],
@@ -2429,7 +2462,8 @@
                     }
                     
                     // Simple rebound check (meal during low without severe crash)
-                    if (bgAtMealTime && bgAtMealTime.sgv < 70) {
+                    // BUG-E FIX: was < 70, but mealDuringLow uses < 80 — gap at 70-80 caused missed REBOUND_HIGH
+                    if (bgAtMealTime && bgAtMealTime.sgv < 80) {
                         findings.push({
                             id: `finding_rebound_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                             type: FindingType.REBOUND_HIGH,
@@ -2490,7 +2524,7 @@
                         }],
                         similarEventsCount: 1,
                         daysWithPattern: 1,
-                        primaryParameter: 'CR',
+                        primaryParameter: 'cr',
                         suggestedChangePercent: adjustmentPercent,
                         contributingFactors: ['weak_cr'],
                         claimedEventIds: [mealId, ...highReadings.map(getEventId), ...correctionsAfterMeal.map(getEventId)],
@@ -2671,23 +2705,27 @@
             
             getIOBAtTime(deviceStatus, targetTime) {
                 if (!deviceStatus || deviceStatus.length === 0) return null;
-                
+
                 const targetTimestamp = new Date(targetTime).getTime();
                 let closestIOB = null;
                 let minTimeDiff = Infinity;
-                
+
+                // BUG-B FIX: handle both numeric and object-form IOB (matches Detector 3 logic)
+                // BUG-B FIX: align lookup window to 15 min (was 10 min — too tight for CGM alignment)
                 deviceStatus.forEach(status => {
-                    if (status.created_at && status.iob && typeof status.iob === 'number') {
-                        const statusTime = new Date(status.created_at).getTime();
-                        const timeDiff = Math.abs(statusTime - targetTimestamp);
-                        
-                        if (timeDiff < 10 * 60 * 1000 && timeDiff < minTimeDiff) {
-                            minTimeDiff = timeDiff;
-                            closestIOB = status.iob;
-                        }
+                    if (!status.created_at) return;
+                    const iobVal = typeof status.iob === 'object' && status.iob !== null
+                        ? status.iob.iob
+                        : status.iob;
+                    if (typeof iobVal !== 'number') return;
+                    const statusTime = new Date(status.created_at).getTime();
+                    const timeDiff = Math.abs(statusTime - targetTimestamp);
+                    if (timeDiff < 15 * 60 * 1000 && timeDiff < minTimeDiff) {
+                        minTimeDiff = timeDiff;
+                        closestIOB = iobVal;
                     }
                 });
-                
+
                 return closestIOB;
             },
             
@@ -2902,7 +2940,7 @@
                         })),
                         similarEventsCount: corrections.length,
                         daysWithPattern: 1,
-                        primaryParameter: 'ISF',
+                        primaryParameter: 'isf',
                         suggestedChangePercent: adjustmentPercent,
                         contributingFactors: ['weak_isf', 'persistent_highs'],
                         claimedEventIds: corrections.map(c => getEventId(c)),
@@ -4129,7 +4167,7 @@
                 output += `\n`;
                 
                 output += `**Basal Schedule (U/hr):**\n`;
-                const basalTotal = schedules.basal.reduce((sum, e) => sum + e.value, 0);
+                const basalTotal = computeBasalDailyTotal(schedules.basal); // BUG-A FIX: duration-weighted
                 schedules.basal.forEach(entry => {
                     output += `- ${entry.time}: ${entry.value}\n`;
                 });
@@ -4153,8 +4191,8 @@
                     const recencyIcon = finding.eventsLast24h > 0 ? '[NEW]' :
                                        finding.eventsLast3Days > 0 ? '[OLD]' :
                                        finding.isStructural ? '[STRUCTURAL]' : '[STALE]';
-                                       finding.isStructural ? 'â—' : 'âš ï¸';
-                    output += `${idx + 1}. ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
+                    const recencyDot = finding.isStructural ? '◉' : '⚠️'; // BUG-C FIX: was a dead expression
+                    output += `${idx + 1}. ${recencyDot} ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
                     output += `   - Severity: ${(finding.severity * 100).toFixed(0)}%\n`;
                     output += `   - ${finding.details}\n\n`;
                 });
@@ -6377,41 +6415,15 @@
                 // Calculate basal total from active schedule
                 let basalTotal = 0;
                 if (activeSchedules?.basal && Array.isArray(activeSchedules.basal)) {
-                    // Use the basal array directly, not converted to object
-                    basalTotal = activeSchedules.basal.reduce((sum, entry) => sum + entry.value, 0);
+                    // BUG-A FIX: use duration-weighted sum, not raw rate sum
+                    basalTotal = computeBasalDailyTotal(activeSchedules.basal);
                 } else if (basalSchedule) {
-                    basalTotal = basalSchedule.reduce((sum, entry) => sum + entry.value, 0);
+                    basalTotal = computeBasalDailyTotal(basalSchedule);
                 }
                 console.log('Basal total for sensitivity calculation:', basalTotal.toFixed(2));
                 
-                // Calculate TDD from iAPS deviceStatus (extract both 24h and 2-week)
-                let tdd = null;
-                let tdd24h = null;
-                let tdd2Week = null;
-                if (nightscoutData?.deviceStatus) {
-                    for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
-                        const status = nightscoutData.deviceStatus[i];
-                        if (status.openaps?.enacted?.reason) {
-                            const reason = status.openaps.enacted.reason;
-                            // Extract TDD values from reason string
-                            // "Insulin 24h" = Rolling 24-hour insulin delivery (what we want)
-                            // "TDD" = Today's total since midnight (calendar day)
-                            const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                            const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
-                            
-                            if (twoWeekMatch) {
-                                tdd2Week = parseFloat(twoWeekMatch[1]);
-                                tdd = tdd2Week; // Prefer 2-week for calculations
-                            }
-                            if (currentMatch) {
-                                tdd24h = parseFloat(currentMatch[1]);
-                                if (!tdd) tdd = tdd24h; // Fallback to 24h
-                            }
-                            
-                            if (tdd2Week || tdd24h) break;
-                        }
-                    }
-                }
+                // DQ-B FIX: TDD extraction — use shared helper (was duplicated in 3 places)
+                const { tdd24h, tdd2Week, tddForSignal: tdd } = extractTDDFromDeviceStatus(nightscoutData?.deviceStatus);
                 
                 // Calculate total carbs in last 24 hours
                 let totalCarbs24h = 0;
@@ -6508,55 +6520,36 @@
                         isf: scheduleToObject(activeSchedules?.isf || isfSchedule)
                     },
                     // SPEC 2: Trend tracking columns
+                    // DQ-C FIX: calculateAGP was called 7 separate times iterating ~2016 readings each.
+                    // Compute once and reuse for all period TIR lookups.
                     tir7d: (() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
-                            return agp ? agp.tir.inRange.toFixed(1) : '';
+                            const agp7d = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
+                            return agp7d ? agp7d.tir.inRange.toFixed(1) : '';
                         } catch(e) { return ''; }
                     })(),
                     basalRatio: basalRatioInfo?.ratio ? basalRatioInfo.ratio.toFixed(1) : '',
-                    // SPEC 2+: Period TIR tracking
-                    tirDeepSleep: (() => {
+                    // SPEC 2+: Period TIR tracking — all reuse the same cached AGP computed once above
+                    ...(() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
-                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Deep Sleep');
-                            return tir !== null ? tir.toString() : '';
-                        } catch(e) { return ''; }
-                    })(),
-                    tirDawn: (() => {
-                        try {
-                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
-                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Dawn');
-                            return tir !== null ? tir.toString() : '';
-                        } catch(e) { return ''; }
-                    })(),
-                    tirMorning: (() => {
-                        try {
-                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
-                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Morning');
-                            return tir !== null ? tir.toString() : '';
-                        } catch(e) { return ''; }
-                    })(),
-                    tirAfternoon: (() => {
-                        try {
-                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
-                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Afternoon');
-                            return tir !== null ? tir.toString() : '';
-                        } catch(e) { return ''; }
-                    })(),
-                    tirEvening: (() => {
-                        try {
-                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
-                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Evening');
-                            return tir !== null ? tir.toString() : '';
-                        } catch(e) { return ''; }
-                    })(),
-                    tirSleepOnset: (() => {
-                        try {
-                            const agp = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7);
-                            const tir = OutputFormatter.calculatePeriodTIR(agp, 'Sleep Onset');
-                            return tir !== null ? tir.toString() : '';
-                        } catch(e) { return ''; }
+                            const agp7d = OutputFormatter.calculateAGP(nightscoutData?.glucose, 7); // single call
+                            const getTIR = (period) => {
+                                try {
+                                    const tir = OutputFormatter.calculatePeriodTIR(agp7d, period);
+                                    return tir !== null ? tir.toString() : '';
+                                } catch(e) { return ''; }
+                            };
+                            return {
+                                tirDeepSleep: getTIR('Deep Sleep'),
+                                tirDawn:      getTIR('Dawn'),
+                                tirMorning:   getTIR('Morning'),
+                                tirAfternoon: getTIR('Afternoon'),
+                                tirEvening:   getTIR('Evening'),
+                                tirSleepOnset: getTIR('Sleep Onset'),
+                            };
+                        } catch(e) {
+                            return { tirDeepSleep:'', tirDawn:'', tirMorning:'', tirAfternoon:'', tirEvening:'', tirSleepOnset:'' };
+                        }
                     })(),
                     primaryActions: (() => {
                         try {
@@ -6738,39 +6731,8 @@
                         }));
                     
                     // Extract TDD from iAPS deviceStatus for signal analysis
-                    let tddForSignal = null;
-                    let tdd24h = null;
-                    let tdd2Week = null;
-                    
-                    if (nightscoutData.deviceStatus) {
-                        for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
-                            const status = nightscoutData.deviceStatus[i];
-                            if (status.openaps?.enacted?.reason) {
-                                const reason = status.openaps.enacted.reason;
-                                
-                                // Extract TDD values from reason string
-                                // "Insulin 24h" = Rolling 24-hour insulin delivery (what we want)
-                                // "TDD" = Today's total since midnight (calendar day)
-                                const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                                const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
-                                
-                                if (twoWeekMatch) {
-                                    tdd2Week = parseFloat(twoWeekMatch[1]);
-                                }
-                                if (currentMatch) {
-                                    tdd24h = parseFloat(currentMatch[1]);
-                                }
-                                
-                                // If we found either value, we're done
-                                if (tdd2Week || tdd24h) {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Prefer 2-week TDD for signal analysis (more stable)
-                    tddForSignal = tdd2Week || tdd24h;
+                    // DQ-B FIX: use shared TDD extraction helper
+                    const { tdd24h, tdd2Week, tddForSignal } = extractTDDFromDeviceStatus(nightscoutData?.deviceStatus);
                     
                     console.log('TDD extracted:', {
                         tdd24h: tdd24h,
@@ -6895,7 +6857,7 @@
                             // treatment would be given. Also look forward 15 min after the last
                             // sub-70 reading to catch carbs logged during an active low.
                             const alreadyLogged = loggedCarbTimes.some(lt =>
-                                lt.time >= group.startMs - 20 * 60 * 1000 &&
+                                lt.time >= group.startMs - 60 * 60 * 1000 && // BUG-D FIX: was 20 min, comment said 60 min
                                 lt.time <= eventEndMs + 15 * 60 * 1000
                             );
 
@@ -6932,8 +6894,8 @@
                     
                     // Calculate Carb-Adjusted Sensitivity from Sheets history
                     let carbAdjSensitivity = null;
-                    const basalTotal = activeSchedules?.basal 
-                        ? activeSchedules.basal.reduce((sum, entry) => sum + entry.value, 0)
+                    const basalTotal = activeSchedules?.basal
+                        ? computeBasalDailyTotal(activeSchedules.basal) // BUG-A FIX: duration-weighted
                         : 0;
                     console.log('Carb-Adjusted: Gate check -', {
                         hasSheetsUrl: !!sheetsWebAppUrl,
@@ -7061,7 +7023,7 @@
                     
                     // Detector 2: ISF-Induced Lows (Correction Overcorrection)
                     allFindings.push(...PatternDetectors.detectISFInducedLows(
-                        lowProblems, nightscoutData, activeSchedules.isf, claimedEvents, analysisWindow
+                        lowProblems, nightscoutData, activeSchedules.isf, claimedEvents, analysisWindow, activeSchedules.cr // DQ-D FIX: pass crSchedule
                     ));
                     
                     // Detector 3: Post-Meal Highs
@@ -7114,7 +7076,7 @@
                         
                         // Apply confidence penalty to CR/ISF findings
                         allFindings.forEach(f => {
-                            if (f.primaryParameter === 'CR' || f.primaryParameter === 'ISF') {
+                            if (f.primaryParameter === 'cr' || f.primaryParameter === 'isf') {
                                 f.severity = f.severity * 0.8; // 20% penalty
                                 f.contributingFactors = f.contributingFactors || [];
                                 f.contributingFactors.push('penalized_basal_ratio');
@@ -7140,7 +7102,7 @@
                         currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
                     } else {
                         console.warn('activeSchedules.basal not available, using basalSchedule fallback');
-                        currentBasalTotal = basalSchedule.reduce((sum, entry) => sum + entry.value, 0);
+                        currentBasalTotal = computeBasalDailyTotal(basalSchedule); // BUG-A FIX
                         currentBasalPercent = tddForSignal ? (currentBasalTotal / tddForSignal) * 100 : null;
                     }
                     
@@ -7434,10 +7396,10 @@
                     let yesterdayEntry = null;
                     if (cachedSheetsEntries && cachedSheetsEntries.length > 0) {
                         const sorted = [...cachedSheetsEntries].sort((a, b) => new Date(a.date) - new Date(b.date));
-                        const todayStr = new Date().toISOString().split('T')[0];
+                        const todayStr = getLocalDateString(); // DQ-A FIX: was new Date().toISOString().split('T')[0] (UTC, diverges near midnight)
                         // Find most recent entry that is NOT from today
                         for (let i = sorted.length - 1; i >= 0; i--) {
-                            const entryDate = sorted[i].date ? new Date(sorted[i].date).toISOString().split('T')[0] : null;
+                            const entryDate = sorted[i].date ? getLocalDateString(new Date(sorted[i].date)) : null; // DQ-A FIX: use local date
                             if (entryDate && entryDate !== todayStr) {
                                 yesterdayEntry = sorted[i];
                                 break;
@@ -7628,7 +7590,7 @@
                         const todayVal = today[time];
                         const yesterdayVal = yesterday[time];
                         
-                        if (yesterdayVal !== undefined && todayVal !== yesterdayVal) {
+                        if (yesterdayVal !== undefined && Math.abs(todayVal - yesterdayVal) > 0.001) { // BUG-F FIX: float equality → tolerance
                             const changePercent = ((todayVal - yesterdayVal) / yesterdayVal * 100).toFixed(1);
                             changes.push({
                                 type: paramType,
@@ -7706,26 +7668,9 @@
                     (sum, p) => sum + (p.cleanWindowCount || 0), 0
                 );
                 
-                // Calculate TDD from iAPS deviceStatus
-                let tdd = null;
+                // DQ-B FIX: use shared TDD extraction helper
                 const nightscoutData = analysisResults.nightscoutData;
-                if (nightscoutData?.deviceStatus) {
-                    for (let i = 0; i < Math.min(5, nightscoutData.deviceStatus.length); i++) {
-                        const status = nightscoutData.deviceStatus[i];
-                        if (status.openaps?.enacted?.reason) {
-                            const reason = status.openaps.enacted.reason;
-                            const twoWeekMatch = reason.match(/2week TDD (\d+\.?\d*)/);
-                            if (twoWeekMatch) {
-                                tdd = parseFloat(twoWeekMatch[1]);
-                                break;
-                            }
-                            const currentMatch = reason.match(/Insulin 24h: (\d+\.?\d*)/);
-                            if (currentMatch && !tdd) {
-                                tdd = parseFloat(currentMatch[1]);
-                            }
-                        }
-                    }
-                }
+                const { tddForSignal: tdd } = extractTDDFromDeviceStatus(nightscoutData?.deviceStatus);
                 
                 // Use effective target from analysis (BUG-018)
                 const targetPercent = analysisResults.effectiveBasalTarget || basalTDDPercent;
