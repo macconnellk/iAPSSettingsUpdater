@@ -4340,7 +4340,14 @@
                         urgent: bundle.isUrgent || false,
                         recency,
                         name: bundle.name,
-                        detector: bundle.findings?.[0]?.type || 'unknown',
+                        detector: (() => {
+                            const f = bundle.findings || [];
+                            if (f.some(x => x.type === FindingType.POST_MEAL_HIGH)) return FindingType.POST_MEAL_HIGH;
+                            if (f.some(x => x.type === FindingType.CORRECTION_INEFFECTIVE)) return FindingType.CORRECTION_INEFFECTIVE;
+                            if (f.some(x => x.type === FindingType.BASAL_SIGNAL_HIGH)) return FindingType.BASAL_SIGNAL_HIGH;
+                            if (f.some(x => x.type === FindingType.BASAL_SIGNAL_LOW)) return FindingType.BASAL_SIGNAL_LOW;
+                            return f[0]?.type || 'unknown';
+                        })(),
                         timeBlock: bundle.timeBlock || 'General',
                         rootCause: bundle.rootCause || null,
                         urgentReason: bundle.urgentReason || null,
