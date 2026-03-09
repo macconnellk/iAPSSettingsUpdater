@@ -8042,6 +8042,41 @@
                                     </div>
                                 </div>
                                 
+                                {/* Decision Log — available here so a page reload doesn't lose access */}
+                                {sheetsWebAppUrl && (
+                                    <div className="border-t border-gray-700 pt-4">
+                                        <div className="flex items-center gap-2 mb-2">
+                                            <span className="text-gray-300 text-sm font-medium">📝 Decision Log</span>
+                                            <span className="text-gray-500 text-xs">Paste Claude's decision log output below</span>
+                                        </div>
+                                        <textarea
+                                            placeholder={`${getLocalDateString()}: `}
+                                            value={decisionLog}
+                                            onChange={(e) => setDecisionLog(e.target.value)}
+                                            rows={3}
+                                            className="w-full bg-gray-800/50 border border-gray-700 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-500 resize-none mb-2"
+                                        />
+                                        <button
+                                            onClick={saveDecisionLog}
+                                            disabled={decisionLogStatus === 'saving'}
+                                            className={`w-full px-4 py-2 rounded-xl font-medium transition-all text-sm ${
+                                                decisionLogStatus === 'success'
+                                                    ? 'bg-green-600/20 text-green-400 border border-green-500/30'
+                                                    : decisionLogStatus === 'error'
+                                                    ? 'bg-red-600/20 text-red-400 border border-red-500/30'
+                                                    : decisionLogStatus === 'saving'
+                                                    ? 'bg-gray-600/20 text-gray-400 border border-gray-500/30 cursor-wait'
+                                                    : 'bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 border border-amber-500/30'
+                                            }`}
+                                        >
+                                            {decisionLogStatus === 'saving' ? '⏳ Saving...' :
+                                             decisionLogStatus === 'success' ? '✓ Saved to Sheet!' :
+                                             decisionLogStatus === 'error' ? '✗ Failed (enter text first)' :
+                                             '💾 Save Decision Log'}
+                                        </button>
+                                    </div>
+                                )}
+
                                 {/* Run Button */}
                                 <button
                                     onClick={runAnalysis}
