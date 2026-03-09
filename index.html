@@ -2976,7 +2976,7 @@
                 const analysisStart = new Date(Date.now() - basalWindow * 24 * 60 * 60 * 1000);
                 
                 // Find clean windows (IOB < 0.1, COB = 0)
-                // Tighter threshold = cleaner signal (0.1 U Ã— ISF 100 = max 10 mg/dL pending impact)
+                // Tighter threshold = cleaner signal (0.1 U × ISF 100 = max 10 mg/dL pending impact)
                 const cleanWindows = [];
                 
                 nightscoutData.glucose.forEach(reading => {
@@ -3045,7 +3045,7 @@
                 let currentBasalPercent = null;
                 let adjustmentPercent = null;
                 
-                // Tiered nudge table: 1% per 10 mg/dL band, capped at Â±5%
+                // Tiered nudge table: 1% per 10 mg/dL band, capped at ±5%
                 const getTieredAdjustment = (deviation) => {
                     if (deviation < -50) return -5;
                     if (deviation < -40) return -4;
@@ -3851,7 +3851,7 @@
                         const isSignalFallback = analysisResults.effectiveTargetSource === 'signal-fallback';
                         
                         output += `**Basal % of TDD:**\n`;
-                        if (currentPct) output += `- Current: ${currentPct.toFixed(1)}% (actual basal schedule Ã· TDD)\n`;
+                        if (currentPct) output += `- Current: ${currentPct.toFixed(1)}% (actual basal schedule ÷ TDD)\n`;
                         if (signalPct) output += `- Signal: ${signalPct.toFixed(1)}% (today's clean windows suggest)\n`;
                         
                         // BUG-023: Show different message for signal fallback
@@ -4100,7 +4100,7 @@
                     }
                     // Show ratio protection info
                     if (dist.ratioProtection?.active) {
-                        output += `🛡ï¸ **Ratio Protection:** ${dist.ratioProtection.blockedCount} change(s) blocked to maintain ≤2:1 ratio (min rate floor: ${dist.ratioProtection.minAllowedRate} U/hr)\n`;
+                        output += `🛡️ **Ratio Protection:** ${dist.ratioProtection.blockedCount} change(s) blocked to maintain ≤2:1 ratio (min rate floor: ${dist.ratioProtection.minAllowedRate} U/hr)\n`;
                     }
                     output += `\n`;
                 }
@@ -6453,13 +6453,13 @@
                 const gap = signalPercent ? (signalPercent - targetPercent) : 0;
                 
                 // Calculate final % 
-                // Logic: Final % = Target % rate-limited to Yesterday's Final % Â± 2%
+                // Logic: Final % = Target % rate-limited to Yesterday's Final % ± 2%
                 let finalPercent = targetPercent;
                 
                 // Apply guardrails (30-50%)
                 finalPercent = Math.max(30, Math.min(50, finalPercent));
                 
-                // Rate limit: max Â±2% per day from yesterday's final
+                // Rate limit: max ±2% per day from yesterday's final
                 const maxDailyChange = 2.0;
                 if (yesterdayFinal !== null && yesterdayFinal !== undefined) {
                     if (finalPercent > yesterdayFinal + maxDailyChange) {
@@ -7678,13 +7678,13 @@
                 const gap = signalPercent ? (signalPercent - targetPercent) : 0;
                 
                 // Calculate final %
-                // Logic: Final % = Target % rate-limited to Yesterday's Final % Â± 2%
+                // Logic: Final % = Target % rate-limited to Yesterday's Final % ± 2%
                 let finalPercent = targetPercent;
                 
                 // Apply guardrails (30-50%)
                 finalPercent = Math.max(30, Math.min(50, finalPercent));
                 
-                // Rate limit: max Â±2% per day from yesterday's final
+                // Rate limit: max ±2% per day from yesterday's final
                 const maxDailyChange = 2.0;
                 const yesterdayFinal = dynamicTarget?.yesterdayFinal;
                 if (yesterdayFinal !== null && yesterdayFinal !== undefined) {
@@ -8233,7 +8233,7 @@
                                         {/* Target calculation context */}
                                         {analysisResults.tdd && analysisResults.finalPercent && (
                                             <div className="text-xs text-gray-500 mb-4">
-                                                Target: {analysisResults.finalPercent.toFixed(1)}% Ã— {analysisResults.tdd.toFixed(1)} U TDD = {((analysisResults.finalPercent / 100) * analysisResults.tdd).toFixed(2)} U/day
+                                                Target: {analysisResults.finalPercent.toFixed(1)}% × {analysisResults.tdd.toFixed(1)} U TDD = {((analysisResults.finalPercent / 100) * analysisResults.tdd).toFixed(2)} U/day
                                             </div>
                                         )}
                                         
