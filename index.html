@@ -464,12 +464,12 @@
                 // Check for sustained sensitivity elevation across consecutive sessions
                 // Two consecutive sessions with carbAdjSensitivity >= 1.10 = TRANSIENT_SENSITIVITY
                 // regardless of signal direction consistency (catches step-change scenarios)
-                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 1.10 && sensitivityHistory) {
+                if (carbAdjSensitivity !== null && carbAdjSensitivity >= .95 && sensitivityHistory) {
                     const sortedHistory = [...sensitivityHistory]
                         .filter(e => e.carbAdjSensitivity && !isNaN(parseFloat(e.carbAdjSensitivity)))
                         .sort((a, b) => new Date(b.date || b.timestamp) - new Date(a.date || a.timestamp));
                     const priorSensitivity = sortedHistory.length > 0 ? parseFloat(sortedHistory[0].carbAdjSensitivity) : null;
-                    if (priorSensitivity !== null && priorSensitivity >= 1.10) {
+                    if (priorSensitivity !== null && priorSensitivity >= .95) {
                         return {
                             state: BodyStateType.TRANSIENT_SENSITIVITY,
                             confidence: 0.85,
