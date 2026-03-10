@@ -424,7 +424,7 @@
         // =========================================================================
         
         const StateDetector = {
-            detect(signalAnalysis, tddHistory, changeHistory, userOverride = null) {
+            detect(signalAnalysis, tddHistory, changeHistory, userOverride = null, carbAdjSensitivity = null, sensitivityHistory = null) {
                 // Check for user-declared override first
                 if (userOverride && userOverride.active) {
                     return {
@@ -459,6 +459,28 @@
                         contributingFactors: [`${recentChanges.length} parameter changes in last ${CONFIG.recoveryDays} days`],
                         recommendedOverride: null
                     };
+                }
+                
+                // Check for sustained sensitivity elevation across consecutive sessions
+                // Two consecutive sessions with carbAdjSensitivity >= 1.10 = TRANSIENT_SENSITIVITY
+                // regardless of signal direction consistency (catches step-change scenarios)
+                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 1.10 && sensitivityHistory) {
+                    const sortedHistory = [...sensitivityHistory]
+                        .filter(e => e.carbAdjSensitivity && !isNaN(parseFloat(e.carbAdjSensitivity)))
+                        .sort((a, b) => new Date(b.date || b.timestamp) - new Date(a.date || a.timestamp));
+                    const priorSensitivity = sortedHistory.length > 0 ? parseFloat(sortedHistory[0].carbAdjSensitivity) : null;
+                    if (priorSensitivity !== null && priorSensitivity >= 1.10) {
+                        return {
+                            state: BodyStateType.TRANSIENT_SENSITIVITY,
+                            confidence: 0.85,
+                            daysInState: 2,
+                            contributingFactors: [
+                                `Carb-adjusted sensitivity ${carbAdjSensitivity.toFixed(2)} (current session)`,
+                                `Prior session sensitivity ${priorSensitivity.toFixed(2)} — sustained elevation ≥1.10 for 2+ sessions`
+                            ],
+                            recommendedOverride: carbAdjSensitivity >= 1.20 ? 85 : 90
+                        };
+                    }
                 }
                 
                 // Analyze signal directions
@@ -7190,7 +7212,9 @@
                         signalAnalysis,
                         null, // TDD history not yet implemented
                         changeHistory,
-                        userOverride.active ? userOverride : null
+                        userOverride.active ? userOverride : null,
+                        carbAdjSensitivity || null,
+                        cachedSheetsEntries || null
                     );
                     
                     // Run recommendation engine
