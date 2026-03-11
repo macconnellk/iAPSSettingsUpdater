@@ -464,17 +464,12 @@
                 // Check for sustained sensitivity elevation across consecutive sessions
                 // Two consecutive sessions with carbAdjSensitivity >= 1.10 = TRANSIENT_SENSITIVITY
                 // regardless of signal direction consistency (catches step-change scenarios)
-                console.log('[StateDetector] carbAdjSensitivity:', carbAdjSensitivity, '| sensitivityHistory length:', sensitivityHistory ? sensitivityHistory.length : 'null');
-                if (sensitivityHistory && sensitivityHistory.length > 0) {
-                    console.log('[StateDetector] Most recent history entry:', JSON.stringify(sensitivityHistory[0]));
-                }
-                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 0.90 && sensitivityHistory) {
-                    const sortedHistory = [...sensitivityHistory]
+                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 1.10 && sensitivityHistoryLocal) {
+                    const sortedHistory = [...sensitivityHistoryLocal]
                         .filter(e => e.carbAdjSensitivity && !isNaN(parseFloat(e.carbAdjSensitivity)))
                         .sort((a, b) => new Date(b.date || b.timestamp) - new Date(a.date || a.timestamp));
                     const priorSensitivity = sortedHistory.length > 0 ? parseFloat(sortedHistory[0].carbAdjSensitivity) : null;
-                    console.log('[StateDetector] priorSensitivity from history:', priorSensitivity, '| sortedHistory length:', sortedHistory.length);
-                    if (priorSensitivity !== null && priorSensitivity >= 0.90) {
+                    if (priorSensitivity !== null && priorSensitivity >= 1.10) {
                         return {
                             state: BodyStateType.TRANSIENT_SENSITIVITY,
                             confidence: 0.85,
