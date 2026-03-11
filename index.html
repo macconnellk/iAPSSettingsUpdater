@@ -6919,6 +6919,7 @@
                     
                     // Calculate Carb-Adjusted Sensitivity from Sheets history
                     let carbAdjSensitivity = null;
+                    let sensitivityHistoryLocal = null;
                     const basalTotal = activeSchedules?.basal
                         ? computeBasalDailyTotal(activeSchedules.basal) // BUG-A FIX: duration-weighted
                         : 0;
@@ -6943,6 +6944,9 @@
                             } else {
                                 console.log(`Carb-Adjusted: Using ${historyEntries.length} cached entries from loadDynamicTarget`);
                             }
+                            
+                            // Capture for StateDetector — cachedSheetsEntries React state not yet propagated at detect() call
+                            sensitivityHistoryLocal = historyEntries;
                             
                             if (historyEntries.length > 0) {
                                 // Log first entry fields for debugging
@@ -7219,7 +7223,7 @@
                         changeHistory,
                         userOverride.active ? userOverride : null,
                         carbAdjSensitivity || null,
-                        cachedSheetsEntries || null
+                        sensitivityHistoryLocal
                     );
                     
                     // Run recommendation engine
