@@ -464,8 +464,8 @@
                 // Check for sustained sensitivity elevation across consecutive sessions
                 // Two consecutive sessions with carbAdjSensitivity >= 1.10 = TRANSIENT_SENSITIVITY
                 // regardless of signal direction consistency (catches step-change scenarios)
-                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 1.10 && sensitivityHistoryLocal) {
-                    const sortedHistory = [...sensitivityHistoryLocal]
+                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 1.10 && sensitivityHistory) {
+                    const sortedHistory = [...sensitivityHistory]
                         .filter(e => e.carbAdjSensitivity && !isNaN(parseFloat(e.carbAdjSensitivity)))
                         .sort((a, b) => new Date(b.date || b.timestamp) - new Date(a.date || a.timestamp));
                     const priorSensitivity = sortedHistory.length > 0 ? parseFloat(sortedHistory[0].carbAdjSensitivity) : null;
@@ -3747,7 +3747,7 @@
                     
                     detectedChanges.forEach(change => {
                         const paramLabel = change.type.toUpperCase();
-                        const direction = change.changePercent > 0 ? '↑' : '↓';
+                        const direction = change.changePercent > 0 ? '↑' : '↑';
                         const changeStr = `${change.from}→${change.to} (${change.changePercent > 0 ? '+' : ''}${change.changePercent}%)`;
                         output += `| ${change.time} | ${paramLabel} | ${changeStr} ${direction} |\n`;
                     });
@@ -5270,12 +5270,12 @@
                 // 48h Trend comparison
                 if (agp48h) {
                     const tirDiff = agp48h.tir.inRange - agp.tir.inRange;
-                    const tirArrow = tirDiff > 2 ? '↑' : tirDiff < -2 ? '↓' : '→';
+                    const tirArrow = tirDiff > 2 ? '↑' : tirDiff < -2 ? '↑' : '→';
                     const tirDiffStr = tirDiff > 0 ? `+${tirDiff.toFixed(0)}%` : `${tirDiff.toFixed(0)}%`;
                     
                     const problemHours7d = agp.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
                     const problemHours48h = agp48h.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
-                    const problemArrow = problemHours48h < problemHours7d ? '↑' : problemHours48h > problemHours7d ? '↓' : '→';
+                    const problemArrow = problemHours48h < problemHours7d ? '↑' : problemHours48h > problemHours7d ? '↑' : '→';
                     
                     output += `**48h Trend:** ${agp48h.tir.inRange.toFixed(0)}% TIR (${tirDiffStr} ${tirArrow}) | Problem hours: ${problemHours7d}→${problemHours48h} ${problemArrow}\n`;
                 }
