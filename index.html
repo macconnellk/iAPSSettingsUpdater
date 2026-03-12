@@ -4291,6 +4291,15 @@
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
                     : null;
                 
+                const toLocalTimeStr = (isoOrDate) => {
+                    if (!isoOrDate) return null;
+                    try {
+                        const d = new Date(isoOrDate);
+                        if (isNaN(d)) return null;
+                        return d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+                    } catch(e) { return null; }
+                };
+
                 // SPEC 4: Check for no-changes case and return short-form JSON
                 const primaryBundlesCheck = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
                 const hasUrgent = bundles.some(b => b.isUrgent);
@@ -4307,6 +4316,7 @@
                         meta: {
                             version: '2.3.1',
                             timestamp: new Date().toISOString(),
+                            localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
                             dataQuality: {
                                 glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
@@ -4397,18 +4407,22 @@
                                 // Extract BG from the finding's events array (type-specific property names)
                                 const bg = evt0.lowBG || evt0.peakBG || evt0.highBG || null;
                                 
-                                // Extract date from eventTime
+                                // Extract date from eventTime — use local time for Claude readability
                                 let eventDate = null;
+                                let eventTimeLocal = null;
                                 try {
                                     if (f.eventTime) {
                                         const d = new Date(f.eventTime);
-                                        if (!isNaN(d)) eventDate = d.toISOString().split('T')[0];
+                                        if (!isNaN(d)) {
+                                            eventDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                                            eventTimeLocal = d.toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+                                        }
                                     }
                                 } catch(e) {}
                                 
                                 evidence.events.push({
                                     date: eventDate,
-                                    time: f.eventTime || f.scheduleTime,
+                                    time: eventTimeLocal || f.scheduleTime,
                                     type: f.type,
                                     bg,
                                     context: f.details?.substring(0, 200) || null,
@@ -4518,6 +4532,7 @@
                     meta: {
                         version: '2.3.1',
                         timestamp: new Date().toISOString(),
+                        localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
@@ -4601,19 +4616,7 @@
                             to: c.to,
                             changePercent: c.changePercent,
                             detectedDate: new Date().toISOString().split('T')[0]
-                        })),
-                        manuallyLogged: (() => {
-                            try {
-                                return ChangeTracker.getRecentChanges(7).map(c => ({
-                                    date: c.date,
-                                    scheduleTime: c.scheduleTime,
-                                    parameter: c.param,
-                                    from: c.oldValue,
-                                    to: c.newValue,
-                                    outcome: c.outcome
-                                }));
-                            } catch(e) { return []; }
-                        })()
+                        }))
                     },
                     schedules: {
                         cr: schedules.cr || [],
@@ -4627,6 +4630,54 @@
                             midpoint: s.midpoint
                         }))
                     }
+                    glucoseTrace24h: (() => {
+                        const allGlucose = analysisResults.nightscoutData?.glucose;
+                        if (!allGlucose || allGlucose.length === 0) return null;
+                        const now = new Date();
+                        const dayStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+                        const dayEnd = now;
+                        const todayReadings = allGlucose
+                            .filter(r => {
+                                const t = new Date(r.dateString);
+                                return t >= dayStart && t < dayEnd && r.sgv > 20 && r.sgv < 500;
+                            })
+                            .sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
+                        const SAMPLE_INTERVAL_MS = 13 * 60 * 1000;
+                        const sampled = [];
+                        let lastKeptMs = -Infinity;
+                        for (const r of todayReadings) {
+                            const rMs = new Date(r.dateString).getTime();
+                            if (rMs - lastKeptMs >= SAMPLE_INTERVAL_MS) {
+                                sampled.push(r);
+                                lastKeptMs = rMs;
+                            }
+                        }
+                        const readings = sampled.map(r => [
+                            Math.round((new Date(r.dateString) - dayStart) / 60000),
+                            r.sgv
+                        ]);
+                        const allTreatments = analysisResults.nightscoutData?.treatments || [];
+                        const events = allTreatments
+                            .filter(t => {
+                                const t2 = new Date(t.created_at);
+                                return t2 >= dayStart && t2 < dayEnd && (t.carbs > 0 || t.insulin > 0);
+                            })
+                            .map(t => {
+                                const obj = { time: Math.round((new Date(t.created_at) - dayStart) / 60000) };
+                                if (t.carbs > 0) obj.carbs = t.carbs;
+                                if (t.insulin > 0) obj.insulin = Math.round(t.insulin * 100) / 100;
+                                return obj;
+                            })
+                            .sort((a, b) => a.time - b.time);
+                        return {
+                            windowStart: toLocalTimeStr(dayStart),
+                            windowEnd: toLocalTimeStr(dayEnd),
+                            intervalMinutes: 15,
+                            readingCount: readings.length,
+                            readings,
+                            events
+                        };
+                    })()
                 };
                 
                 // SPEC 3: Add delta comparison if yesterday data available
