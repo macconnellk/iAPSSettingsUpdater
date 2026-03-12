@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.8</title>
+    <title>Daily Insulin Settings Review v3.5.10</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4614,18 +4614,6 @@
                             changePercent: c.changePercent,
                             detectedDate: new Date().toISOString().split('T')[0]
                         })),
-                        manuallyLogged: (() => {
-                            try {
-                                return ChangeTracker.getRecentChanges(7).map(c => ({
-                                    date: c.date,
-                                    scheduleTime: c.scheduleTime,
-                                    parameter: c.param,
-                                    from: c.oldValue,
-                                    to: c.newValue,
-                                    outcome: c.outcome
-                                }));
-                            } catch(e) { return []; }
-                        })()
                     },
                     schedules: {
                         cr: schedules.cr || [],
@@ -4728,7 +4716,6 @@
                     turn1ContextByPeriod: [],
                     sessionContinuity: {
                         autoDetected: [],
-                        manualLogged: [],
                         periodTrends: [],
                         streakAlerts: []
                     },
@@ -4962,18 +4949,6 @@
                 // Auto-detected changes (from delta view or schedule comparison)
                 prompts.sessionContinuity.autoDetected = [];
                 
-                // Manual logged changes (from ChangeTracker)
-                const history = ChangeTracker.getHistory();
-                const pendingChanges = history.changes.filter(c => c.outcome === 'pending');
-                for (const change of pendingChanges.slice(0, 3)) {
-                    const changeDate = new Date(change.date);
-                    const daysAgo = Math.floor((new Date() - changeDate) / (24 * 60 * 60 * 1000));
-                    if (daysAgo >= 1) {
-                        prompts.sessionContinuity.manualLogged.push(
-                            `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} (${change.date}): Applied? What happened?`
-                        );
-                    }
-                }
                 
                 // Period TIR trends
                 if (historyEntries.length >= 3) {
@@ -5056,7 +5031,6 @@
                 
                 console.log('=== Final prompts structure ===');
                 console.log('turn1ContextByPeriod count:', prompts.turn1ContextByPeriod.length);
-                console.log('sessionContinuity.manualLogged count:', prompts.sessionContinuity.manualLogged.length);
                 console.log('sessionContinuity.periodTrends count:', prompts.sessionContinuity.periodTrends.length);
                 console.log('decisionMap count:', prompts.decisionMap.length);
                 
@@ -5099,15 +5073,7 @@
                 // ===== SESSION CONTINUITY =====
                 output += `**Session Continuity:**\n\n`;
                 
-                if (prompts.sessionContinuity.manualLogged.length > 0) {
-                    output += `_Follow-up on changes:_\n`;
-                    for (const item of prompts.sessionContinuity.manualLogged) {
-                        output += `- ${item}\n`;
-                    }
-                    output += `\n`;
-                } else {
-                    output += `_No pending changes to follow up on._\n\n`;
-                }
+                output += `_No pending changes to follow up on._\n\n`;
                 
                 if (prompts.sessionContinuity.periodTrends.length > 0) {
                     output += `_Period TIR Trends (last ${prompts.sessionContinuity.periodTrends[0].values.length} sessions):_\n`;
@@ -6446,14 +6412,20 @@
                     const data = await jsonpFetch(`${sheetsWebAppUrl}?action=yesterday_schedule`);
                     console.log('Yesterday schedule: Received', data);
                     
-                    if (!data.success || !data.hasYesterday) {
+                    // Apps Script returns { success, basal, cr, isf } directly (no hasYesterday/schedules wrapper)
+                    const hasData = data.success && (data.basal || data.cr || data.isf);
+                    if (!hasData) {
                         console.log('Yesterday schedule: No previous data');
                         return null;
                     }
                     
                     return {
-                        date: data.date,
-                        schedules: data.schedules
+                        date: data.date || null,
+                        schedules: {
+                            basal: data.basal,
+                            cr: data.cr,
+                            isf: data.isf
+                        }
                     };
                     
                 } catch (error) {
