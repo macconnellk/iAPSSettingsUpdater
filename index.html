@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.10</title>
+    <title>Daily Insulin Settings Review v3.5.2</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -464,8 +464,8 @@
                 // Check for sustained sensitivity elevation across consecutive sessions
                 // Two consecutive sessions with carbAdjSensitivity >= 1.10 = TRANSIENT_SENSITIVITY
                 // regardless of signal direction consistency (catches step-change scenarios)
-                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 1.10 && sensitivityHistory) {
-                    const sortedHistory = [...sensitivityHistory]
+                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 1.10 && sensitivityHistoryLocal) {
+                    const sortedHistory = [...sensitivityHistoryLocal]
                         .filter(e => e.carbAdjSensitivity && !isNaN(parseFloat(e.carbAdjSensitivity)))
                         .sort((a, b) => new Date(b.date || b.timestamp) - new Date(a.date || a.timestamp));
                     const priorSensitivity = sortedHistory.length > 0 ? parseFloat(sortedHistory[0].carbAdjSensitivity) : null;
@@ -3747,7 +3747,7 @@
                     
                     detectedChanges.forEach(change => {
                         const paramLabel = change.type.toUpperCase();
-                        const direction = change.changePercent > 0 ? '↑' : '↑';
+                        const direction = change.changePercent > 0 ? '↑' : '↓';
                         const changeStr = `${change.from}→${change.to} (${change.changePercent > 0 ? '+' : ''}${change.changePercent}%)`;
                         output += `| ${change.time} | ${paramLabel} | ${changeStr} ${direction} |\n`;
                     });
@@ -4291,16 +4291,6 @@
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
                     : null;
                 
-                // Local time formatter for structured JSON
-                const toLocalTimeStr = (isoOrDate) => {
-                    if (!isoOrDate) return null;
-                    try {
-                        const d = new Date(isoOrDate);
-                        if (isNaN(d)) return null;
-                        return d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
-                    } catch(e) { return null; }
-                };
-
                 // SPEC 4: Check for no-changes case and return short-form JSON
                 const primaryBundlesCheck = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
                 const hasUrgent = bundles.some(b => b.isUrgent);
@@ -4317,7 +4307,6 @@
                         meta: {
                             version: '2.3.1',
                             timestamp: new Date().toISOString(),
-                            localTimestamp: new Date().toLocaleString("en-US", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true }),
                             analysisWindow: config.basalSignalWindow || 7,
                             dataQuality: {
                                 glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
@@ -4413,13 +4402,13 @@
                                 try {
                                     if (f.eventTime) {
                                         const d = new Date(f.eventTime);
-                                        if (!isNaN(d)) eventDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+                                        if (!isNaN(d)) eventDate = d.toISOString().split('T')[0];
                                     }
                                 } catch(e) {}
                                 
                                 evidence.events.push({
                                     date: eventDate,
-                                    time: f.eventTime ? toLocalTimeStr(f.eventTime) : f.scheduleTime,
+                                    time: f.eventTime || f.scheduleTime,
                                     type: f.type,
                                     bg,
                                     context: f.details?.substring(0, 200) || null,
@@ -4529,7 +4518,6 @@
                     meta: {
                         version: '2.3.1',
                         timestamp: new Date().toISOString(),
-                        localTimestamp: new Date().toLocaleString("en-US", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true }),
                         analysisWindow: config?.analysisWindow || 7,
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
@@ -4614,6 +4602,18 @@
                             changePercent: c.changePercent,
                             detectedDate: new Date().toISOString().split('T')[0]
                         })),
+                        manuallyLogged: (() => {
+                            try {
+                                return ChangeTracker.getRecentChanges(7).map(c => ({
+                                    date: c.date,
+                                    scheduleTime: c.scheduleTime,
+                                    parameter: c.param,
+                                    from: c.oldValue,
+                                    to: c.newValue,
+                                    outcome: c.outcome
+                                }));
+                            } catch(e) { return []; }
+                        })()
                     },
                     schedules: {
                         cr: schedules.cr || [],
@@ -4626,62 +4626,7 @@
                             targetHigh: s.targetHigh,
                             midpoint: s.midpoint
                         }))
-                    },
-                    glucoseTrace24h: (() => {
-                        const allGlucose = analysisResults.nightscoutData?.glucose;
-                        if (!allGlucose || allGlucose.length === 0) return null;
-                        // Rolling 24-hour window ending now — gives a complete trace
-                        // regardless of what time of day the tool is run.
-                        const now = new Date();
-                        const dayStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-                        const dayEnd = now;
-                        // Filter to today's readings, sort ascending
-                        const todayReadings = allGlucose
-                            .filter(r => {
-                                const t = new Date(r.dateString);
-                                return t >= dayStart && t < dayEnd && r.sgv > 20 && r.sgv < 500;
-                            })
-                            .sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
-                        // Time-based downsample: keep a reading only if >=13 min have elapsed
-                        // since the last kept reading. This preserves ~15-min spacing across
-                        // sensor gaps rather than shifting phase with index % 3.
-                        const SAMPLE_INTERVAL_MS = 13 * 60 * 1000;
-                        const sampled = [];
-                        let lastKeptMs = -Infinity;
-                        for (const r of todayReadings) {
-                            const rMs = new Date(r.dateString).getTime();
-                            if (rMs - lastKeptMs >= SAMPLE_INTERVAL_MS) {
-                                sampled.push(r);
-                                lastKeptMs = rMs;
-                            }
-                        }
-                        const readings = sampled.map(r => [
-                            Math.round((new Date(r.dateString) - dayStart) / 60000), // minutes since window start
-                            r.sgv
-                        ]);
-                        // Today's meal/bolus events as markers
-                        const allTreatments = analysisResults.nightscoutData?.treatments || [];
-                        const events = allTreatments
-                            .filter(t => {
-                                const t2 = new Date(t.created_at);
-                                return t2 >= dayStart && t2 < dayEnd && (t.carbs > 0 || t.insulin > 0);
-                            })
-                            .map(t => {
-                                const obj = { time: Math.round((new Date(t.created_at) - dayStart) / 60000) };
-                                if (t.carbs > 0) obj.carbs = t.carbs;
-                                if (t.insulin > 0) obj.insulin = Math.round(t.insulin * 100) / 100;
-                                return obj;
-                            })
-                            .sort((a, b) => a.time - b.time);
-                        return {
-                            windowStart: toLocalTimeStr(dayStart),
-                            windowEnd: toLocalTimeStr(dayEnd),
-                            intervalMinutes: 15,
-                            readingCount: readings.length,
-                            readings, // [minutesSinceWindowStart, sgv]
-                            events    // {time, carbs?, insulin?}
-                        };
-                    })()
+                    }
                 };
                 
                 // SPEC 3: Add delta comparison if yesterday data available
@@ -4716,6 +4661,7 @@
                     turn1ContextByPeriod: [],
                     sessionContinuity: {
                         autoDetected: [],
+                        manualLogged: [],
                         periodTrends: [],
                         streakAlerts: []
                     },
@@ -4949,6 +4895,18 @@
                 // Auto-detected changes (from delta view or schedule comparison)
                 prompts.sessionContinuity.autoDetected = [];
                 
+                // Manual logged changes (from ChangeTracker)
+                const history = ChangeTracker.getHistory();
+                const pendingChanges = history.changes.filter(c => c.outcome === 'pending');
+                for (const change of pendingChanges.slice(0, 3)) {
+                    const changeDate = new Date(change.date);
+                    const daysAgo = Math.floor((new Date() - changeDate) / (24 * 60 * 60 * 1000));
+                    if (daysAgo >= 1) {
+                        prompts.sessionContinuity.manualLogged.push(
+                            `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} (${change.date}): Applied? What happened?`
+                        );
+                    }
+                }
                 
                 // Period TIR trends
                 if (historyEntries.length >= 3) {
@@ -5031,6 +4989,7 @@
                 
                 console.log('=== Final prompts structure ===');
                 console.log('turn1ContextByPeriod count:', prompts.turn1ContextByPeriod.length);
+                console.log('sessionContinuity.manualLogged count:', prompts.sessionContinuity.manualLogged.length);
                 console.log('sessionContinuity.periodTrends count:', prompts.sessionContinuity.periodTrends.length);
                 console.log('decisionMap count:', prompts.decisionMap.length);
                 
@@ -5073,7 +5032,15 @@
                 // ===== SESSION CONTINUITY =====
                 output += `**Session Continuity:**\n\n`;
                 
-                output += `_No pending changes to follow up on._\n\n`;
+                if (prompts.sessionContinuity.manualLogged.length > 0) {
+                    output += `_Follow-up on changes:_\n`;
+                    for (const item of prompts.sessionContinuity.manualLogged) {
+                        output += `- ${item}\n`;
+                    }
+                    output += `\n`;
+                } else {
+                    output += `_No pending changes to follow up on._\n\n`;
+                }
                 
                 if (prompts.sessionContinuity.periodTrends.length > 0) {
                     output += `_Period TIR Trends (last ${prompts.sessionContinuity.periodTrends[0].values.length} sessions):_\n`;
@@ -5303,12 +5270,12 @@
                 // 48h Trend comparison
                 if (agp48h) {
                     const tirDiff = agp48h.tir.inRange - agp.tir.inRange;
-                    const tirArrow = tirDiff > 2 ? '↑' : tirDiff < -2 ? '↑' : '→';
+                    const tirArrow = tirDiff > 2 ? '↑' : tirDiff < -2 ? '↓' : '→';
                     const tirDiffStr = tirDiff > 0 ? `+${tirDiff.toFixed(0)}%` : `${tirDiff.toFixed(0)}%`;
                     
                     const problemHours7d = agp.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
                     const problemHours48h = agp48h.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
-                    const problemArrow = problemHours48h < problemHours7d ? '↑' : problemHours48h > problemHours7d ? '↑' : '→';
+                    const problemArrow = problemHours48h < problemHours7d ? '↑' : problemHours48h > problemHours7d ? '↓' : '→';
                     
                     output += `**48h Trend:** ${agp48h.tir.inRange.toFixed(0)}% TIR (${tirDiffStr} ${tirArrow}) | Problem hours: ${problemHours7d}→${problemHours48h} ${problemArrow}\n`;
                 }
@@ -6412,20 +6379,14 @@
                     const data = await jsonpFetch(`${sheetsWebAppUrl}?action=yesterday_schedule`);
                     console.log('Yesterday schedule: Received', data);
                     
-                    // Apps Script returns { success, basal, cr, isf } directly (no hasYesterday/schedules wrapper)
-                    const hasData = data.success && (data.basal || data.cr || data.isf);
-                    if (!hasData) {
+                    if (!data.success || !data.hasYesterday) {
                         console.log('Yesterday schedule: No previous data');
                         return null;
                     }
                     
                     return {
-                        date: data.date || null,
-                        schedules: {
-                            basal: data.basal,
-                            cr: data.cr,
-                            isf: data.isf
-                        }
+                        date: data.date,
+                        schedules: data.schedules
                     };
                     
                 } catch (error) {
