@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.5</title>
+    <title>Daily Insulin Settings Review v3.5.6</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4630,11 +4630,11 @@
                     glucoseTrace24h: (() => {
                         const allGlucose = analysisResults.nightscoutData?.glucose;
                         if (!allGlucose || allGlucose.length === 0) return null;
-                        const traceDate = getLocalDateString();
-                        // 'T00:00:00' (no Z) forces local-time parsing, avoiding UTC offset shift
-                        const midnight = new Date(traceDate + 'T00:00:00');
-                        const dayStart = new Date(midnight.getTime());
-                        const dayEnd = new Date(midnight.getTime() + 24 * 60 * 60 * 1000);
+                        // Rolling 24-hour window ending now — gives a complete trace
+                        // regardless of what time of day the tool is run.
+                        const now = new Date();
+                        const dayStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+                        const dayEnd = now;
                         // Filter to today's readings, sort ascending
                         const todayReadings = allGlucose
                             .filter(r => {
@@ -4656,7 +4656,7 @@
                             }
                         }
                         const readings = sampled.map(r => [
-                            Math.round((new Date(r.dateString) - midnight) / 60000), // minutes from midnight
+                            Math.round((new Date(r.dateString) - dayStart) / 60000), // minutes since window start
                             r.sgv
                         ]);
                         // Today's meal/bolus events as markers
@@ -4667,17 +4667,18 @@
                                 return t2 >= dayStart && t2 < dayEnd && (t.carbs > 0 || t.insulin > 0);
                             })
                             .map(t => {
-                                const obj = { time: Math.round((new Date(t.created_at) - midnight) / 60000) };
+                                const obj = { time: Math.round((new Date(t.created_at) - dayStart) / 60000) };
                                 if (t.carbs > 0) obj.carbs = t.carbs;
                                 if (t.insulin > 0) obj.insulin = Math.round(t.insulin * 100) / 100;
                                 return obj;
                             })
                             .sort((a, b) => a.time - b.time);
                         return {
-                            date: traceDate,
+                            windowStart: dayStart.toISOString(),
+                            windowEnd: dayEnd.toISOString(),
                             intervalMinutes: 15,
                             readingCount: readings.length,
-                            readings, // [minutesSinceMidnight, sgv]
+                            readings, // [minutesSinceWindowStart, sgv]
                             events    // {time, carbs?, insulin?}
                         };
                     })()
