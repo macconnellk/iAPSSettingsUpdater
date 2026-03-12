@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.6</title>
+    <title>Daily Insulin Settings Review v3.5.8</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4291,6 +4291,16 @@
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
                     : null;
                 
+                // Local time formatter for structured JSON
+                const toLocalTimeStr = (isoOrDate) => {
+                    if (!isoOrDate) return null;
+                    try {
+                        const d = new Date(isoOrDate);
+                        if (isNaN(d)) return null;
+                        return d.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+                    } catch(e) { return null; }
+                };
+
                 // SPEC 4: Check for no-changes case and return short-form JSON
                 const primaryBundlesCheck = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
                 const hasUrgent = bundles.some(b => b.isUrgent);
@@ -4307,6 +4317,7 @@
                         meta: {
                             version: '2.3.1',
                             timestamp: new Date().toISOString(),
+                            localTimestamp: new Date().toLocaleString("en-US", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true }),
                             analysisWindow: config.basalSignalWindow || 7,
                             dataQuality: {
                                 glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
@@ -4402,13 +4413,13 @@
                                 try {
                                     if (f.eventTime) {
                                         const d = new Date(f.eventTime);
-                                        if (!isNaN(d)) eventDate = d.toISOString().split('T')[0];
+                                        if (!isNaN(d)) eventDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
                                     }
                                 } catch(e) {}
                                 
                                 evidence.events.push({
                                     date: eventDate,
-                                    time: f.eventTime || f.scheduleTime,
+                                    time: f.eventTime ? toLocalTimeStr(f.eventTime) : f.scheduleTime,
                                     type: f.type,
                                     bg,
                                     context: f.details?.substring(0, 200) || null,
@@ -4518,6 +4529,7 @@
                     meta: {
                         version: '2.3.1',
                         timestamp: new Date().toISOString(),
+                        localTimestamp: new Date().toLocaleString("en-US", { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true }),
                         analysisWindow: config?.analysisWindow || 7,
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
@@ -4674,8 +4686,8 @@
                             })
                             .sort((a, b) => a.time - b.time);
                         return {
-                            windowStart: dayStart.toISOString(),
-                            windowEnd: dayEnd.toISOString(),
+                            windowStart: toLocalTimeStr(dayStart),
+                            windowEnd: toLocalTimeStr(dayEnd),
                             intervalMinutes: 15,
                             readingCount: readings.length,
                             readings, // [minutesSinceWindowStart, sgv]
