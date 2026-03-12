@@ -6430,14 +6430,18 @@
                     const data = await jsonpFetch(`${sheetsWebAppUrl}?action=yesterday_schedule`);
                     console.log('Yesterday schedule: Received', data);
                     
-                    if (!data.success || !data.hasYesterday) {
+                    if (!data.success || !data.basal) {
                         console.log('Yesterday schedule: No previous data');
                         return null;
                     }
                     
                     return {
                         date: data.date,
-                        schedules: data.schedules
+                        schedules: {
+                            basal: data.basal,
+                            cr: data.cr,
+                            isf: data.isf
+                        }
                     };
                     
                 } catch (error) {
