@@ -3747,7 +3747,7 @@
                     
                     detectedChanges.forEach(change => {
                         const paramLabel = change.type.toUpperCase();
-                        const direction = change.changePercent > 0 ? '↑' : '↑';
+                        const direction = change.changePercent > 0 ? '↑' : '↓';
                         const changeStr = `${change.from}→${change.to} (${change.changePercent > 0 ? '+' : ''}${change.changePercent}%)`;
                         output += `| ${change.time} | ${paramLabel} | ${changeStr} ${direction} |\n`;
                     });
