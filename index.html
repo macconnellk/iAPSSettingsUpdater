@@ -86,7 +86,12 @@
             BASAL_SIGNAL_HIGH: 'basal_signal_high',
             BASAL_SIGNAL_LOW: 'basal_signal_low',
             BASAL_RATIO_EXCEEDED: 'basal_ratio_exceeded',
-            REBOUND_HIGH: 'rebound_high'
+            REBOUND_HIGH: 'rebound_high',
+            // ENH-CAE-002: new types for waking-hour high events and mixed attribution
+            DIRECT_MEAL_HIGH: 'direct_meal_high',
+            ISF_SUPPRESSED_HIGH: 'isf_suppressed_high',
+            MIXED_ATTRIBUTION: 'mixed_attribution',
+            RESISTANT_HIGH: 'resistant_high'
         };
         
         const ProtectionLevel = {
@@ -163,7 +168,10 @@
             // Protection
             changeLockoutDays: 3,
             resistantLowLookbackDays: 7,
-            oscillationLookbackDays: 14
+            oscillationLookbackDays: 14,
+
+            // BUG-CAE-001: iAPS upfront bolus fraction — adjust if SMB settings change
+            IAPS_UPFRONT_BOLUS_FRACTION: 0.70,
         };
         
         // Helper to get local date in YYYY-MM-DD format
@@ -1214,6 +1222,18 @@
                 if (findings.some(f => f.type === FindingType.POST_MEAL_HIGH)) {
                     return `${window} Post-Meal Highs`;
                 }
+                if (findings.some(f => f.type === FindingType.DIRECT_MEAL_HIGH)) {
+                    return `${window} Post-Meal Highs (CR Too Weak)`;
+                }
+                if (findings.some(f => f.type === FindingType.ISF_SUPPRESSED_HIGH)) {
+                    return `${window} Correction Insufficient (ISF Too Weak)`;
+                }
+                if (findings.some(f => f.type === FindingType.MIXED_ATTRIBUTION)) {
+                    return `${window} Mixed Attribution — Review Required`;
+                }
+                if (findings.some(f => f.type === FindingType.RESISTANT_HIGH)) {
+                    return `${window} Resistant High (Non-Insulin)`;
+                }
                 if (findings.some(f => f.type === FindingType.CORRECTION_INEFFECTIVE)) {
                     return `${window} Correction Ineffectiveness`;
                 }
@@ -1261,6 +1281,8 @@
             },
             
             findingToRecommendation(finding, schedules, basalRatioInfo = null) {
+                if (finding.type === FindingType.MIXED_ATTRIBUTION) return null;
+                if (finding.type === FindingType.RESISTANT_HIGH) return null;
                 if (!finding.primaryParameter || !finding.scheduleTime) return null;
                 
                 const schedule = schedules[finding.primaryParameter.toLowerCase()];
@@ -1370,6 +1392,18 @@
                 }
                 if (types.includes(FindingType.POST_MEAL_HIGH)) {
                     return 'Post-meal highs requiring corrections - CR too weak';
+                }
+                if (types.includes(FindingType.DIRECT_MEAL_HIGH)) {
+                    return 'Post-meal highs without corrections exhausting budget — CR too weak';
+                }
+                if (types.includes(FindingType.ISF_SUPPRESSED_HIGH)) {
+                    return 'Corrections failing to reach target — ISF too weak (correction dose insufficient per unit)';
+                }
+                if (types.includes(FindingType.MIXED_ATTRIBUTION)) {
+                    return 'Causal attribution ambiguous — CR and ISF axes within scoring threshold. See Turn 1 question.';
+                }
+                if (types.includes(FindingType.RESISTANT_HIGH)) {
+                    return 'High with near-zero IOB and no active bolus — not insulin-caused. Check activity, illness, or counter-regulatory response.';
                 }
                 if (types.includes(FindingType.ISF_INDUCED_LOW)) {
                     return 'Corrections causing lows - ISF too strong';
@@ -1842,8 +1876,8 @@
          *   1. No meal in 3-hour lookback window --> TRUE correction
          *   2. Meal found: derive expected insulin budget for that meal
          *        a. If crSchedule provided: budget = carbs / CR
-         *        b. Else if meal had upfront bolus: budget = mealInsulin / 0.40
-         *           (iAPS delivers ~40% upfront; SMBs cover the remaining ~60%)
+         *        b. Else if meal had upfront bolus: budget = mealInsulin / CONFIG.IAPS_UPFRONT_BOLUS_FRACTION
+         *           (iAPS delivers ~70% upfront; SMBs cover the remaining ~30%)
          *        c. Otherwise: conservative fallback -- treat all SMBs within 3h as meal insulin
          *   3. Sum all insulin delivered since meal start (upfront + prior SMBs)
          *   4. If cumulative < budget x 1.10 --> still within meal budget --> NOT a correction
@@ -1887,8 +1921,8 @@
                     }
                 }
                 if (expectedBudget === 0 && newestMeal.insulin > 0) {
-                    // iAPS delivers ~40% upfront; extrapolate full budget from logged bolus
-                    expectedBudget = newestMeal.insulin / 0.40;
+                    // BUG-CAE-001 fix: iAPS delivers ~70% upfront; extrapolate full budget from logged bolus
+                    expectedBudget = newestMeal.insulin / CONFIG.IAPS_UPFRONT_BOLUS_FRACTION;
                 }
                 if (expectedBudget === 0) {
                     // Conservative fallback: no budget info; assume meal insulin still active
@@ -2000,6 +2034,11 @@
                         
                         // Check for corrections between high and low - if corrections were given, skip
                         // (Let Detector 2 handle correction overcorrection)
+                        // BUG-CAE-001 audit (detectTransientHighWithLow): fix narrows the budget window, so
+                        // fewer SMBs are treated as within-budget meal insulin; more are classified as corrections.
+                        // Net effect: more low events in this pattern are skipped here and routed to Detector 2.
+                        // Behavioral change is bounded — this detector already requires a preceding high > 180,
+                        // so only post-high SMBs are reclassified. No correctness concern for this caller.
                         const correctionsDuringPeriod = nightscoutData.treatments.filter(t => {
                             if (!isTrueCorrection(t, nightscoutData.treatments, crSchedule)) return false;
                             const tTime = new Date(t.created_at);
@@ -2213,6 +2252,11 @@
                     const oneHourAgo = new Date(lowTime - 1 * 60 * 60 * 1000);
                     
                     // Find corrections in 1-3 hour lookback window (v25 used this tighter window)
+                    // BUG-CAE-001 audit (detectISFInducedLows): intended beneficiary of the fix.
+                    // With 0.40, post-meal SMBs appeared within-budget and were excluded here, preventing
+                    // ISF_INDUCED_LOW from firing when a Cat2/Cat3 correction drove the low.
+                    // With 0.70, budget is correctly narrower; more post-meal SMBs are classified as
+                    // corrections and included in recentCorrections, enabling proper ISF attribution.
                     const recentCorrections = nightscoutData.treatments.filter(t => {
                         if (!isTrueCorrection(t, nightscoutData.treatments, crSchedule)) return false; // DQ-D FIX: pass crSchedule so budget logic works
                         const tTime = new Date(t.created_at);
@@ -2396,6 +2440,13 @@
                     const peakBG = peakReading.sgv;
                     
                     // Check for corrections
+                    // BUG-CAE-001 audit (detectPostMealHighs): with 0.70, more SMBs are classified as
+                    // corrections, so correctionsAfterMeal.length increases for post-meal windows.
+                    // This may suppress POST_MEAL_HIGH findings where a correction was present but
+                    // previously miscategorized as within-budget meal insulin (the check at line ~2480
+                    // requires corrections OR peakBG ≥ 220 to proceed). For waking-hour scope, this
+                    // detector is retired by ENH-CAE-002. For overnight POST_MEAL_HIGH events, verify
+                    // the fix does not incorrectly suppress findings where no correction was intended.
                     const correctionsAfterMeal = nightscoutData.treatments.filter(t => {
                         if (!isTrueCorrection(t, nightscoutData.treatments, crSchedule)) return false;
                         const tTime = new Date(t.created_at);
@@ -2517,7 +2568,12 @@
                     }
                     
                     if (correctionsAfterMeal.length === 0 && peakBG < 220) return;
-                    
+
+                    // ENH-CAE-002 §5.11: POST_MEAL_HIGH retired for waking hours (6am–midnight).
+                    // Engine generates DIRECT_MEAL_HIGH / ISF_SUPPRESSED_HIGH for those meals.
+                    // Retained for overnight meals (midnight–6am).
+                    if (mealTime.getHours() >= 6) return;
+
                     claimedEvents.meals.add(mealId);
                     highReadings.forEach(h => claimedEvents.highs.add(getEventId(h)));
                     correctionsAfterMeal.forEach(c => claimedEvents.corrections.add(getEventId(c)));
@@ -2844,6 +2900,14 @@
                 });
                 
                 // Add corrections to each segment
+                // BUG-CAE-001 audit (detectCorrectionIneffectiveness): overnight-scoped detector.
+                // Overnight fasting corrections are predominantly Cat 3 (>3hr from any meal), so
+                // the upfront fraction change has minimal impact here — Cat 3 classification is
+                // determined by meal absence, not budget math. Note: crSchedule is not passed to
+                // this call site; the fallback branch (now using IAPS_UPFRONT_BOLUS_FRACTION) only
+                // activates when crSchedule is absent AND newestMeal.insulin > 0. For overnight
+                // Cat 3 corrections (no meal in window), the recentMeals.length === 0 path fires
+                // first, so the fraction constant is never reached. No behavioral change expected.
                 nightscoutData.treatments.forEach(t => {
                     if (!isTrueCorrection(t, nightscoutData.treatments)) return;
                     
@@ -2986,8 +3050,939 @@
                 });
                 
                 return findings;
+            },
+
+            // ─────────────────────────────────────────────────────────────────
+            // ENH-CAE-002: Causal Attribution Engine — low event path
+            // §5.1–5.9 (low scoring tables only)
+            // Not wired into main analysis loop — called explicitly when ready.
+            // ─────────────────────────────────────────────────────────────────
+
+            /**
+             * §5.6: Decompose all SMBs relative to the governing meal into Cat1/2/3.
+             * Returns budget, ratio, categorised SMB arrays, and correction list.
+             */
+            _decomposeSMBs(treatments, glucose, mealTime, mealCarbs, crSchedule) {
+                // Upfront bolus: insulin on the treatment that carries the carbs (±2 min)
+                const upfrontBolus = treatments
+                    .filter(t => t.carbs > 0 &&
+                        Math.abs(new Date(t.created_at) - mealTime) < 2 * 60 * 1000)
+                    .reduce((sum, t) => sum + (t.insulin || 0), 0);
+
+                const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
+                const expectedBudget = (crEntry && crEntry.value > 0)
+                    ? mealCarbs / crEntry.value
+                    : (upfrontBolus > 0
+                        ? upfrontBolus / CONFIG.IAPS_UPFRONT_BOLUS_FRACTION
+                        : 0);
+
+                // Peak BG time in the 3-hour post-meal window
+                const threeHrsAfterMeal = new Date(mealTime.getTime() + 3 * 60 * 60 * 1000);
+                let peakBG = 0, peakTime = mealTime;
+                glucose
+                    .filter(r => {
+                        const rt = new Date(r.dateString);
+                        return rt >= mealTime && rt <= threeHrsAfterMeal;
+                    })
+                    .forEach(r => {
+                        if (r.sgv > peakBG) { peakBG = r.sgv; peakTime = new Date(r.dateString); }
+                    });
+
+                const cat1SMBs = [], cat2SMBs = [], cat3SMBs = [];
+
+                const allSMBs = treatments
+                    .filter(t => t.eventType && t.eventType.includes('SMB') && t.insulin > 0)
+                    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+                for (const smb of allSMBs) {
+                    const smbTime = new Date(smb.created_at);
+                    const minsSinceMeal = (smbTime - mealTime) / 60000;
+
+                    // Cat3: fired >3hr after ANY meal (no meal in 3hr window before SMB)
+                    if (minsSinceMeal < 0 || minsSinceMeal > 180) {
+                        const windowStart = new Date(smbTime.getTime() - 3 * 60 * 60 * 1000);
+                        const nearMeals = treatments.filter(t => {
+                            if (!t.carbs || t.carbs <= 0 || !t.created_at) return false;
+                            const tt = new Date(t.created_at);
+                            return tt >= windowStart && tt <= smbTime;
+                        });
+                        if (nearMeals.length === 0) cat3SMBs.push(smb);
+                        continue;
+                    }
+
+                    // Cumulative insulin delivered from mealTime up to (not including) this SMB
+                    const cumulativeBefore = treatments
+                        .filter(t => {
+                            if (!t.insulin || t.insulin <= 0 || !t.created_at) return false;
+                            const tt = new Date(t.created_at);
+                            return tt >= mealTime && tt < smbTime;
+                        })
+                        .reduce((sum, t) => sum + t.insulin, 0);
+
+                    const budgetExhausted = expectedBudget > 0 &&
+                        cumulativeBefore >= expectedBudget * 1.10;
+                    const bgStillRising = smbTime <= peakTime;
+
+                    if (minsSinceMeal <= 90 && bgStillRising) {
+                        cat1SMBs.push(smb);           // Cat1: 0–90 min, BG rising
+                    } else if (minsSinceMeal > 90 && minsSinceMeal <= 180 && budgetExhausted) {
+                        cat2SMBs.push(smb);           // Cat2: 90min–3hr, budget exhausted
+                    }
+                    // else: uncategorised within-3hr SMB — excluded from scoring
+                }
+
+                const cat1Total = cat1SMBs.reduce((s, t) => s + t.insulin, 0);
+                const cat2Total = cat2SMBs.reduce((s, t) => s + t.insulin, 0);
+                const cat3Total = cat3SMBs.reduce((s, t) => s + t.insulin, 0);
+                const actualTotal = upfrontBolus + cat1Total + cat2Total;
+                const budgetRatio = expectedBudget > 0 ? actualTotal / expectedBudget : 0;
+                // §5.6: correctionTotal = Cat3 + Cat2 (budget already exhausted for Cat2 by definition)
+                const correctionTotal = cat3Total + cat2Total;
+                const corrections = [...cat2SMBs, ...cat3SMBs]
+                    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+                return {
+                    upfrontBolus, expectedBudget, actualTotal, budgetRatio,
+                    correctionTotal, cat1SMBs, cat2SMBs, cat3SMBs,
+                    cat1Total, cat2Total, cat3Total,
+                    peakBG, peakTime, corrections
+                };
+            },
+
+            /** §5.7 CR axis — low direction */
+            _scoreCRAxisLow(decomp, minsFromMealToLow, glucose, mealTime, lowTime) {
+                let score = 0;
+
+                if (decomp.budgetRatio > 1.40) {
+                    score += 0.8;                             // replaces +0.5
+                } else if (decomp.budgetRatio > 1.20) {
+                    score += 0.5;
+                }
+
+                if (minsFromMealToLow <= 90) {
+                    score += 0.3;
+                } else if (minsFromMealToLow <= 150) {
+                    score += 0.15;
+                }
+
+                // No peak > 160 between meal and low (flat-then-crash pattern)
+                const hasPeakAbove160 = glucose.some(r => {
+                    const rt = new Date(r.dateString);
+                    return rt > mealTime && rt < lowTime && r.sgv > 160;
+                });
+                if (!hasPeakAbove160) score += 0.2;
+
+                // Cat1 SMBs delivered > 40% of expected budget
+                if (decomp.expectedBudget > 0 &&
+                    decomp.cat1Total > 0.40 * decomp.expectedBudget) {
+                    score += 0.15;
+                }
+
+                return score;
+            },
+
+            /** §5.7 ISF axis — low direction */
+            _scoreISFAxisLow(decomp, correctionToEvent, iobAtLow) {
+                let score = 0;
+
+                if (decomp.correctionTotal > 0 && correctionToEvent !== null) {
+                    if (correctionToEvent < 60) {
+                        score += 0.6;                         // fast overcorrection
+                    } else if (correctionToEvent <= 90) {
+                        score += 0.35;
+                    }
+                }
+
+                if (decomp.cat3SMBs.length > 0) score += 0.7;   // pure fasting correction
+                if (decomp.cat2SMBs.length > 0) score += 0.25;  // post-meal, budget exhausted
+
+                // IOB at low > 0.4U, no Cat1 SMBs still active (all Cat1s already categorised)
+                if (iobAtLow !== null && iobAtLow > 0.4 && decomp.cat1SMBs.length === 0) {
+                    score += 0.2;
+                }
+
+                return score;
+            },
+
+            /** §5.7 Basal axis — low direction */
+            _scoreBasalAxisLow(decomp, minsFromMealToLow, iobAtLow, treatments, lowTime, signalAnalysis) {
+                let score = 0;
+
+                if (iobAtLow !== null && iobAtLow < 0.2) score += 0.6;
+
+                // No bolus of any type within 3hr of low
+                const threeHrsBefore = new Date(lowTime.getTime() - 3 * 60 * 60 * 1000);
+                const hasRecentBolus = treatments.some(t => {
+                    if (!t.insulin || t.insulin <= 0 || !t.created_at) return false;
+                    const tt = new Date(t.created_at);
+                    return tt >= threeHrsBefore && tt <= lowTime;
+                });
+                if (!hasRecentBolus) score += 0.4;
+
+                if (minsFromMealToLow > 180) score += 0.3;
+
+                // Clean window signal shows LOW in the same circadian hour block
+                if (signalAnalysis && signalAnalysis.periods) {
+                    const lowHour = lowTime.getHours();
+                    const matchPeriod = signalAnalysis.periods.find(p =>
+                        lowHour >= p.startHour && lowHour < p.endHour
+                    );
+                    if (matchPeriod && matchPeriod.signal === 'LOW') score += 0.3;
+                }
+
+                return score;
+            },
+
+            /**
+             * runCausalAttributionEngine — low event path (§5.1–5.9)
+             *
+             * Processes all waking-hour low events (6am–midnight) that have a
+             * governing meal within 4 hours. Events without a governing meal are
+             * left unclaimed so detectUnexplainedLows can handle them.
+             *
+             * NOT wired into the main analysis loop — call explicitly after
+             * ENH-CAE-002 wiring phase is complete.
+             */
+            runCausalAttributionEngine(
+                lowProblems, nightscoutData, crSchedule, isfSchedule,
+                claimedEvents, analysisWindow, signalAnalysis
+            ) {
+                const findings = [];
+                const analysisStart = new Date(
+                    Date.now() - analysisWindow * 24 * 60 * 60 * 1000
+                );
+
+                for (const low of lowProblems) {
+                    const lowId = getEventId(low);
+                    if (claimedEvents.lows.has(lowId)) continue;
+
+                    const lowTime = new Date(low.localTime || low.time);
+
+                    // §5.2: Engine scope — waking hours 6am–midnight
+                    const lowHour = lowTime.getHours();
+                    if (lowHour < 6) continue;
+
+                    if (lowTime < analysisStart) continue;
+
+                    // §5.4 Step 1: Governing meal — most recent meal with
+                    // carbs ≥ minMealCarbsForAttribution within 4 hours before low
+                    const fourHoursBefore = new Date(lowTime.getTime() - 4 * 60 * 60 * 1000);
+                    const governingMeal = nightscoutData.treatments
+                        .filter(t => {
+                            if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution) return false;
+                            if (!t.created_at) return false;
+                            const tt = new Date(t.created_at);
+                            return tt >= fourHoursBefore && tt < lowTime;
+                        })
+                        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+
+                    // No governing meal → fasting context; leave for detectUnexplainedLows
+                    if (!governingMeal) continue;
+
+                    const mealId = getEventId(governingMeal);
+                    const mealTime = new Date(governingMeal.created_at);
+                    const minsFromMealToLow = (lowTime - mealTime) / 60000;
+
+                    // §5.6 Step 3: SMB decomposition
+                    const decomp = this._decomposeSMBs(
+                        nightscoutData.treatments, nightscoutData.glucose,
+                        mealTime, governingMeal.carbs, crSchedule
+                    );
+
+                    const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
+
+                    const correctionToEvent = decomp.corrections.length > 0
+                        ? (lowTime - new Date(decomp.corrections[0].created_at)) / 60000
+                        : null;
+
+                    // §5.7 Step 4: Axis scoring
+                    const crScore = this._scoreCRAxisLow(
+                        decomp, minsFromMealToLow,
+                        nightscoutData.glucose, mealTime, lowTime
+                    );
+                    const isfScore = this._scoreISFAxisLow(decomp, correctionToEvent, iobAtLow);
+                    const basalScore = this._scoreBasalAxisLow(
+                        decomp, minsFromMealToLow, iobAtLow,
+                        nightscoutData.treatments, lowTime, signalAnalysis
+                    );
+
+                    // §5.8 Step 5: Dominant axis → finding
+                    const period = CIRCADIAN_PERIODS.find(p => {
+                        const h = mealTime.getHours();
+                        return h >= p.startHour && h < p.endHour;
+                    });
+                    const periodName = period ? period.name : 'Unknown';
+
+                    const axisFactors = [
+                        'causal_engine',
+                        `cr_score:${crScore.toFixed(2)}`,
+                        `isf_score:${isfScore.toFixed(2)}`,
+                        `basal_score:${basalScore.toFixed(2)}`
+                    ];
+
+                    let finding = null;
+
+                    // All axes below threshold → RESISTANT_LOW
+                    if (crScore < 0.25 && isfScore < 0.25 && basalScore < 0.25) {
+                        finding = {
+                            id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                            type: FindingType.RESISTANT_LOW,
+                            scheduleTime: null,
+                            period: periodName,
+                            severity: 0.4,
+                            primaryParameter: null,
+                            suggestedChangePercent: 0,
+                            contributingFactors: axisFactors,
+                            details: `Low ${low.bg} mg/dL — all axis scores below threshold. Non-insulin cause suspected.`
+                        };
+                    } else {
+                        // Sort axes descending
+                        const axes = [
+                            { axis: 'cr',    score: crScore },
+                            { axis: 'isf',   score: isfScore },
+                            { axis: 'basal', score: basalScore }
+                        ].sort((a, b) => b.score - a.score);
+                        const top    = axes[0];
+                        const second = axes[1];
+
+                        // MIXED: top two both ≥ 0.35 and within 0.15 of each other
+                        if (top.score >= 0.35 && second.score >= 0.35 &&
+                            (top.score - second.score) <= 0.15) {
+                            const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.MIXED_ATTRIBUTION,
+                                scheduleTime: crEntry ? crEntry.time : null,
+                                period: periodName,
+                                severity: 0.5,
+                                primaryParameter: null,
+                                suggestedChangePercent: 0,
+                                contributingFactors: axisFactors,
+                                details: `Low ${low.bg} mg/dL following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
+                                turn1Question: `Low following ${governingMeal.carbs}g meal — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
+                            };
+                        } else if (top.score < 0.4) {
+                            // Dominant axis exists but score is too weak → RESISTANT_LOW
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.RESISTANT_LOW,
+                                scheduleTime: null,
+                                period: periodName,
+                                severity: 0.4,
+                                primaryParameter: null,
+                                suggestedChangePercent: 0,
+                                contributingFactors: axisFactors,
+                                details: `Low ${low.bg} mg/dL — dominant axis below 0.4 threshold. Unclear cause.`
+                            };
+                        } else if (top.axis === 'basal') {
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.UNEXPLAINED_LOW,
+                                scheduleTime: null,
+                                period: periodName,
+                                severity: low.bg < 55 ? 0.9 : low.bg < 65 ? 0.75 : 0.6,
+                                primaryParameter: 'basal',
+                                suggestedChangePercent: -5,
+                                contributingFactors: [...axisFactors, 'excess_basal'],
+                                details: `Low ${low.bg} mg/dL — basal axis dominant (${basalScore.toFixed(2)}). Near-zero IOB, no recent bolus.`
+                            };
+                        } else if (top.axis === 'isf') {
+                            const isfEntry = getISFForTime(mealTime.toISOString(), isfSchedule);
+                            const adj = (correctionToEvent !== null && correctionToEvent < 60)
+                                ? 7.5 : 5;
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.ISF_INDUCED_LOW,
+                                scheduleTime: isfEntry ? isfEntry.time : '00:00',
+                                period: periodName,
+                                severity: low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.7,
+                                primaryParameter: 'isf',
+                                suggestedChangePercent: adj,
+                                contributingFactors: [...axisFactors, 'strong_isf'],
+                                details: `Low ${low.bg} mg/dL — ISF axis dominant (${isfScore.toFixed(2)}). Correction overcorrected.`
+                            };
+                        } else {
+                            // CR axis dominant → DIRECT_MEAL_LOW (§5.9)
+                            const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
+                            const adj = low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5;
+                            const sev = low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.7;
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.DIRECT_MEAL_LOW,
+                                scheduleTime: crEntry ? crEntry.time : '00:00',
+                                period: periodName,
+                                severity: sev,
+                                primaryParameter: 'cr',
+                                suggestedChangePercent: adj,
+                                contributingFactors: [...axisFactors, 'strong_cr'],
+                                details: `Meal (${governingMeal.carbs}g) → Low ${low.bg} mg/dL at ${minsFromMealToLow.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                            };
+                        }
+                    }
+
+                    if (finding) {
+                        findings.push(finding);
+                        claimedEvents.lows.add(lowId);
+                        // Claim nearby lows (same low event, multiple CGM readings)
+                        const lowTimeMs = lowTime.getTime();
+                        lowProblems.forEach(o => {
+                            if (Math.abs(
+                                new Date(o.localTime || o.time).getTime() - lowTimeMs
+                            ) <= 15 * 60 * 1000) {
+                                claimedEvents.lows.add(getEventId(o));
+                            }
+                        });
+                    }
+                }
+
+                return findings;
+            },
+
+            // ── ENH-CAE-002: buildHighProblems (§5.3a) ───────────────────────────────
+            buildHighProblems(glucose, analysisStart) {
+                const highCandidates = glucose
+                    .filter(r => {
+                        const rTime = new Date(r.dateString);
+                        return rTime >= analysisStart && r.sgv >= 180;
+                    })
+                    .sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
+
+                const highProblems = [];
+                let currentEvent = [];
+
+                highCandidates.forEach(r => {
+                    if (currentEvent.length === 0) {
+                        currentEvent.push(r);
+                    } else {
+                        const gap = new Date(r.dateString) -
+                            new Date(currentEvent[currentEvent.length - 1].dateString);
+                        if (gap <= 20 * 60 * 1000) {
+                            currentEvent.push(r);
+                        } else {
+                            if (currentEvent.length >= 2) {
+                                const peak = currentEvent.reduce(
+                                    (max, x) => x.sgv > max.sgv ? x : max
+                                );
+                                highProblems.push({
+                                    bg: peak.sgv,
+                                    time: peak.dateString,
+                                    readings: currentEvent.slice()
+                                });
+                            }
+                            currentEvent = [r];
+                        }
+                    }
+                });
+                if (currentEvent.length >= 2) {
+                    const peak = currentEvent.reduce(
+                        (max, x) => x.sgv > max.sgv ? x : max
+                    );
+                    highProblems.push({
+                        bg: peak.sgv,
+                        time: peak.dateString,
+                        readings: currentEvent.slice()
+                    });
+                }
+
+                return highProblems;
+            },
+
+            // ── ENH-CAE-002: High axis scoring helpers (§5.7) ────────────────────────
+
+            _scoreCRAxisHigh(decomp, minsFromMealToPeak, highTime, glucose, mealTime) {
+                let score = 0;
+
+                // Budget ratio
+                if (decomp.budgetRatio < 0.60)      { score += 0.6; }
+                else if (decomp.budgetRatio < 0.80) { score += 0.4; }
+
+                // No Cat2 or Cat3 corrections fired despite BG > 180 for > 30 min
+                const noCorrections =
+                    decomp.cat2SMBs.length === 0 && decomp.cat3SMBs.length === 0;
+                if (noCorrections) {
+                    const highReadings = glucose.filter(r => {
+                        const rt = new Date(r.dateString);
+                        return rt >= mealTime && rt <= highTime && r.sgv > 180;
+                    });
+                    if (highReadings.length >= 2) {
+                        const firstHigh = highReadings.reduce((e, r) =>
+                            new Date(r.dateString) < new Date(e.dateString) ? r : e);
+                        const lastHigh  = highReadings.reduce((e, r) =>
+                            new Date(r.dateString) > new Date(e.dateString) ? r : e);
+                        const durationMin =
+                            (new Date(lastHigh.dateString) - new Date(firstHigh.dateString)) / 60000;
+                        if (durationMin > 30) score += 0.3;
+                    }
+                }
+
+                // Peak within 90 min of meal
+                if (minsFromMealToPeak <= 90) score += 0.3;
+
+                // Cat1 SMBs < 20% of expectedBudget
+                if (decomp.expectedBudget > 0 &&
+                    decomp.cat1Total < 0.20 * decomp.expectedBudget) {
+                    score += 0.15;
+                }
+
+                // BG still > 160 at 3hr mark after meal
+                const threeHrsMark = new Date(mealTime.getTime() + 3 * 60 * 60 * 1000);
+                const bgAt3hr = glucose.filter(r => {
+                    const rt = new Date(r.dateString);
+                    return Math.abs(rt - threeHrsMark) < 15 * 60 * 1000;
+                });
+                if (bgAt3hr.some(r => r.sgv > 160)) score += 0.2;
+
+                return score;
+            },
+
+            _scoreISFAxisHigh(decomp, glucose, deviceStatus, highTime, highPeakBG) {
+                let score = 0;
+
+                if (decomp.correctionTotal > 0 && decomp.corrections.length > 0) {
+                    const firstCorrTime = new Date(decomp.corrections[0].created_at);
+                    const twoHrsAfterCorr =
+                        new Date(firstCorrTime.getTime() + 120 * 60 * 1000);
+
+                    // BG remains > 160 at 120 min post-correction
+                    const bgAt120 = glucose.filter(r => {
+                        const rt = new Date(r.dateString);
+                        return Math.abs(rt - twoHrsAfterCorr) < 15 * 60 * 1000;
+                    });
+                    if (bgAt120.some(r => r.sgv > 160)) score += 0.6;
+
+                    // Cat3 SMBs fired but BG did not reach within 30 mg/dL of target
+                    // within 120 min of first correction
+                    if (decomp.cat3SMBs.length > 0) {
+                        const bgInWindow = glucose.filter(r => {
+                            const rt = new Date(r.dateString);
+                            return rt >= firstCorrTime && rt <= twoHrsAfterCorr;
+                        });
+                        const reachedTarget = bgInWindow.some(
+                            r => r.sgv <= CONFIG.targetBG + 30
+                        );
+                        if (!reachedTarget) score += 0.5;
+                    }
+
+                    // Cat2 SMBs fired but BG trajectory flat or rising after correction
+                    if (decomp.cat2SMBs.length > 0) {
+                        const firstCat2Time = new Date(decomp.cat2SMBs[0].created_at);
+                        const bgAfterCat2 = glucose
+                            .filter(r => {
+                                const rt = new Date(r.dateString);
+                                return rt > firstCat2Time &&
+                                    rt <= new Date(firstCat2Time.getTime() + 90 * 60 * 1000);
+                            })
+                            .sort((a, b) =>
+                                new Date(a.dateString) - new Date(b.dateString));
+                        if (bgAfterCat2.length >= 2) {
+                            const firstBG = bgAfterCat2[0].sgv;
+                            const lastBG  = bgAfterCat2[bgAfterCat2.length - 1].sgv;
+                            if (lastBG >= firstBG) score += 0.3;
+                        }
+                    }
+                }
+
+                // IOB at high peak > 0.5U but BG still > 180
+                const iobAtPeak = this.getIOBAtTime(deviceStatus, highTime);
+                if (iobAtPeak !== null && iobAtPeak > 0.5 && highPeakBG > 180) {
+                    score += 0.2;
+                }
+
+                return score;
+            },
+
+            _scoreBasalAxisHigh(iobAtHigh, treatments, highTime, decomp, signalAnalysis, glucose, mealTime) {
+                let score = 0;
+
+                const threeHrsBefore = new Date(highTime.getTime() - 3 * 60 * 60 * 1000);
+
+                const hasRecentBolus = treatments.some(t => {
+                    if (!t.insulin || t.insulin <= 0 || !t.created_at) return false;
+                    const tt = new Date(t.created_at);
+                    return tt >= threeHrsBefore && tt <= highTime;
+                });
+
+                // IOB at high peak < 0.2U AND no bolus within 3hr
+                if (iobAtHigh !== null && iobAtHigh < 0.2 && !hasRecentBolus) {
+                    score += 0.5;
+                }
+
+                // BG rising steadily for > 60 min with no meal in 3hr
+                const noMealIn3hr = !treatments.some(t => {
+                    if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution ||
+                        !t.created_at) return false;
+                    const tt = new Date(t.created_at);
+                    return tt >= threeHrsBefore && tt <= highTime;
+                });
+                if (noMealIn3hr) {
+                    const sixtyMinBefore = new Date(highTime.getTime() - 60 * 60 * 1000);
+                    const bgWindow = glucose
+                        .filter(r => {
+                            const rt = new Date(r.dateString);
+                            return rt >= sixtyMinBefore && rt <= highTime;
+                        })
+                        .sort((a, b) =>
+                            new Date(a.dateString) - new Date(b.dateString));
+                    if (bgWindow.length >= 3 &&
+                        bgWindow[bgWindow.length - 1].sgv > bgWindow[0].sgv) {
+                        score += 0.4;
+                    }
+                }
+
+                // Clean window signal shows HIGH in same hour block
+                if (signalAnalysis && signalAnalysis.periods) {
+                    const highHour = highTime.getHours();
+                    const matchPeriod = signalAnalysis.periods.find(p =>
+                        highHour >= p.startHour && highHour < p.endHour
+                    );
+                    if (matchPeriod && matchPeriod.signal === 'HIGH') score += 0.3;
+                }
+
+                return score;
+            },
+
+            /**
+             * runHighCausalAttributionEngine — high event path (§5.3a, §5.5, §5.7, §5.9)
+             *
+             * Processes all waking-hour high events (6am–midnight, sustained ≥2 readings)
+             * that have a governing meal within 4 hours. Events without a governing meal
+             * are left unclaimed. Rebound-context events are skipped.
+             *
+             * NOT wired into the main analysis loop — call explicitly after
+             * ENH-CAE-002 wiring phase is complete.
+             */
+            runHighCausalAttributionEngine(
+                highProblems, nightscoutData, crSchedule, isfSchedule,
+                claimedEvents, analysisWindow, signalAnalysis
+            ) {
+                const findings = [];
+                const analysisStart = new Date(
+                    Date.now() - analysisWindow * 24 * 60 * 60 * 1000
+                );
+
+                for (const high of highProblems) {
+                    const highTime = new Date(high.time);
+                    const highHour = highTime.getHours();
+
+                    // §5.2: Engine scope — waking hours 6am–midnight
+                    if (highHour < 6) continue;
+                    if (highTime < analysisStart) continue;
+
+                    // Claim check — skip if any reading in this event already claimed
+                    const allHighIds = (high.readings || []).map(r => getEventId(r));
+                    if (allHighIds.some(id => claimedEvents.highs.has(id))) continue;
+
+                    // §5.4 Step 1: Governing meal
+                    const fourHoursBefore =
+                        new Date(highTime.getTime() - 4 * 60 * 60 * 1000);
+                    const governingMeal = nightscoutData.treatments
+                        .filter(t => {
+                            if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution)
+                                return false;
+                            if (!t.created_at) return false;
+                            const tt = new Date(t.created_at);
+                            return tt >= fourHoursBefore && tt < highTime;
+                        })
+                        .sort((a, b) =>
+                            new Date(b.created_at) - new Date(a.created_at))[0];
+
+                    // No governing meal → fasting context; not in engine scope
+                    if (!governingMeal) continue;
+
+                    const mealTime = new Date(governingMeal.created_at);
+                    const minsFromMealToPeak = (highTime - mealTime) / 60000;
+
+                    // Minimum causal latency: peak < 30 min after meal predates meal causally
+                    if (minsFromMealToPeak < 30) continue;
+
+                    // §5.5 Step 2: Rebound check — skip to detectPostMealHighs
+                    const bgAtMeal = nightscoutData.glucose.find(r =>
+                        Math.abs(new Date(r.dateString) - mealTime) < 10 * 60 * 1000
+                    );
+                    const mealDuringLow = bgAtMeal && bgAtMeal.sgv < 80;
+
+                    let isSafetyReduction = false;
+                    if (!mealDuringLow) {
+                        const crEntryReb = getCRForTime(governingMeal.created_at, crSchedule);
+                        if (crEntryReb && crEntryReb.value > 0) {
+                            const expectedBolus = governingMeal.carbs / crEntryReb.value;
+                            const actualBolus   = governingMeal.insulin || 0;
+                            const pctGiven = expectedBolus > 0
+                                ? (actualBolus / expectedBolus) * 100
+                                : 100;
+                            if (pctGiven < 70) {
+                                const iobAtMeal = this.getIOBAtTime(
+                                    nightscoutData.deviceStatus, mealTime
+                                );
+                                isSafetyReduction =
+                                    !(iobAtMeal !== null && iobAtMeal > 1.0);
+                            }
+                        }
+                    }
+                    if (mealDuringLow) continue;
+
+                    const safetyReductionFlag = isSafetyReduction;
+
+                    // §5.6 Step 3: SMB decomposition (shared with low path)
+                    const decomp = this._decomposeSMBs(
+                        nightscoutData.treatments, nightscoutData.glucose,
+                        mealTime, governingMeal.carbs, crSchedule
+                    );
+
+                    const iobAtHigh = this.getIOBAtTime(
+                        nightscoutData.deviceStatus, highTime
+                    );
+
+                    // §5.7 Step 4: Axis scoring (high direction)
+                    const crScore = this._scoreCRAxisHigh(
+                        decomp, minsFromMealToPeak, highTime,
+                        nightscoutData.glucose, mealTime
+                    );
+                    const isfScore = this._scoreISFAxisHigh(
+                        decomp, nightscoutData.glucose, nightscoutData.deviceStatus,
+                        highTime, high.bg
+                    );
+                    const basalScore = this._scoreBasalAxisHigh(
+                        iobAtHigh, nightscoutData.treatments, highTime,
+                        decomp, signalAnalysis, nightscoutData.glucose, mealTime
+                    );
+
+                    // §5.8 Step 5: Dominant axis → finding
+                    const period = CIRCADIAN_PERIODS.find(p => {
+                        const h = mealTime.getHours();
+                        return h >= p.startHour && h < p.endHour;
+                    });
+                    const periodName = period ? period.name : 'Unknown';
+
+                    const axisFactors = [
+                        'causal_engine',
+                        `cr_score:${crScore.toFixed(2)}`,
+                        `isf_score:${isfScore.toFixed(2)}`,
+                        `basal_score:${basalScore.toFixed(2)}`,
+                        ...(safetyReductionFlag ? ['post_meal_context_ambiguous'] : [])
+                    ];
+
+                    let finding = null;
+
+                    // All axes below threshold → RESISTANT_HIGH
+                    if (crScore < 0.25 && isfScore < 0.25 && basalScore < 0.25) {
+                        finding = {
+                            id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                            type: FindingType.RESISTANT_HIGH,
+                            scheduleTime: null,
+                            period: periodName,
+                            severity: 0.3,
+                            primaryParameter: null,
+                            suggestedChangePercent: 0,
+                            contributingFactors: axisFactors,
+                            details: `High ${high.bg} mg/dL — all axis scores below threshold. Non-insulin cause suspected.`
+                        };
+                    } else {
+                        const axes = [
+                            { axis: 'cr',    score: crScore },
+                            { axis: 'isf',   score: isfScore },
+                            { axis: 'basal', score: basalScore }
+                        ].sort((a, b) => b.score - a.score);
+                        const top    = axes[0];
+                        const second = axes[1];
+
+                        // MIXED: top two both ≥ 0.35 and within 0.15 of each other
+                        if (top.score >= 0.35 && second.score >= 0.35 &&
+                            (top.score - second.score) <= 0.15) {
+                            const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.MIXED_ATTRIBUTION,
+                                scheduleTime: crEntry ? crEntry.time : null,
+                                period: periodName,
+                                severity: 0.5,
+                                primaryParameter: null,
+                                suggestedChangePercent: 0,
+                                contributingFactors: axisFactors,
+                                details: `High ${high.bg} mg/dL following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
+                                turn1Question: `High following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}. Did a correction fire and fail, or did BG peak without any correction? Your answer determines whether we adjust CR or ISF.`
+                            };
+                        } else if (top.score < 0.4) {
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.RESISTANT_HIGH,
+                                scheduleTime: null,
+                                period: periodName,
+                                severity: 0.3,
+                                primaryParameter: null,
+                                suggestedChangePercent: 0,
+                                contributingFactors: axisFactors,
+                                details: `High ${high.bg} mg/dL — dominant axis below 0.4 threshold.`
+                            };
+                        } else if (top.axis === 'basal') {
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.BASAL_SIGNAL_HIGH,
+                                scheduleTime: `${String(highTime.getHours()).padStart(2, '0')}:00`,
+                                period: periodName,
+                                severity: 0.5,
+                                primaryParameter: 'basal',
+                                suggestedChangePercent: 5,
+                                contributingFactors: [...axisFactors, 'insufficient_basal'],
+                                details: `High ${high.bg} mg/dL — basal axis dominant (${basalScore.toFixed(2)}). Near-zero IOB, BG rising without recent bolus.`
+                            };
+                        } else if (top.axis === 'isf') {
+                            const isfEntry = getISFForTime(
+                                mealTime.toISOString(), isfSchedule
+                            );
+                            const sev = high.bg > 220 ? 0.80 : 0.65;
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.ISF_SUPPRESSED_HIGH,
+                                scheduleTime: isfEntry ? isfEntry.time : '00:00',
+                                period: periodName,
+                                severity: sev,
+                                primaryParameter: 'isf',
+                                suggestedChangePercent: -5,
+                                contributingFactors: [...axisFactors, 'weak_isf'],
+                                details: `High ${high.bg} mg/dL — ISF axis dominant (${isfScore.toFixed(2)}). Correction failed to reach target.`
+                            };
+                        } else {
+                            // CR axis dominant → DIRECT_MEAL_HIGH (§5.9)
+                            const crEntry = getCRForTime(
+                                mealTime.toISOString(), crSchedule
+                            );
+                            const adj = high.bg > 250 ? -7 : high.bg > 220 ? -5 : -3;
+                            const sev = high.bg > 250 ? 0.85 : high.bg > 220 ? 0.70 : 0.55;
+                            finding = {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.DIRECT_MEAL_HIGH,
+                                scheduleTime: crEntry ? crEntry.time : '00:00',
+                                period: periodName,
+                                severity: sev,
+                                primaryParameter: 'cr',
+                                suggestedChangePercent: adj,
+                                contributingFactors: [...axisFactors, 'weak_cr'],
+                                details: `Meal (${governingMeal.carbs}g) → High ${high.bg} mg/dL at ${minsFromMealToPeak.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                            };
+                        }
+                    }
+
+                    if (finding) {
+                        findings.push(finding);
+                        allHighIds.forEach(id => claimedEvents.highs.add(id));
+                    }
+                }
+
+                return findings;
+            },
+
+            // ─────────────────────────────────────────────────────────────────
+            // ENH-CAE-003: Waking-Hour Correction Ineffectiveness Detector
+            // §6: Cat3 SMBs (fasting, >3hr from any meal) between 6am–midnight
+            // that repeatedly fail to bring BG to within 20 mg/dL of target.
+            // Complement to overnight detectCorrectionIneffectiveness.
+            // ─────────────────────────────────────────────────────────────────
+            detectWakingCorrectionIneffectiveness(nightscoutData, isfSchedule, targetBG, claimedEvents, analysisWindow) {
+                const findings = [];
+                const analysisStart = new Date(Date.now() - analysisWindow * 24 * 60 * 60 * 1000);
+                const bgTarget = (typeof targetBG === 'number' && targetBG > 0) ? targetBG : CONFIG.targetBG;
+
+                const sessions = [];
+
+                nightscoutData.treatments.forEach(t => {
+                    if (!t.eventType || !t.eventType.includes('SMB')) return;
+                    if (!t.insulin || t.insulin <= 0) return;
+                    if (!t.created_at) return;
+
+                    const smbTime = new Date(t.created_at);
+                    if (smbTime < analysisStart) return;
+
+                    // §6.2 scope: 6am–midnight only
+                    const hour = smbTime.getHours();
+                    if (hour < 6) return;
+
+                    // Cat3: no meal with carbs >= minMealCarbsForAttribution in 3hr lookback
+                    const windowStart = new Date(smbTime.getTime() - 3 * 60 * 60 * 1000);
+                    const recentMeals = nightscoutData.treatments.filter(meal => {
+                        if (!meal.carbs || meal.carbs < CONFIG.minMealCarbsForAttribution) return false;
+                        if (!meal.created_at) return false;
+                        const mealTime = new Date(meal.created_at);
+                        return mealTime >= windowStart && mealTime <= smbTime;
+                    });
+                    if (recentMeals.length > 0) return; // Not Cat3
+
+                    // Skip if already claimed by the engine (SMB led to a low)
+                    const smbId = getEventId(t);
+                    if (claimedEvents.corrections.has(smbId)) return;
+
+                    // BG readings in the 120min window after the SMB
+                    const twoHrsAfter = new Date(smbTime.getTime() + 120 * 60 * 1000);
+                    const bgInWindow = nightscoutData.glucose.filter(r => {
+                        const rt = new Date(r.dateString);
+                        return rt > smbTime && rt <= twoHrsAfter;
+                    }).sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
+
+                    if (bgInWindow.length === 0) return;
+
+                    // §6.3: if BG went below lowThreshold this was a low event — skip
+                    if (bgInWindow.some(r => r.sgv <= CONFIG.lowThreshold)) return;
+
+                    // Pattern: BG never reached within 20 mg/dL of target
+                    const reachedNearTarget = bgInWindow.some(r => r.sgv <= bgTarget + 20);
+                    if (reachedNearTarget) return;
+
+                    // BG ends above target at ~120 min
+                    const bgAt120 = bgInWindow[bgInWindow.length - 1];
+                    if (bgAt120.sgv <= bgTarget) return;
+
+                    sessions.push({ smb: t, smbTime, bgAt120, bgInWindow });
+                });
+
+                // §6.2 threshold: 3+ sessions required
+                if (sessions.length < 3) return findings;
+
+                const repr = sessions[0];
+                const isfEntry = getISFForTime(repr.smbTime.toISOString(), isfSchedule);
+                const period = CIRCADIAN_PERIODS.find(p => {
+                    const h = repr.smbTime.getHours();
+                    return h >= p.startHour && h < p.endHour;
+                });
+                const avgBGAt120 = sessions.reduce((sum, s) => sum + s.bgAt120.sgv, 0) / sessions.length;
+
+                findings.push({
+                    id: `finding_waking_corr_ineff_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                    type: FindingType.CORRECTION_INEFFECTIVE,
+                    detectedAt: new Date().toISOString(),
+                    eventTime: repr.smb.created_at,
+                    scheduleTime: isfEntry.time,
+                    period: period?.name || 'Waking',
+                    severity: 0.65,
+                    events: sessions.map(s => ({
+                        time: formatTimeForDisplay(s.smb.created_at),
+                        insulin: s.smb.insulin,
+                        bgAt120: s.bgAt120.sgv
+                    })),
+                    similarEventsCount: sessions.length,
+                    daysWithPattern: sessions.length,
+                    primaryParameter: 'isf',
+                    suggestedChangePercent: -5,
+                    contributingFactors: ['weak_isf', 'daytime_correction_ineffective', 'cat3_smb'],
+                    claimedEventIds: sessions.map(s => getEventId(s.smb)),
+                    conflictsWith: [],
+                    recencyWeight: 1.0,
+                    details: `${sessions.length} daytime fasting corrections (Cat3 SMBs) failed to reach within 20 mg/dL of target within 120 minutes. Average BG at 120min: ${avgBGAt120.toFixed(0)} mg/dL (target: ${bgTarget} mg/dL). ISF may be too weak for fasting corrections.`,
+                    safetyNote: null
+                });
+
+                sessions.forEach(s => claimedEvents.corrections.add(getEventId(s.smb)));
+
+                return findings;
             }
         };
+
+        // =========================================================================
+        // ENH-CAE-004: Period Validity Message Helper
+        // §7.2: UI message for INSUFFICIENT periods — bolus coverage structural
+        // =========================================================================
+
+        const getPeriodValidityMessage = (periodName) =>
+            `No valid fasting windows in ${periodName} — bolus coverage structural for this schedule. See Attribution Engine findings for CR/ISF analysis of events in this window.`;
 
         // =========================================================================
         // SIGNAL ANALYSIS MODULE (PRESERVED FROM v25)
@@ -2997,60 +3992,121 @@
             analyzeCleanWindows(nightscoutData, basalWindow, targetBG = 110, basalSchedule = null, isfSchedule = null, tdd = null) {
                 const analysisStart = new Date(Date.now() - basalWindow * 24 * 60 * 60 * 1000);
                 
-                // Find clean windows (IOB < 0.1, COB = 0)
-                // Tighter threshold = cleaner signal (0.1 U × ISF 100 = max 10 mg/dL pending impact)
+                // Find clean windows (IOB < 0.1, COB = 0) with ENH-CAE-001 gates A/B/C.
+                // candidateReadings: all readings passing the IOB/COB filter.
+                // rejectedBy null = passed all gates (counts as a clean window).
+                const candidateReadings = [];
                 const cleanWindows = [];
-                
+
                 nightscoutData.glucose.forEach(reading => {
                     const readingTime = new Date(reading.dateString);
                     if (readingTime < analysisStart) return;
-                    
-                    // Check for IOB at this time
+
                     const closestStatus = nightscoutData.deviceStatus?.find(status => {
                         if (!status.created_at) return false;
                         const statusTime = new Date(status.created_at);
                         const timeDiff = Math.abs(statusTime - readingTime);
                         return timeDiff < 10 * 60 * 1000;
                     });
-                    
+
                     if (!closestStatus) return;
-                    
+
                     const iob = closestStatus.iob || closestStatus.openaps?.iob?.iob || 0;
                     const cob = closestStatus.cob || closestStatus.openaps?.cob?.cob || 0;
-                    
-                    if (iob < 0.1 && cob === 0) {
-                        cleanWindows.push({
-                            time: readingTime,
-                            bg: reading.sgv,
-                            deviation: reading.sgv - targetBG
-                        });
+
+                    if (!(iob < 0.1 && cob === 0)) return;
+
+                    // Candidate: passed IOB/COB filter. Now apply gates in order.
+                    const deviation = reading.sgv - targetBG;
+
+                    // Gate A: no insulin treatment within 180 minutes before reading
+                    const gateA_cutoff = new Date(readingTime.getTime() - 180 * 60 * 1000);
+                    const failsGateA = (nightscoutData.treatments || []).some(t =>
+                        t.insulin > 0 && t.created_at &&
+                        new Date(t.created_at) > gateA_cutoff &&
+                        new Date(t.created_at) <= readingTime
+                    );
+                    if (failsGateA) {
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateA' });
+                        return;
                     }
+
+                    // Gate B: |deltaBG / deltaTime| ≤ 1.5 mg/dL/min.
+                    // No prior reading within 20 minutes → exclude as a precaution.
+                    const priorCGM = (nightscoutData.glucose || []).filter(r => {
+                        const rt = new Date(r.dateString);
+                        const diffMin = (readingTime - rt) / 60000;
+                        return diffMin > 0 && diffMin <= 20;
+                    });
+                    if (priorCGM.length === 0) {
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateB' });
+                        return;
+                    }
+                    const prior = priorCGM.reduce((c, r) =>
+                        (readingTime - new Date(r.dateString)) < (readingTime - new Date(c.dateString)) ? r : c
+                    );
+                    const deltaTime = (readingTime - new Date(prior.dateString)) / 60000;
+                    const deltaBG = reading.sgv - prior.sgv;
+                    if (Math.abs(deltaBG / deltaTime) > 1.5) {
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateB' });
+                        return;
+                    }
+
+                    // Gate C: no APS zero-temp (enacted.rate === 0 strictly, not null) in prior 90 min
+                    const gateC_cutoff = new Date(readingTime.getTime() - 90 * 60 * 1000);
+                    const failsGateC = (nightscoutData.deviceStatus || []).some(s => {
+                        if (!s.created_at) return false;
+                        const sTime = new Date(s.created_at);
+                        return sTime >= gateC_cutoff && sTime <= readingTime &&
+                               s.openaps?.enacted?.rate === 0;
+                    });
+                    if (failsGateC) {
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateC' });
+                        return;
+                    }
+
+                    // Passed all gates — clean window
+                    candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: null });
+                    cleanWindows.push({ time: readingTime, bg: reading.sgv, deviation });
                 });
-                
+
                 // Group by period
                 const periods = CIRCADIAN_PERIODS.map(period => {
-                    const windowsInPeriod = cleanWindows.filter(w => {
-                        const hour = w.time.getHours();
-                        return hour >= period.startHour && hour < period.endHour;
+                    const candidatesInPeriod = candidateReadings.filter(c => {
+                        const h = c.time.getHours();
+                        return h >= period.startHour && h < period.endHour;
                     });
-                    
-                    const hasSufficientData = windowsInPeriod.length >= CONFIG.minEventsHighConfidence; // Synced with CONFIG
+                    const windowsInPeriod = candidatesInPeriod.filter(c => c.rejectedBy === null);
+                    const candidateWindowCount = candidatesInPeriod.length;
+                    const rejectedByGate = {
+                        gateA: candidatesInPeriod.filter(c => c.rejectedBy === 'gateA').length,
+                        gateB: candidatesInPeriod.filter(c => c.rejectedBy === 'gateB').length,
+                        gateC: candidatesInPeriod.filter(c => c.rejectedBy === 'gateC').length,
+                    };
+                    const windowQuality = candidateWindowCount > 0
+                        ? windowsInPeriod.length / candidateWindowCount
+                        : 0;
+
+                    const hasSufficientData = windowsInPeriod.length >= CONFIG.minEventsHighConfidence;
                     const deviations = windowsInPeriod.map(w => w.deviation).sort((a, b) => a - b);
-                    const medianDeviation = hasSufficientData 
+                    const medianDeviation = hasSufficientData
                         ? deviations[Math.floor(deviations.length / 2)]
                         : null;
-                    
+
                     const signal = !hasSufficientData ? 'INSUFFICIENT' :
                         medianDeviation > 10 ? 'HIGH' :
                         medianDeviation < -10 ? 'LOW' : 'NEUTRAL';
-                    
+
                     return {
                         ...period,
                         hours: `${String(period.startHour).padStart(2, '0')}:00-${String(period.endHour).padStart(2, '0')}:00`,
                         cleanWindowCount: windowsInPeriod.length,
                         hasSufficientData,
                         medianDeviation,
-                        signal
+                        signal,
+                        candidateWindowCount,
+                        rejectedByGate,
+                        windowQuality,
                     };
                 });
                 
@@ -6804,6 +7860,13 @@
                             time: r.dateString,
                             localTime: r.dateString
                         }));
+
+                    // §5.3a: highProblems — sustained waking-hour high events (BG ≥ 180, ≥2
+                    // consecutive readings within a 20-min gap). Built here adjacent to
+                    // lowProblems; consumed by runHighCausalAttributionEngine once wired.
+                    const highProblems = PatternDetectors.buildHighProblems(
+                        nightscoutData.glucose, analysisStart
+                    );
                     
                     // Extract TDD from iAPS deviceStatus for signal analysis
                     // DQ-B FIX: use shared TDD extraction helper
@@ -7089,23 +8152,40 @@
                     
                     // Run all detectors to produce findings
                     const allFindings = [];
-                    
-                    // Detector 1b: Transient High with Subsequent Low (more specific pattern - runs first)
+
+                    // ENH-CAE-002 §5.12: Engine runs before siloed detectors so waking-hour events
+                    // are claimed before detectDirectMealLows / detectISFInducedLows see them.
+                    allFindings.push(...PatternDetectors.runCausalAttributionEngine(
+                        lowProblems, nightscoutData, activeSchedules.cr, activeSchedules.isf,
+                        claimedEvents, analysisWindow, signalAnalysis
+                    ));
+                    allFindings.push(...PatternDetectors.runHighCausalAttributionEngine(
+                        highProblems, nightscoutData, activeSchedules.cr, activeSchedules.isf,
+                        claimedEvents, analysisWindow, signalAnalysis
+                    ));
+
+                    // Detector 1b: Transient High with Subsequent Low (retained for all hours)
                     allFindings.push(...PatternDetectors.detectTransientHighWithLow(
                         lowProblems, nightscoutData, activeSchedules.cr, claimedEvents, analysisWindow
                     ));
-                    
-                    // Detector 1: Direct Meal-Induced Lows
+
+                    // ENH-CAE-002 §5.11: detectDirectMealLows retired for waking hours — pass only
+                    // overnight lows (midnight–6am). Engine handles 6am–midnight scope.
+                    const overnightLowProblems = lowProblems.filter(low =>
+                        new Date(low.time).getHours() < 6
+                    );
+
+                    // Detector 1: Direct Meal-Induced Lows (overnight only)
                     allFindings.push(...PatternDetectors.detectDirectMealLows(
-                        lowProblems, nightscoutData, activeSchedules.cr, claimedEvents, analysisWindow
+                        overnightLowProblems, nightscoutData, activeSchedules.cr, claimedEvents, analysisWindow
                     ));
                     
-                    // Detector 2: ISF-Induced Lows (Correction Overcorrection)
+                    // Detector 2: ISF-Induced Lows (overnight only — engine handles waking hours)
                     allFindings.push(...PatternDetectors.detectISFInducedLows(
-                        lowProblems, nightscoutData, activeSchedules.isf, claimedEvents, analysisWindow, activeSchedules.cr // DQ-D FIX: pass crSchedule
+                        overnightLowProblems, nightscoutData, activeSchedules.isf, claimedEvents, analysisWindow, activeSchedules.cr // DQ-D FIX: pass crSchedule
                     ));
                     
-                    // Detector 3: Post-Meal Highs
+                    // Detector 3: Post-Meal Highs (REBOUND_HIGH all hours; POST_MEAL_HIGH overnight only — see guard inside function)
                     allFindings.push(...PatternDetectors.detectPostMealHighs(
                         nightscoutData, activeSchedules.cr, claimedEvents, analysisWindow
                     ));
@@ -7123,6 +8203,11 @@
                     // Detector 6: Correction Ineffectiveness (overnight ISF strengthening)
                     allFindings.push(...PatternDetectors.detectCorrectionIneffectiveness(
                         nightscoutData, activeSchedules.isf, claimedEvents, analysisWindow, nightscoutData.profile
+                    ));
+
+                    // ENH-CAE-003: Waking-Hour Correction Ineffectiveness (daytime Cat3 SMBs)
+                    allFindings.push(...PatternDetectors.detectWakingCorrectionIneffectiveness(
+                        nightscoutData, activeSchedules.isf, targetBG, claimedEvents, analysisWindow
                     ));
                     
                     // BUG-003: Add basal ratio exceeded finding if applicable
@@ -7165,6 +8250,40 @@
                     
                     // Aggregate similar findings
                     const aggregatedFindings = aggregateFindings(allFindings);
+
+                    // ENH-CAE-002 §5.10 ISF contradiction resolution: when ISF_INDUCED_LOW and
+                    // ISF_SUPPRESSED_HIGH both appear in the same session, flag both with
+                    // conflictsWith and inject a MIXED_ATTRIBUTION finding for ISF.
+                    const isfLowFindings  = aggregatedFindings.filter(f => f.type === FindingType.ISF_INDUCED_LOW);
+                    const isfHighFindings = aggregatedFindings.filter(f => f.type === FindingType.ISF_SUPPRESSED_HIGH);
+                    if (isfLowFindings.length > 0 && isfHighFindings.length > 0) {
+                        isfLowFindings.forEach(f => {
+                            f.conflictsWith = [...(f.conflictsWith || []),
+                                ...isfHighFindings.map(h => h.id || h.type)];
+                        });
+                        isfHighFindings.forEach(f => {
+                            f.conflictsWith = [...(f.conflictsWith || []),
+                                ...isfLowFindings.map(l => l.id || l.type)];
+                        });
+                        aggregatedFindings.push({
+                            id: `finding_isf_conflict_${Date.now()}`,
+                            type: FindingType.MIXED_ATTRIBUTION,
+                            detectedAt: new Date().toISOString(),
+                            scheduleTime: null,
+                            period: 'All',
+                            severity: 0.5,
+                            similarEventsCount: 1,
+                            daysWithPattern: 1,
+                            primaryParameter: null,
+                            suggestedChangePercent: 0,
+                            contributingFactors: ['causal_engine', 'isf_bidirectional_conflict'],
+                            claimedEventIds: [],
+                            conflictsWith: [],
+                            recencyWeight: 1.0,
+                            details: 'ISF scoring in both directions — a correction overcorrected to a low and a separate correction failed to reach target. May reflect different ISF periods or activity effects.',
+                            turn1Question: 'ISF is scoring in both directions today — a correction overcorrected to a low and a separate correction failed to reach target. These may reflect different ISF periods or activity effects. Can you provide context on what was different between these two events?'
+                        });
+                    }
                     
                     // Calculate current basal percent for comparison
                     let currentBasalTotal = 0;
@@ -8907,6 +10026,11 @@
                                                     <div className="text-gray-500 text-xs">
                                                         {period.cleanWindowCount} windows
                                                     </div>
+                                                    {period.signal === 'INSUFFICIENT' && (
+                                                        <div className="text-gray-500 text-xs mt-1 italic">
+                                                            {getPeriodValidityMessage(period.name)}
+                                                        </div>
+                                                    )}
                                                 </div>
                                             ))}
                                         </div>
