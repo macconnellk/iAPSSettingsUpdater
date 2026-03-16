@@ -2751,7 +2751,33 @@
                     // For basal reduction due to lows, use NEGATIVE percentages (less insulin)
                     // Larger reduction for more severe lows
                     const adjustmentPercent = low.bg < 55 ? -10 : low.bg < 65 ? -7.5 : -5;
-                    
+
+                    // Pressure low detection heuristic
+                    const recoveryWindow = new Date(lowTime.getTime() + 30 * 60 * 1000);
+                    const recoveryReadings = nightscoutData.glucose.filter(r => {
+                        const rTime = new Date(r.dateString);
+                        return rTime > lowTime && rTime <= recoveryWindow && r.sgv > 80;
+                    });
+                    const rapidRecovery = recoveryReadings.length > 0 &&
+                        recoveryReadings.some(r => {
+                            const minsAfterLow = (new Date(r.dateString) - lowTime) / 60000;
+                            return minsAfterLow <= 20 && r.sgv > 90;
+                        });
+                    const surroundingLows = nightscoutData.glucose.filter(r => {
+                        const rTime = new Date(r.dateString);
+                        const minsFromLow = Math.abs(rTime - lowTime) / 60000;
+                        return minsFromLow > 5 && minsFromLow <= 45
+                            && r.sgv <= 70 && r.dateString !== low.time;
+                    });
+                    const isolated = surroundingLows.length === 0;
+                    const likelyPressureLow = rapidRecovery && isolated && low.bg < 55;
+
+                    const baseSeverity = low.bg < 55 ? 0.9 : low.bg < 65 ? 0.75 : 0.6;
+                    const pressureFactors = likelyPressureLow ? ['likely_pressure_artifact'] : [];
+                    const pressureDetails = likelyPressureLow
+                        ? ' Note: rapid recovery pattern suggests possible CGM pressure artifact — verify before acting.'
+                        : '';
+
                     findings.push({
                         id: `finding_unexplained_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.UNEXPLAINED_LOW,
@@ -2759,7 +2785,7 @@
                         eventTime: low.localTime || low.time, // BUG-022: Store original timestamp
                         scheduleTime: basalEntry.time,
                         period: period?.name || 'Unknown',
-                        severity: low.bg < 55 ? 0.9 : low.bg < 65 ? 0.75 : 0.6,
+                        severity: likelyPressureLow ? Math.min(baseSeverity, 0.4) : baseSeverity,
                         events: [{
                             time: formatTimeForDisplay(low.localTime || low.time),
                             lowBG: low.bg,
@@ -2769,11 +2795,11 @@
                         daysWithPattern: 1,
                         primaryParameter: 'basal',
                         suggestedChangePercent: adjustmentPercent,
-                        contributingFactors: ['excess_basal'],
+                        contributingFactors: ['excess_basal', ...pressureFactors],
                         claimedEventIds: [lowId],
                         conflictsWith: [],
                         recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
-                        details: `Unexplained low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}. No recent meals or corrections to attribute. Consider reducing basal at ${basalEntry.time}.`
+                        details: `Unexplained low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}. No recent meals or corrections to attribute. Consider reducing basal at ${basalEntry.time}.${pressureDetails}`
                     });
                     claimedEvents.lows.add(lowId);
                 });
@@ -5388,7 +5414,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '2.3.1',
+                            version: '3.5.13',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -5620,7 +5646,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '2.3.1',
+                        version: '3.5.13',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
