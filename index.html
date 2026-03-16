@@ -5048,6 +5048,19 @@
                         output += `| ${period.name} | ${dev} | ${signal} | ${agpCheck.icon} ${agpCheck.detail} | ${protection} |\n`;
                     });
                     output += `\n`;
+
+                    const insufficientWaking = analysisResults.signalAnalysis.periods
+                        .filter(p => p.signal === 'INSUFFICIENT' &&
+                            p.startHour >= 6 && p.startHour < 24);
+                    if (insufficientWaking.length > 0) {
+                        insufficientWaking.forEach(p => {
+                            output += `_${p.name}: No valid fasting windows — ` +
+                                `bolus coverage structural for this schedule. ` +
+                                `See Attribution Engine findings for CR/ISF ` +
+                                `analysis of events in this window._\n`;
+                        });
+                        output += `\n`;
+                    }
                     
                     // Show divergence warnings if any
                     if (divergences.length > 0) {
@@ -5272,7 +5285,12 @@
                     const recencyDot = finding.isStructural ? '◉' : '⚠️'; // BUG-C FIX: was a dead expression
                     output += `${idx + 1}. ${recencyDot} ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
                     output += `   - Severity: ${(finding.severity * 100).toFixed(0)}%\n`;
-                    output += `   - ${finding.details}\n\n`;
+                    output += `   - ${finding.details}\n`;
+                    if (finding.turn1Question) {
+                        output += `   - **Turn 1 Question:** ${finding.turn1Question}\n\n`;
+                    } else {
+                        output += `\n`;
+                    }
                 });
                 
                 output += `</details>\n`;
@@ -5506,10 +5524,26 @@
                         name: bundle.name,
                         detector: (() => {
                             const f = bundle.findings || [];
-                            if (f.some(x => x.type === FindingType.POST_MEAL_HIGH)) return FindingType.POST_MEAL_HIGH;
-                            if (f.some(x => x.type === FindingType.CORRECTION_INEFFECTIVE)) return FindingType.CORRECTION_INEFFECTIVE;
-                            if (f.some(x => x.type === FindingType.BASAL_SIGNAL_HIGH)) return FindingType.BASAL_SIGNAL_HIGH;
-                            if (f.some(x => x.type === FindingType.BASAL_SIGNAL_LOW)) return FindingType.BASAL_SIGNAL_LOW;
+                            if (f.some(x => x.type === FindingType.DIRECT_MEAL_HIGH))
+                                return FindingType.DIRECT_MEAL_HIGH;
+                            if (f.some(x => x.type === FindingType.ISF_SUPPRESSED_HIGH))
+                                return FindingType.ISF_SUPPRESSED_HIGH;
+                            if (f.some(x => x.type === FindingType.MIXED_ATTRIBUTION))
+                                return FindingType.MIXED_ATTRIBUTION;
+                            if (f.some(x => x.type === FindingType.RESISTANT_HIGH))
+                                return FindingType.RESISTANT_HIGH;
+                            if (f.some(x => x.type === FindingType.DIRECT_MEAL_LOW))
+                                return FindingType.DIRECT_MEAL_LOW;
+                            if (f.some(x => x.type === FindingType.ISF_INDUCED_LOW))
+                                return FindingType.ISF_INDUCED_LOW;
+                            if (f.some(x => x.type === FindingType.POST_MEAL_HIGH))
+                                return FindingType.POST_MEAL_HIGH;
+                            if (f.some(x => x.type === FindingType.CORRECTION_INEFFECTIVE))
+                                return FindingType.CORRECTION_INEFFECTIVE;
+                            if (f.some(x => x.type === FindingType.BASAL_SIGNAL_HIGH))
+                                return FindingType.BASAL_SIGNAL_HIGH;
+                            if (f.some(x => x.type === FindingType.BASAL_SIGNAL_LOW))
+                                return FindingType.BASAL_SIGNAL_LOW;
                             return f[0]?.type || 'unknown';
                         })(),
                         timeBlock: bundle.timeBlock || 'General',
