@@ -4047,9 +4047,9 @@
                         const entryBG = readings[0];
                         const nadir = Math.min(...readings);
 
-                        if (entryBG > 150 && nadir < 90) {
+                        if (entryBG > 150 && nadir < 70) {
                             cascadeCount++;
-                        } else if (entryBG <= 140 && nadir >= 90) {
+                        } else if (entryBG <= 140 && nadir >= 70) {
                             basalCount++;
                         }
                     });
