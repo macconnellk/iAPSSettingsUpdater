@@ -3999,6 +3999,86 @@
                 sessions.forEach(s => claimedEvents.corrections.add(getEventId(s.smb)));
 
                 return findings;
+            },
+
+            classifyOvernightCorrectionPattern(findings, nightscoutData, analysisWindow) {
+                const analysisStart = new Date(
+                    Date.now() - analysisWindow * 24 * 60 * 60 * 1000
+                );
+
+                const overnightFindings = findings.filter(f => {
+                    if (f.type !== FindingType.CORRECTION_INEFFECTIVE) return false;
+                    const hour = parseInt(f.scheduleTime?.split(':')[0]);
+                    return !isNaN(hour) && (hour >= 22 || hour < 6);
+                });
+
+                overnightFindings.forEach(finding => {
+                    const scheduleHour = parseInt(finding.scheduleTime?.split(':')[0]);
+
+                    const startHour = scheduleHour >= 22 ? 22 : scheduleHour;
+                    const endHour = startHour >= 22 ? 24 : startHour + 2;
+
+                    const segmentReadingsByNight = {};
+
+                    nightscoutData.glucose.forEach(r => {
+                        const rTime = new Date(r.dateString);
+                        if (rTime < analysisStart) return;
+                        const hour = rTime.getHours();
+                        if (hour < startHour || hour >= endHour) return;
+
+                        const nightDate = new Date(rTime);
+                        if (hour < 12) nightDate.setDate(nightDate.getDate() - 1);
+                        const nightKey = nightDate.toISOString().split('T')[0];
+
+                        if (!segmentReadingsByNight[nightKey]) {
+                            segmentReadingsByNight[nightKey] = [];
+                        }
+                        segmentReadingsByNight[nightKey].push(r.sgv);
+                    });
+
+                    const nights = Object.values(segmentReadingsByNight);
+                    if (nights.length === 0) return;
+
+                    let cascadeCount = 0;
+                    let basalCount = 0;
+
+                    nights.forEach(readings => {
+                        if (readings.length < 4) return;
+                        const entryBG = readings[0];
+                        const nadir = Math.min(...readings);
+
+                        if (entryBG > 150 && nadir < 90) {
+                            cascadeCount++;
+                        } else if (entryBG <= 140 && nadir >= 90) {
+                            basalCount++;
+                        }
+                    });
+
+                    const totalClassified = cascadeCount + basalCount;
+                    if (totalClassified === 0) return;
+
+                    const cascadePct = cascadeCount / totalClassified;
+
+                    let patternType;
+                    if (cascadePct >= 0.65) {
+                        patternType = 'carryover_cascade';
+                    } else if (cascadePct <= 0.35) {
+                        patternType = 'basal_insufficiency';
+                    } else {
+                        patternType = 'mixed_pattern';
+                    }
+
+                    if (!finding.contributingFactors) {
+                        finding.contributingFactors = [];
+                    }
+                    finding.contributingFactors.push(`overnight_pattern:${patternType}`);
+                    finding.diagnosticContext = {
+                        patternType,
+                        cascadeNights: cascadeCount,
+                        basalInsufficiencyNights: basalCount,
+                        totalNightsAnalyzed: nights.length
+                    };
+                });
             }
         };
 
@@ -5362,6 +5442,19 @@
                     output += `${idx + 1}. ${recencyDot} ${recencyIcon} **${finding.type}** @ ${finding.scheduleTime || finding.period}\n`;
                     output += `   - Severity: ${(finding.severity * 100).toFixed(0)}%\n`;
                     output += `   - ${finding.details}\n`;
+                    if (finding.diagnosticContext) {
+                        const dc = finding.diagnosticContext;
+                        const label =
+                            dc.patternType === 'carryover_cascade'
+                                ? 'Carryover cascade (upstream meal problem)' :
+                            dc.patternType === 'basal_insufficiency'
+                                ? 'Basal insufficiency (fasting drift)'
+                                : 'Mixed pattern (both carryover and drift observed)';
+                        output += `   - **Overnight Pattern:** ${label} — ` +
+                            `${dc.cascadeNights} cascade / ` +
+                            `${dc.basalInsufficiencyNights} basal / ` +
+                            `${dc.totalNightsAnalyzed} nights analyzed\n\n`;
+                    }
                     if (finding.turn1Question) {
                         output += `   - **Turn 1 Question:** ${finding.turn1Question}\n\n`;
                     } else {
@@ -8314,6 +8407,9 @@
                     allFindings.push(...PatternDetectors.detectCorrectionIneffectiveness(
                         nightscoutData, activeSchedules.isf, claimedEvents, analysisWindow, nightscoutData.profile
                     ));
+                    PatternDetectors.classifyOvernightCorrectionPattern(
+                        allFindings, nightscoutData, analysisWindow
+                    );
 
                     // ENH-CAE-003: Waking-Hour Correction Ineffectiveness (daytime Cat3 SMBs)
                     allFindings.push(...PatternDetectors.detectWakingCorrectionIneffectiveness(
