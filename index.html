@@ -6183,11 +6183,18 @@
                     }
                 }
                 
-                // Safety fast-track: only recurring severe lows
-                const recurringSevereLows = findings.filter(f => 
-                    f.type === 'unexplained_low' && 
-                    f.severity >= 0.9 && 
-                    f.eventsLast3Days >= 2
+                // Safety fast-track: only recurring severe lows that belong to PRIMARY bundles
+                const primaryFindingIds = new Set();
+                bundles.filter(b => b.priority === 'PRIMARY').forEach(b => {
+                    (b.findings || []).forEach(f => {
+                        primaryFindingIds.add(f.id);
+                    });
+                });
+                const recurringSevereLows = findings.filter(f =>
+                    f.type === 'unexplained_low' &&
+                    f.severity >= 0.9 &&
+                    f.eventsLast3Days >= 2 &&
+                    primaryFindingIds.has(f.id)
                 );
                 
                 if (recurringSevereLows.length > 0) {
