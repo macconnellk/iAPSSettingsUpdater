@@ -5224,6 +5224,13 @@
                     
                     output += `**Summary:** ${dist.currentTotal.toFixed(2)} U/day → ${dist.proposedTotal.toFixed(2)} U/day (${change >= 0 ? '+' : ''}${change.toFixed(2)} U, ${dist.incrementsNeeded} increments)\n\n`;
 
+                    const effectiveChanges = analysisResults.basalOptimization
+                        .hourlyChanges.filter(h => h.hasChange).length;
+
+                    if (effectiveChanges === 0 && dist.incrementsNeeded !== 0) {
+                        output += `_Note: ${Math.abs(dist.incrementsNeeded)} increment(s) indicated but absorbed by pump rounding — no rate changes required._\n\n`;
+                    }
+
                     if (dist.method === 'proportional-no-signal') {
                         output += `_Proposed adjustment: uniform ${
                             ((dist.scaleFactor - 1) * 100).toFixed(1)
