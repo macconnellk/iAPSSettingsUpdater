@@ -4370,6 +4370,43 @@
              * Includes ratio protection to avoid making basal ratio worse.
              */
             distributeIncrements(currentHourly, periodSignals, incrementsNeeded, ratioProtection = null) {
+                const allInsufficient = !periodSignals ||
+                    periodSignals.every(p =>
+                        !p.hasSufficientData || p.medianDeviation === null
+                    );
+
+                const currentTotal = currentHourly.reduce((s, r) => s + r, 0);
+
+                if (allInsufficient && currentTotal > 0) {
+                    const targetTotal = currentTotal + incrementsNeeded * this.PUMP_INCREMENT;
+                    const scaleFactor = targetTotal / currentTotal;
+                    const proposedHourly = currentHourly.map(r =>
+                        this.roundToIncrement(r * scaleFactor)
+                    );
+                    const proposedTotal = proposedHourly.reduce((s, r) => s + r, 0);
+                    const appliedHours = proposedHourly
+                        .map((rate, hour) => ({
+                            hour: `${String(hour).padStart(2, '0')}:00`,
+                            period: this.getPeriodForHour(hour)?.name,
+                            delta: rate - currentHourly[hour],
+                            newRate: rate
+                        }))
+                        .filter(h => Math.abs(h.delta) >= 0.001);
+
+                    return {
+                        schedule: proposedHourly,
+                        distribution: {
+                            incrementsNeeded,
+                            direction: incrementsNeeded < 0 ? 'decrease' : 'increase',
+                            method: 'proportional-no-signal',
+                            scaleFactor: parseFloat(scaleFactor.toFixed(4)),
+                            appliedHours,
+                            currentTotal,
+                            proposedTotal
+                        }
+                    };
+                }
+
                 const schedule = [...currentHourly];
                 const isDecrease = incrementsNeeded < 0;
                 const isIncrease = !isDecrease;
@@ -5186,7 +5223,13 @@
                     }
                     
                     output += `**Summary:** ${dist.currentTotal.toFixed(2)} U/day → ${dist.proposedTotal.toFixed(2)} U/day (${change >= 0 ? '+' : ''}${change.toFixed(2)} U, ${dist.incrementsNeeded} increments)\n\n`;
-                    
+
+                    if (dist.method === 'proportional-no-signal') {
+                        output += `_Proposed adjustment: uniform ${
+                            ((dist.scaleFactor - 1) * 100).toFixed(1)
+                        }% proportional scaling — no period signal available, schedule shape preserved._\n\n`;
+                    }
+
                     output += `| Hour | Current | Proposed | Change |\n`;
                     output += `|------|---------|----------|--------|\n`;
                     
