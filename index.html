@@ -8466,35 +8466,27 @@
 
                     // ENH-CAE-002 §5.10 ISF contradiction resolution: when ISF_INDUCED_LOW and
                     // ISF_SUPPRESSED_HIGH both appear in the same session, flag both with
-                    // conflictsWith and inject a MIXED_ATTRIBUTION finding for ISF.
+                    // conflictsWith and isf_contradiction tag. Form 2 MIXED_ATTRIBUTION
+                    // finding (synthetic "All" timeblock) is suppressed — not clinically
+                    // actionable. Underlying findings carry the contradiction signal.
                     const isfLowFindings  = aggregatedFindings.filter(f => f.type === FindingType.ISF_INDUCED_LOW);
                     const isfHighFindings = aggregatedFindings.filter(f => f.type === FindingType.ISF_SUPPRESSED_HIGH);
                     if (isfLowFindings.length > 0 && isfHighFindings.length > 0) {
                         isfLowFindings.forEach(f => {
                             f.conflictsWith = [...(f.conflictsWith || []),
                                 ...isfHighFindings.map(h => h.id || h.type)];
+                            if (!f.contributingFactors) f.contributingFactors = [];
+                            if (!f.contributingFactors.includes('isf_contradiction')) {
+                                f.contributingFactors.push('isf_contradiction');
+                            }
                         });
                         isfHighFindings.forEach(f => {
                             f.conflictsWith = [...(f.conflictsWith || []),
                                 ...isfLowFindings.map(l => l.id || l.type)];
-                        });
-                        aggregatedFindings.push({
-                            id: `finding_isf_conflict_${Date.now()}`,
-                            type: FindingType.MIXED_ATTRIBUTION,
-                            detectedAt: new Date().toISOString(),
-                            scheduleTime: null,
-                            period: 'All',
-                            severity: 0.5,
-                            similarEventsCount: 1,
-                            daysWithPattern: 1,
-                            primaryParameter: null,
-                            suggestedChangePercent: 0,
-                            contributingFactors: ['causal_engine', 'isf_bidirectional_conflict'],
-                            claimedEventIds: [],
-                            conflictsWith: [],
-                            recencyWeight: 1.0,
-                            details: 'ISF scoring in both directions — a correction overcorrected to a low and a separate correction failed to reach target. May reflect different ISF periods or activity effects.',
-                            turn1Question: 'ISF is scoring in both directions today — a correction overcorrected to a low and a separate correction failed to reach target. These may reflect different ISF periods or activity effects. Can you provide context on what was different between these two events?'
+                            if (!f.contributingFactors) f.contributingFactors = [];
+                            if (!f.contributingFactors.includes('isf_contradiction')) {
+                                f.contributingFactors.push('isf_contradiction');
+                            }
                         });
                     }
                     
