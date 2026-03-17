@@ -166,7 +166,8 @@
             minConfidenceRecoveryState: 0.9,
             
             // Protection
-            changeLockoutDays: 3,
+            changeLockoutDays: 3,     // basal — unchanged
+            bolusLockoutDays: 2,      // cr and isf
             resistantLowLookbackDays: 7,
             oscillationLookbackDays: 14,
 
@@ -284,6 +285,34 @@
                 this.saveHistory(history);
                 return newChange;
             },
+
+            // Register a change detected by schedule comparison (not manually queued).
+            // Uses outcome EFFECTIVE since the pump already has the new value.
+            // Deduplicates: skips if an auto_detected entry for this slot already
+            // exists with today's date.
+            registerAutoDetected(change) {
+                const today = getLocalDateString();
+                const existing = this.getChangesForSlot(change.param, change.scheduleTime);
+                const alreadyToday = existing.some(
+                    e => e.source === 'auto_detected' && e.date === today
+                );
+                if (alreadyToday) return null;
+
+                const history = this.getHistory();
+                const newChange = {
+                    id: `change_auto_${Date.now()}`,
+                    date: today,
+                    timestamp: new Date().toISOString(),
+                    source: 'auto_detected',
+                    outcome: OutcomeType.EFFECTIVE,
+                    outcomeDate: null,
+                    outcomeNotes: null,
+                    ...change
+                };
+                history.changes.push(newChange);
+                this.saveHistory(history);
+                return newChange;
+            },
             
             logOverride(override) {
                 const history = this.getHistory();
@@ -346,9 +375,13 @@
                 if (changes.length === 0) return null;
                 
                 const lastChange = changes[changes.length - 1];
-                const lastDate = new Date(lastChange.date);
-                const today = new Date();
-                const diffTime = today - lastDate;
+                // Compare local calendar dates to avoid UTC-midnight off-by-one.
+                // lastChange.date is YYYY-MM-DD local; getLocalDateString() returns same format.
+                const todayStr = getLocalDateString();
+                const lastStr  = lastChange.date;
+                const today = new Date(todayStr + 'T00:00:00');
+                const last  = new Date(lastStr  + 'T00:00:00');
+                const diffTime = today - last;
                 return Math.floor(diffTime / (1000 * 60 * 60 * 24));
             },
             
@@ -655,10 +688,13 @@
             assignProtection(scheduleTime, param, period, findings, signalAnalysis) {
                 // Recent change lock
                 const daysSince = ChangeTracker.daysSinceChange(param, scheduleTime);
-                if (daysSince !== null && daysSince < CONFIG.changeLockoutDays) {
+                const lockoutDays = (param === 'cr' || param === 'isf')
+                    ? CONFIG.bolusLockoutDays
+                    : CONFIG.changeLockoutDays;
+                if (daysSince !== null && daysSince < lockoutDays) {
                     return {
                         level: ProtectionLevel.LOCKED,
-                        reason: `Changed ${daysSince} day(s) ago (${CONFIG.changeLockoutDays}-day lockout)`
+                        reason: `Changed ${daysSince} day(s) ago (${lockoutDays}-day lockout)`
                     };
                 }
                 
@@ -2503,6 +2539,7 @@
                             findings.push({
                                 id: `finding_rebound_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.REBOUND_HIGH,
+                                eventTime: peakReading.dateString,
                                 detectedAt: new Date().toISOString(),
                                 scheduleTime: crEntry?.time || '00:00',
                                 period: CIRCADIAN_PERIODS.find(p => {
@@ -2540,6 +2577,7 @@
                         findings.push({
                             id: `finding_rebound_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                             type: FindingType.REBOUND_HIGH,
+                            eventTime: peakReading.dateString,
                             detectedAt: new Date().toISOString(),
                             scheduleTime: crEntry?.time || '00:00',
                             period: CIRCADIAN_PERIODS.find(p => {
@@ -3353,6 +3391,7 @@
                         finding = {
                             id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                             type: FindingType.RESISTANT_LOW,
+                            eventTime: low.time,
                             scheduleTime: null,
                             period: periodName,
                             severity: 0.4,
@@ -3378,6 +3417,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.MIXED_ATTRIBUTION,
+                                eventTime: low.time,
                                 scheduleTime: crEntry ? crEntry.time : null,
                                 period: periodName,
                                 severity: 0.5,
@@ -3392,6 +3432,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.RESISTANT_LOW,
+                                eventTime: low.time,
                                 scheduleTime: null,
                                 period: periodName,
                                 severity: 0.4,
@@ -3404,6 +3445,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.UNEXPLAINED_LOW,
+                                eventTime: low.time,
                                 scheduleTime: null,
                                 period: periodName,
                                 severity: low.bg < 55 ? 0.9 : low.bg < 65 ? 0.75 : 0.6,
@@ -3419,6 +3461,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.ISF_INDUCED_LOW,
+                                eventTime: low.time,
                                 scheduleTime: isfEntry ? isfEntry.time : '00:00',
                                 period: periodName,
                                 severity: low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.7,
@@ -3435,6 +3478,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.DIRECT_MEAL_LOW,
+                                eventTime: low.time,
                                 scheduleTime: crEntry ? crEntry.time : '00:00',
                                 period: periodName,
                                 severity: sev,
@@ -3795,6 +3839,7 @@
                         finding = {
                             id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                             type: FindingType.RESISTANT_HIGH,
+                            eventTime: high.time,
                             scheduleTime: null,
                             period: periodName,
                             severity: 0.3,
@@ -3819,6 +3864,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.MIXED_ATTRIBUTION,
+                                eventTime: high.time,
                                 scheduleTime: crEntry ? crEntry.time : null,
                                 period: periodName,
                                 severity: 0.5,
@@ -3832,6 +3878,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.RESISTANT_HIGH,
+                                eventTime: high.time,
                                 scheduleTime: null,
                                 period: periodName,
                                 severity: 0.3,
@@ -3844,6 +3891,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.BASAL_SIGNAL_HIGH,
+                                eventTime: high.time,
                                 scheduleTime: `${String(highTime.getHours()).padStart(2, '0')}:00`,
                                 period: periodName,
                                 severity: 0.5,
@@ -3860,6 +3908,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.ISF_SUPPRESSED_HIGH,
+                                eventTime: high.time,
                                 scheduleTime: isfEntry ? isfEntry.time : '00:00',
                                 period: periodName,
                                 severity: sev,
@@ -3878,6 +3927,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.DIRECT_MEAL_HIGH,
+                                eventTime: high.time,
                                 scheduleTime: crEntry ? crEntry.time : '00:00',
                                 period: periodName,
                                 severity: sev,
@@ -4957,9 +5007,9 @@
                 const recentChanges = ChangeTracker.getRecentChanges(7);
                 
                 if (recentChanges.length > 0) {
-                    output += `### Manually Logged\n\n`;
-                    output += `| Date | Change | Outcome |\n`;
-                    output += `|------|--------|--------|\n`;
+                    output += `### Recent Changes\n\n`;
+                    output += `| Date | Source | Change | Outcome |\n`;
+                    output += `|------|--------|--------|--------|\n`;
                     
                     recentChanges.forEach(change => {
                         const outcomeEmoji = {
@@ -4970,7 +5020,8 @@
                             [OutcomeType.PENDING]: '⏳',
                             [OutcomeType.INDETERMINATE]: '?'
                         };
-                        output += `| ${change.date} | ${change.scheduleTime} ${change.param}: ${change.oldValue}→${change.newValue} | ${outcomeEmoji[change.outcome] || '?'} |\n`;
+                        const source = change.source === 'auto_detected' ? 'Auto' : 'Manual';
+                        output += `| ${change.date} | ${source} | ${change.scheduleTime} ${change.param}: ${change.oldValue}→${change.newValue} | ${outcomeEmoji[change.outcome] || '?'} |\n`;
                     });
                     output += `\n`;
                 }
@@ -6224,6 +6275,23 @@
                         );
                     }
                 }
+
+                // Auto-detected applied changes — show as "confirm effect" follow-ups
+                const cutoff3d = new Date();
+                cutoff3d.setDate(cutoff3d.getDate() - 3);
+                const autoApplied = history.changes.filter(c =>
+                    c.source === 'auto_detected' &&
+                    c.outcome === OutcomeType.EFFECTIVE &&
+                    new Date(c.date) >= cutoff3d
+                );
+                for (const change of autoApplied.slice(0, 3)) {
+                    const daysAgo = Math.floor((new Date() - new Date(change.date)) / (24 * 60 * 60 * 1000));
+                    if (daysAgo >= 1) {
+                        prompts.sessionContinuity.manualLogged.push(
+                            `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} detected ${change.date}: Confirm effect visible in today's data.`
+                        );
+                    }
+                }
                 
                 // Period TIR trends
                 if (historyEntries.length >= 3) {
@@ -6356,7 +6424,7 @@
                     }
                     output += `\n`;
                 } else {
-                    output += `_No pending changes to follow up on._\n\n`;
+                    output += `_No queued or recently auto-detected changes to follow up on._\n\n`;
                 }
                 
                 if (prompts.sessionContinuity.periodTrends.length > 0) {
@@ -8048,6 +8116,15 @@
                         const changes = detectScheduleChanges(todaySchedules, yesterdayScheduleResult.schedules);
                         if (changes.length > 0) {
                             console.log('Detected schedule changes:', changes);
+                            changes.forEach(c => {
+                                ChangeTracker.registerAutoDetected({
+                                    param: c.type,
+                                    scheduleTime: c.time,
+                                    oldValue: c.from,
+                                    newValue: c.to,
+                                    changePercent: c.changePercent
+                                });
+                            });
                             setDetectedChanges(changes);
                         } else {
                             console.log('No schedule changes detected');
@@ -8648,8 +8725,22 @@
             // Aggregate similar findings with recency tracking
             const aggregateFindings = (findings) => {
                 const grouped = {};
+                const directOutput = [];
                 const now = new Date();
-                
+
+                const engineTypes = new Set([
+                    FindingType.DIRECT_MEAL_HIGH,
+                    FindingType.ISF_SUPPRESSED_HIGH,
+                    FindingType.DIRECT_MEAL_LOW,
+                    FindingType.ISF_INDUCED_LOW,
+                    FindingType.MIXED_ATTRIBUTION,
+                    FindingType.RESISTANT_HIGH,
+                    FindingType.RESISTANT_LOW,
+                    FindingType.REBOUND_HIGH,
+                    FindingType.POST_MEAL_HIGH,
+                    FindingType.TRANSIENT_HIGH_LOW,
+                ]);
+
                 // Finding types that are always "current" (structural or from current analysis)
                 const alwaysCurrentTypes = [
                     'basal_ratio_exceeded',
@@ -8660,6 +8751,27 @@
                 ];
                 
                 findings.forEach(finding => {
+                    // Engine findings bypass aggregation — each is a distinct attributed event
+                    if (engineTypes.has(finding.type)) {
+                        const eventTime = finding.eventTime ? new Date(finding.eventTime) : null;
+                        const hoursAgo = eventTime ? (now - eventTime) / (1000 * 60 * 60) : null;
+                        const result = {
+                            ...finding,
+                            similarEventsCount: 1,
+                            eventsLast24h: hoursAgo !== null && hoursAgo <= 24 ? 1 : 0,
+                            eventsLast3Days: hoursAgo !== null && hoursAgo <= 72 ? 1 : 0,
+                            mostRecentTime: eventTime,
+                            hoursSinceMostRecent: hoursAgo,
+                            isStructural: false,
+                            recencyTier: hoursAgo === null ? 'UNKNOWN'
+                                : hoursAgo <= 24 ? 'CURRENT'
+                                : hoursAgo <= 72 ? 'RECENT'
+                                : hoursAgo <= 168 ? 'STALE' : 'EXPIRED'
+                        };
+                        directOutput.push(result);
+                        return;
+                    }
+
                     const key = `${finding.type}_${finding.scheduleTime}_${finding.primaryParameter}`;
                     
                     // Check if this is a structural finding that's always current
@@ -8752,7 +8864,7 @@
                     console.log(`Finding ${finding.type} @ ${finding.scheduleTime}: ${finding.eventsLast24h} last 24h, ${finding.eventsLast3Days} last 3d, hours=${hours?.toFixed(1)}, tier=${finding.recencyTier}`);
                 });
                 
-                return Object.values(grouped);
+                return [...Object.values(grouped), ...directOutput];
             };
             
             // Copy for Claude review
