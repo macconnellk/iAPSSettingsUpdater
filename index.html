@@ -3293,10 +3293,14 @@
              * Returns budget, ratio, categorised SMB arrays, and correction list.
              */
             _decomposeSMBs(treatments, glucose, mealTime, mealCarbs, crSchedule) {
-                // Upfront bolus: insulin on the treatment that carries the carbs (±2 min)
+                // Upfront bolus: iAPS posts the meal bolus and carb entry as separate records.
+                // Capture any non-SMB bolus within ±5 minutes of meal time.
                 const upfrontBolus = treatments
-                    .filter(t => t.carbs > 0 &&
-                        Math.abs(new Date(t.created_at) - mealTime) < 2 * 60 * 1000)
+                    .filter(t => {
+                        if (!t.insulin || t.insulin <= 0 || !t.created_at) return false;
+                        if (t.eventType && t.eventType.includes('SMB')) return false;
+                        return Math.abs(new Date(t.created_at) - mealTime) < 5 * 60 * 1000;
+                    })
                     .reduce((sum, t) => sum + (t.insulin || 0), 0);
 
                 const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
@@ -3328,8 +3332,20 @@
                     const smbTime = new Date(smb.created_at);
                     const minsSinceMeal = (smbTime - mealTime) / 60000;
 
-                    // Cat3: fired >3hr after ANY meal (no meal in 3hr window before SMB)
+                    // Cat3: fasting correction — fired outside the meal's 0–180min window with no
+                    // meal in the 3hr lookback at the time it fired.
+                    //
+                    // Pre-meal SMBs (minsSinceMeal < 0) are only Cat3-eligible when the governing
+                    // meal's upfront bolus is absent or negligible. If a full meal bolus was
+                    // delivered after the pre-meal correction, the correction's IOB is no longer
+                    // causally dominant — exclude it from Cat3 to prevent false ISF attribution.
                     if (minsSinceMeal < 0 || minsSinceMeal > 180) {
+                        // Pre-meal SMBs: exclude if governing meal had substantive upfront delivery.
+                        if (minsSinceMeal < 0 && upfrontBolus > 0) {
+                            // Pre-meal correction with a subsequent full meal delivery.
+                            // Causal continuity is broken — do not classify as Cat3.
+                            continue;
+                        }
                         const windowStart = new Date(smbTime.getTime() - 3 * 60 * 60 * 1000);
                         const nearMeals = treatments.filter(t => {
                             if (!t.carbs || t.carbs <= 0 || !t.created_at) return false;
@@ -3423,7 +3439,10 @@
                     }
                 }
 
-                if (decomp.cat3SMBs.length > 0) score += 0.7;   // pure fasting correction
+                // Cat3 score: only award when no upfront meal bolus was delivered in this window.
+                // If upfrontBolus > 0, a full meal delivery followed the correction; the low is
+                // more likely driven by meal insulin than the fasting correction.
+                if (decomp.cat3SMBs.length > 0 && decomp.upfrontBolus === 0) score += 0.7;
                 if (decomp.cat2SMBs.length > 0) score += 0.25;  // post-meal, budget exhausted
 
                 // IOB at low > 0.4U, no Cat1 SMBs still active (all Cat1s already categorised)
