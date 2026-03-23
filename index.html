@@ -2059,10 +2059,6 @@
                         const highDurationMinutes = (lastHighTime - firstHighTime) / (1000 * 60);
                         const peakBG = Math.max(...highReadings.map(r => r.sgv));
                         
-                        // Check if high was TRANSIENT (<60 minutes)
-                        const HIGH_DURATION_THRESHOLD = 60;
-                        if (highDurationMinutes >= HIGH_DURATION_THRESHOLD) continue; // Sustained high - not transient
-                        
                         // Check if low occurred within 3 hours of high ending
                         const timeFromHighToLowHours = (lowTime - lastHighTime) / (1000 * 60 * 60);
                         const TIME_TO_LOW_THRESHOLD = 3;
@@ -2081,7 +2077,80 @@
                             return tTime >= firstHighTime && tTime <= lowTime;
                         });
                         
-                        if (correctionsDuringPeriod.length > 0) continue; // Corrections given - not pure meal effect
+                        if (correctionsDuringPeriod.length > 0) {
+                            // Corrections were given during the high — only proceed if high was transient.
+                            // Sustained high + corrections routes to Detector 2 (ISF overcorrection pattern).
+
+                            // --- BIMODAL DETECTION ---
+                            const BIMODAL_GAP_THRESHOLD = 15; // minutes
+
+                            const sortedHighs = [...highReadings].sort(
+                                (a, b) => new Date(a.dateString) - new Date(b.dateString)
+                            );
+
+                            let bimodalGapIndex = -1;
+                            for (let i = 0; i < sortedHighs.length - 1; i++) {
+                                const gap = (new Date(sortedHighs[i + 1].dateString) -
+                                             new Date(sortedHighs[i].dateString)) / (1000 * 60);
+                                if (gap > BIMODAL_GAP_THRESHOLD) {
+                                    bimodalGapIndex = i;
+                                    break;
+                                }
+                            }
+
+                            if (bimodalGapIndex >= 0) {
+                                const firstCluster = sortedHighs.slice(0, bimodalGapIndex + 1);
+                                const firstPeak = Math.max(...firstCluster.map(r => r.sgv));
+                                const firstPeakTime = firstCluster.reduce((max, r) =>
+                                    r.sgv > max.sgv ? r : max
+                                );
+
+                                console.log(`  Bimodal high detected. First peak: ${firstPeak} mg/dL at ${formatTimeForDisplay(firstPeakTime.dateString)}. Emitting secondary CR finding.`);
+
+                                const crEntry = getCRForTime(meal.created_at, crSchedule);
+                                const mealPeriod = CIRCADIAN_PERIODS.find(p => {
+                                    const hour = new Date(meal.created_at).getHours();
+                                    return hour >= p.startHour && hour < p.endHour;
+                                });
+
+                                const baseAdjustPercent = low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5;
+                                const adjustmentPercent = baseAdjustPercent / 2;
+
+                                findings.push({
+                                    id: `finding_bimodal_cr_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                    type: FindingType.TRANSIENT_HIGH_LOW,
+                                    detectedAt: new Date().toISOString(),
+                                    eventTime: low.localTime || low.time,
+                                    scheduleTime: crEntry.time,
+                                    period: mealPeriod?.name || 'Unknown',
+                                    severity: 0.5,
+                                    events: [{
+                                        mealTime: formatTimeForDisplay(meal.created_at),
+                                        mealCarbs: meal.carbs,
+                                        peakBG: firstPeak,
+                                        highDuration: null,
+                                        lowBG: low.bg,
+                                        lowTime: formatTimeForDisplay(low.localTime || low.time),
+                                        timeToLow: timeFromHighToLowHours,
+                                        bimodal: true
+                                    }],
+                                    similarEventsCount: 1,
+                                    daysWithPattern: 1,
+                                    primaryParameter: 'cr',
+                                    suggestedChangePercent: adjustmentPercent,
+                                    contributingFactors: ['strong_cr', 'bimodal_rebound', 'secondary_signal'],
+                                    claimedEventIds: [mealId],
+                                    conflictsWith: [],
+                                    recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
+                                    details: `Bimodal BG: meal at ${formatTimeForDisplay(meal.created_at)} (${meal.carbs}g) → initial spike to ${firstPeak} mg/dL → partial recovery → rebound with corrections → low ${low.bg} mg/dL. Initial spike indicates CR absorption gap. Reduced-confidence secondary signal; Detector 2 handles ISF attribution for the correction phase.`
+                                });
+                            }
+
+                            const HIGH_DURATION_THRESHOLD = 60;
+                            if (highDurationMinutes >= HIGH_DURATION_THRESHOLD) continue;
+                        }
+                        // No corrections → fire regardless of high duration.
+                        // Budget-completing SMBs are excluded by isTrueCorrection and do not count as corrections.
                         
                         // This meal has the transient high pattern!
                         // Score based on peak BG and timing
@@ -2356,35 +2425,132 @@
                         if (dropRate > 2) return; // Already dropping fast - not correction's fault
                     }
                     
+                    // --- GATE 3: Rescue Bolus Exclusion ---
+                    // Compute glucose nadir between lastHighReading and the low
+                    const nadirWindow = nightscoutData.glucose.filter(reading => {
+                        const rTime = new Date(reading.dateString);
+                        return rTime >= new Date(lastHighReading.dateString) && rTime <= lowTime;
+                    });
+                    const nadirReading = nadirWindow.length > 0
+                        ? nadirWindow.reduce((min, r) => r.sgv < min.sgv ? r : min)
+                        : { dateString: low.localTime || low.time, sgv: low.bg };
+                    const nadirTime = new Date(nadirReading.dateString);
+                    const rescueCutoff = new Date(nadirTime.getTime() - 15 * 60 * 1000);
+
+                    // Exclude boluses fired within 15 minutes of or after the nadir —
+                    // these are rescue responses to the low, not its cause.
+                    const genuineCorrections = recentCorrections.filter(c =>
+                        new Date(c.created_at) < rescueCutoff
+                    );
+
+                    if (genuineCorrections.length < recentCorrections.length) {
+                        console.log(`  Gate 3: excluded ${recentCorrections.length - genuineCorrections.length} rescue bolus(es) near nadir at ${formatTimeForDisplay(nadirReading.dateString)}`);
+                    }
+
+                    if (genuineCorrections.length === 0) {
+                        console.log(`  ⊘ Gate 3: no genuine corrections remain after rescue exclusion. Checking Gate 2.`);
+                    }
+
+                    // --- GATE 2: Absorption Window + Descent SMB Check ---
+                    // Only runs when Gate 3 removed all corrections (genuineCorrections.length === 0)
+                    if (genuineCorrections.length === 0) {
+                        const twoHoursBeforeNadir = new Date(nadirTime.getTime() - 120 * 60 * 1000);
+                        const peakTime = new Date(lastHighReading.dateString);
+
+                        // Find a meal within 120 minutes of the nadir
+                        const absorbingMeal = nightscoutData.treatments.find(t => {
+                            if (!t.carbs || t.carbs <= 0 || !t.created_at) return false;
+                            const tTime = new Date(t.created_at);
+                            return tTime >= twoHoursBeforeNadir && tTime <= nadirTime;
+                        });
+
+                        if (absorbingMeal) {
+                            // Check for SMBs during the descent (peak BG → nadir), raw — not isTrueCorrection-filtered.
+                            const smbsDuringDescent = nightscoutData.treatments.filter(t => {
+                                if (!t.eventType || !t.eventType.includes('SMB')) return false;
+                                if (!t.created_at) return false;
+                                const tTime = new Date(t.created_at);
+                                return tTime > peakTime && tTime < nadirTime;
+                            });
+
+                            if (smbsDuringDescent.length === 0) {
+                                console.log(`  ✓ Gate 2: meal at ${formatTimeForDisplay(absorbingMeal.created_at)}, 0 SMBs during descent. Reclassifying as DIRECT_MEAL_LOW.`);
+
+                                if (crSchedule) {
+                                    const crEntry = getCRForTime(absorbingMeal.created_at, crSchedule);
+                                    const mealTime = new Date(absorbingMeal.created_at);
+                                    const period = CIRCADIAN_PERIODS.find(p => {
+                                        const hour = mealTime.getHours();
+                                        return hour >= p.startHour && hour < p.endHour;
+                                    });
+                                    const lowSeverity = low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.75;
+                                    const adjustmentPercent = low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5;
+
+                                    findings.push({
+                                        id: `finding_dml_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                        type: FindingType.DIRECT_MEAL_LOW,
+                                        detectedAt: new Date().toISOString(),
+                                        eventTime: low.localTime || low.time,
+                                        scheduleTime: crEntry.time,
+                                        period: period?.name || 'Unknown',
+                                        severity: lowSeverity,
+                                        events: [{
+                                            time: formatTimeForDisplay(absorbingMeal.created_at),
+                                            mealCarbs: absorbingMeal.carbs,
+                                            lowBG: low.bg,
+                                            lowTime: formatTimeForDisplay(low.localTime || low.time)
+                                        }],
+                                        similarEventsCount: 1,
+                                        daysWithPattern: 1,
+                                        primaryParameter: 'cr',
+                                        suggestedChangePercent: adjustmentPercent,
+                                        contributingFactors: ['strong_cr', 'rescue_bolus_excluded'],
+                                        claimedEventIds: [getEventId(absorbingMeal), lowId],
+                                        conflictsWith: [],
+                                        recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
+                                        details: `Meal at ${formatTimeForDisplay(absorbingMeal.created_at)} (${absorbingMeal.carbs}g) drove BG to nadir ${nadirReading.sgv} mg/dL at ${formatTimeForDisplay(nadirReading.dateString)}. No SMBs during descent. Rescue bolus near nadir excluded from ISF attribution.`
+                                    });
+                                }
+                                return; // Do NOT emit ISF_INDUCED_LOW
+                            } else {
+                                console.log(`  Gate 2: ${smbsDuringDescent.length} SMB(s) found during descent. ISF attribution proceeds.`);
+                            }
+                        }
+
+                        // Gate 2 didn't fire (no absorbing meal, or SMBs present during descent)
+                        // With genuineCorrections === 0, there is nothing to attribute ISF causation to.
+                        return;
+                    }
+
                     // Claim corrections (but NOT lows - allow multiple attributions)
-                    recentCorrections.forEach(c => {
+                    genuineCorrections.forEach(c => {
                         claimedEvents.corrections.add(getEventId(c));
                     });
                     highReadings.forEach(h => {
                         claimedEvents.highs.add(getEventId(h));
                     });
-                    
-                    const totalCorrectionInsulin = recentCorrections.reduce((sum, c) => sum + (c.insulin || 0), 0);
+
+                    const totalCorrectionInsulin = genuineCorrections.reduce((sum, c) => sum + (c.insulin || 0), 0);
                     const isfEntry = getISFForTime(earliestCorrectionTime.toISOString(), isfSchedule);
-                    
+
                     // Severity and adjustment
-                    const lowSeverity = hasStacking ? 
+                    const lowSeverity = hasStacking ?
                         (low.bg < 55 ? 0.75 : low.bg < 65 ? 0.65 : 0.55) : // Reduced for stacking
                         (low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.75);
                     const adjustmentPercent = low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5;
-                    
+
                     const period = CIRCADIAN_PERIODS.find(p => {
                         const hour = earliestCorrectionTime.getHours();
                         return hour >= p.startHour && hour < p.endHour;
                     });
-                    
+
                     // Build details with stacking note if applicable
-                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)} → ${recentCorrections.length} correction${recentCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) → Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}.`;
-                    
+                    let details = `High ${lastHighReading.sgv} mg/dL at ${formatTimeForDisplay(lastHighReading.dateString)} → ${genuineCorrections.length} correction${genuineCorrections.length > 1 ? 's' : ''} (${totalCorrectionInsulin.toFixed(2)}U) → Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}.`;
+
                     if (hasStacking) {
                         details += ` Note: ${mealsBetweenCorrectionAndLow.length} meal(s) between corrections and low may have contributed (insulin stacking).`;
                     }
-                    
+
                     findings.push({
                         id: `finding_isf_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.ISF_INDUCED_LOW,
@@ -2396,7 +2562,7 @@
                         events: [{
                             highBG: lastHighReading.sgv,
                             highTime: formatTimeForDisplay(lastHighReading.dateString),
-                            corrections: recentCorrections.length,
+                            corrections: genuineCorrections.length,
                             totalInsulin: totalCorrectionInsulin,
                             lowBG: low.bg,
                             lowTime: formatTimeForDisplay(low.localTime || low.time),
@@ -2407,7 +2573,7 @@
                         primaryParameter: 'isf',
                         suggestedChangePercent: adjustmentPercent,
                         contributingFactors: hasStacking ? ['strong_isf', 'insulin_stacking'] : ['strong_isf'],
-                        claimedEventIds: [...recentCorrections.map(getEventId), ...highReadings.map(getEventId)],
+                        claimedEventIds: [...genuineCorrections.map(getEventId), ...highReadings.map(getEventId)],
                         conflictsWith: [],
                         recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
                         details: details
