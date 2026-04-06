@@ -788,22 +788,31 @@
                 
                 // Step 3b: Add conflict bundles if any
                 slotConflicts.forEach(conflict => {
+                    const isResolved = conflict.recencyResolved === true;
                     bundles.push({
                         id: `conflict_${conflict.slot}`,
-                        name: `⚠️ Conflict: ${conflict.slot}`,
-                        tier: Tier.ROUTINE, // Low priority since conflicted
+                        name: isResolved
+                            ? `ℹ️ Conflict resolved (recency): ${conflict.slot}`
+                            : `⚠️ Conflict: ${conflict.slot}`,
+                        tier: Tier.ROUTINE,
                         priority: 'REFERENCE',
                         recommendations: [],
                         compoundEffect: null,
-                        rootCause: 'Conflicting findings at same schedule slot',
-                        evidenceSummary: `Both strengthening (${conflict.strengthenCount}) and weakening (${conflict.weakenCount}) patterns detected`,
+                        rootCause: isResolved
+                            ? `Conflict at this slot resolved by recency — stale signals suppressed`
+                            : 'Conflicting findings at same schedule slot',
+                        evidenceSummary: isResolved
+                            ? `${conflict.resolvedDirection === 'strengthen' ? 'Strengthening' : 'Weakening'} signals are current; opposing signals are stale`
+                            : `Both strengthening (${conflict.strengthenCount}) and weakening (${conflict.weakenCount}) patterns detected`,
                         evidenceDetails: [
                             { icon: 'UP', detail: `Strengthen: ${conflict.strengthenTypes}`, type: 'conflict' },
                             { icon: 'DOWN', detail: `Weaken: ${conflict.weakenTypes}`, type: 'conflict' }
                         ],
                         conflictsWith: [],
-                        blockedBy: `High variability - ${conflict.details}. Hold changes until patterns stabilize.`,
-                        confidence: 0.3,
+                        blockedBy: isResolved
+                            ? null
+                            : `High variability - ${conflict.details}. Hold changes until patterns stabilize.`,
+                        confidence: isResolved ? 0.6 : 0.3,
                         isSlotConflict: true,
                         conflictDetails: conflict,
                         // BUG-022: Conflicts are structural - always current
@@ -876,6 +885,47 @@
                 return prioritized;
             },
             
+            /**
+             * Returns a quality multiplier for a finding based on measurement context.
+             * Clean fasting-window evidence scores > 1.0; IOB-contaminated evidence < 1.0.
+             * Applied to recencyWeight in conflict resolution to compute effectiveWeight.
+             */
+            getEvidenceQualityMultiplier(finding) {
+                const type = finding.type;
+                const factors = finding.contributingFactors || [];
+
+                if (type === FindingType.CORRECTION_INEFFECTIVE) {
+                    // Check overnight pattern classifier result (stored in diagnosticContext.patternType).
+                    // CANONICAL PATH: use finding.diagnosticContext?.patternType — NOT events[0].overnightPattern.
+                    // The classifier writes to diagnosticContext, not to the events array.
+                    const overnightPattern = finding.diagnosticContext?.patternType;
+                    if (overnightPattern === 'basal_insufficiency') return 1.5;
+                    if (overnightPattern === 'carryover_cascade')   return 0.7;
+                    if (overnightPattern === 'mixed_pattern')       return 0.9;
+
+                    // Waking-hour: check for Cat3 fasting corrections
+                    if (factors.includes('cat3_corrections')) return 1.5;
+
+                    return 0.8; // Post-meal context assumed
+                }
+
+                if (type === FindingType.ISF_INDUCED_LOW) {
+                    // No governing meal = fasting overcorrection = cleaner ISF signal
+                    if (!factors.includes('governing_meal')) return 1.2;
+                    return 0.6; // Governing meal present — meal IOB contaminates attribution
+                }
+
+                if (type === FindingType.DIRECT_MEAL_HIGH || type === FindingType.DIRECT_MEAL_LOW) {
+                    const sensitivity = finding.sessionSensitivity;
+                    if (sensitivity === null || sensitivity === undefined) return 1.0;
+                    if (sensitivity >= 1.20) return 0.5;
+                    if (sensitivity >= 1.10) return 0.75;
+                    return 1.0;
+                }
+
+                return 1.0; // Default — no adjustment
+            },
+
             detectSlotConflicts(findings) {
                 // Group by schedule slot (parameter + time)
                 const bySlot = {};
@@ -892,18 +942,62 @@
                 Object.entries(bySlot).forEach(([slot, slotFindings]) => {
                     const strengthenFindings = slotFindings.filter(f => this.isStrengthening(f));
                     const weakenFindings = slotFindings.filter(f => !this.isStrengthening(f));
-                    
+
                     if (strengthenFindings.length > 0 && weakenFindings.length > 0) {
-                        // Conflict detected
-                        slotConflicts.push({
-                            slot: slot,
-                            strengthenCount: strengthenFindings.length,
-                            weakenCount: weakenFindings.length,
-                            strengthenTypes: strengthenFindings.map(f => f.type).join(', '),
-                            weakenTypes: weakenFindings.map(f => f.type).join(', '),
-                            details: `Strengthen: ${strengthenFindings.map(f => f.type).join(', ')} vs Weaken: ${weakenFindings.map(f => f.type).join(', ')}`
-                        });
-                        // Don't add these to valid findings
+                        // Both sides present — check recency dominance before quarantining
+                        const RECENCY_DOMINANCE_THRESHOLD = 0.5;
+                        const STALE_RATIO_THRESHOLD = 3.0;
+
+                        const strengthenWeight = strengthenFindings.reduce(
+                            (sum, f) => sum + (f.recencyWeight || 0) * this.getEvidenceQualityMultiplier(f), 0
+                        );
+                        const weakenWeight = weakenFindings.reduce(
+                            (sum, f) => sum + (f.recencyWeight || 0) * this.getEvidenceQualityMultiplier(f), 0
+                        );
+
+                        const dominant = strengthenWeight >= weakenWeight
+                            ? { findings: strengthenFindings, weight: strengthenWeight,
+                                recessive: weakenFindings, recessiveWeight: weakenWeight,
+                                direction: 'strengthen' }
+                            : { findings: weakenFindings, weight: weakenWeight,
+                                recessive: strengthenFindings, recessiveWeight: strengthenWeight,
+                                direction: 'weaken' };
+
+                        const ratio = dominant.recessiveWeight > 0
+                            ? dominant.weight / dominant.recessiveWeight
+                            : Infinity;
+
+                        if (dominant.weight >= RECENCY_DOMINANCE_THRESHOLD &&
+                            ratio >= STALE_RATIO_THRESHOLD) {
+                            // Dominant side is sufficiently more recent — recessive side is stale.
+                            console.log(
+                                `Conflict at ${slot}: ${dominant.direction} side dominates ` +
+                                `(weight ${dominant.weight.toFixed(2)} vs ${dominant.recessiveWeight.toFixed(2)}, ` +
+                                `ratio ${ratio.toFixed(1)}x). Stale recessive side suppressed.`
+                            );
+                            validFindings.push(...dominant.findings);
+                            slotConflicts.push({
+                                slot: slot,
+                                strengthenCount: strengthenFindings.length,
+                                weakenCount: weakenFindings.length,
+                                strengthenTypes: strengthenFindings.map(f => f.type).join(', '),
+                                weakenTypes: weakenFindings.map(f => f.type).join(', '),
+                                details: `Strengthen: ${strengthenFindings.map(f => f.type).join(', ')} vs Weaken: ${weakenFindings.map(f => f.type).join(', ')}`,
+                                recencyResolved: true,
+                                resolvedDirection: dominant.direction
+                            });
+                        } else {
+                            // Genuine bidirectional conflict — quarantine both sides
+                            slotConflicts.push({
+                                slot: slot,
+                                strengthenCount: strengthenFindings.length,
+                                weakenCount: weakenFindings.length,
+                                strengthenTypes: strengthenFindings.map(f => f.type).join(', '),
+                                weakenTypes: weakenFindings.map(f => f.type).join(', '),
+                                details: `Strengthen: ${strengthenFindings.map(f => f.type).join(', ')} vs Weaken: ${weakenFindings.map(f => f.type).join(', ')}`,
+                            });
+                            // Don't add these to valid findings
+                        }
                     } else {
                         validFindings.push(...slotFindings);
                     }
@@ -948,7 +1042,17 @@
             },
             
             isStrengthening(finding) {
-                // Strengthening = more insulin
+                // Strengthening = recommendation delivers MORE insulin.
+                // Only these three types produce a strengthen recommendation.
+                //
+                // IMPORTANT — types that are NOT strengthen (common spec/test mistake):
+                //   DIRECT_MEAL_HIGH    → CR weaken (raise CR value = less insulin per gram)
+                //   ISF_SUPPRESSED_HIGH → ISF weaken (raise ISF value = less correction per unit)
+                //   ISF_INDUCED_LOW     → ISF weaken
+                //   DIRECT_MEAL_LOW     → CR weaken
+                //   UNEXPLAINED_LOW     → basal reduce
+                //   RESISTANT_LOW       → no recommendation (null)
+                // All of the above land in weakenFindings in detectSlotConflicts.
                 const strengthenTypes = [
                     FindingType.POST_MEAL_HIGH,
                     FindingType.CORRECTION_INEFFECTIVE,
@@ -3521,7 +3625,18 @@
                             if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution) return false;
                             if (!t.created_at) return false;
                             const tt = new Date(t.created_at);
-                            return tt >= fourHoursBefore && tt < lowTime;
+                            if (!(tt >= fourHoursBefore && tt < lowTime)) return false;
+
+                            // Exclude rescue carbs eaten during a hypoglycemic episode.
+                            // If BG < 80 at time of entry, this is treatment, not a meal.
+                            // Consistent with the same guard in detectDirectMealLows (line 2221),
+                            // detectTransientHighWithLow, and runHighCausalAttributionEngine (line 3772).
+                            const bgAtEntry = nightscoutData.glucose.find(r =>
+                                Math.abs(new Date(r.dateString) - tt) < 10 * 60 * 1000
+                            );
+                            if (bgAtEntry && bgAtEntry.sgv < 80) return false;
+
+                            return true;
                         })
                         .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
 
@@ -4223,7 +4338,10 @@
                     daysWithPattern: sessions.length,
                     primaryParameter: 'isf',
                     suggestedChangePercent: -5,
-                    contributingFactors: ['weak_isf', 'daytime_correction_ineffective', 'cat3_smb'],
+                    contributingFactors: ['weak_isf', 'daytime_correction_ineffective', 'cat3_smb', 'cat3_corrections'],
+                    // NOTE: 'cat3_corrections' is intentionally written here and read by
+                    // getEvidenceQualityMultiplier() to identify waking-hour fasting correction
+                    // findings for quality weighting in conflict resolution. Do not remove.
                     claimedEventIds: sessions.map(s => getEventId(s.smb)),
                     conflictsWith: [],
                     recencyWeight: 1.0,
@@ -4428,8 +4546,65 @@
                         ? windowsInPeriod.length / candidateWindowCount
                         : 0;
 
-                    const hasSufficientData = windowsInPeriod.length >= CONFIG.minEventsHighConfidence;
-                    const deviations = windowsInPeriod.map(w => w.deviation).sort((a, b) => a - b);
+                    // --- Parameter-change population partitioning ---
+                    // If a basal change was applied to any entry in this period's hours during
+                    // the analysis window, use only post-change windows for medianDeviation.
+                    // Falls back to full population if post-change windows are insufficient.
+                    let effectiveWindows = windowsInPeriod;
+                    let populationSplit  = false;
+                    let postChangeCount  = 0;
+                    let splitChangeDate  = null;
+
+                    if (basalSchedule && basalSchedule.length > 0) {
+                        const entriesInPeriod = basalSchedule.filter(entry => {
+                            const hour = parseInt(entry.time.split(':')[0]);
+                            return hour >= period.startHour && hour < period.endHour;
+                        });
+
+                        let mostRecentChangeDate = null;
+                        for (const entry of entriesInPeriod) {
+                            const slotChanges = ChangeTracker.getChangesForSlot('basal', entry.time);
+                            const windowChanges = slotChanges.filter(
+                                c => new Date(c.date + 'T00:00:00') >= analysisStart
+                            );
+                            if (windowChanges.length > 0) {
+                                const latest = windowChanges.reduce((a, b) =>
+                                    new Date(a.date) > new Date(b.date) ? a : b
+                                );
+                                const latestDate = new Date(latest.date + 'T00:00:00');
+                                if (!mostRecentChangeDate || latestDate > mostRecentChangeDate) {
+                                    mostRecentChangeDate = latestDate;
+                                }
+                            }
+                        }
+
+                        if (mostRecentChangeDate) {
+                            splitChangeDate = mostRecentChangeDate;
+                            const postChangeWindows = windowsInPeriod.filter(
+                                w => w.time >= mostRecentChangeDate
+                            );
+                            postChangeCount = postChangeWindows.length;
+                            populationSplit = true;
+
+                            if (postChangeWindows.length >= CONFIG.minEventsHighConfidence) {
+                                effectiveWindows = postChangeWindows;
+                                console.log(
+                                    `Signal partition: ${period.name} — using ${postChangeWindows.length} ` +
+                                    `post-change windows (change ${mostRecentChangeDate.toISOString().slice(0, 10)}), ` +
+                                    `dropped ${windowsInPeriod.length - postChangeWindows.length} pre-change`
+                                );
+                            } else {
+                                console.log(
+                                    `Signal partition: ${period.name} — only ${postChangeWindows.length} ` +
+                                    `post-change windows (need ${CONFIG.minEventsHighConfidence}); ` +
+                                    `using full population (${windowsInPeriod.length} windows)`
+                                );
+                            }
+                        }
+                    }
+
+                    const hasSufficientData = effectiveWindows.length >= CONFIG.minEventsHighConfidence;
+                    const deviations = effectiveWindows.map(w => w.deviation).sort((a, b) => a - b);
                     const medianDeviation = hasSufficientData
                         ? deviations[Math.floor(deviations.length / 2)]
                         : null;
@@ -4442,12 +4617,16 @@
                         ...period,
                         hours: `${String(period.startHour).padStart(2, '0')}:00-${String(period.endHour).padStart(2, '0')}:00`,
                         cleanWindowCount: windowsInPeriod.length,
+                        effectiveWindowCount: effectiveWindows.length,
                         hasSufficientData,
                         medianDeviation,
                         signal,
                         candidateWindowCount,
                         rejectedByGate,
                         windowQuality,
+                        populationSplit,
+                        postChangeCount,
+                        splitChangeDate: splitChangeDate ? splitChangeDate.toISOString() : null,
                     };
                 });
                 
@@ -7034,41 +7213,66 @@
                 if (recentWithActions.length >= 2 || recentWithWatch.length >= 2) {
                     output += '## Item Persistence\n\n';
                     
-                    // Track action names across days
-                    const actionFrequency = {};
+                    const SESSION_DECAY_FACTOR = 0.3;
+                    const SESSION_WINDOW_DAYS  = 14;
+                    const sessionRecencyWeight = (sessionDateStr) => {
+                        if (!sessionDateStr) return 0;
+                        const sessionDate = new Date(sessionDateStr + 'T00:00:00');
+                        const now = new Date();
+                        const ageDays = (now - sessionDate) / (1000 * 60 * 60 * 24);
+                        return Math.exp(-SESSION_DECAY_FACTOR * (ageDays / SESSION_WINDOW_DAYS));
+                    };
+
+                    const actionFrequency     = {};
+                    const actionWeightedScore = {};
                     for (const e of recentWithActions) {
                         const actions = Array.isArray(e.primaryActions) ? e.primaryActions : [];
+                        const w = sessionRecencyWeight(e.date || e.timestamp || '');
                         for (const a of actions) {
                             const key = a.name || 'unknown';
-                            actionFrequency[key] = (actionFrequency[key] || 0) + 1;
+                            actionFrequency[key]     = (actionFrequency[key]     || 0) + 1;
+                            actionWeightedScore[key] = (actionWeightedScore[key] || 0) + w;
                         }
                     }
-                    
-                    const watchFrequency = {};
+
+                    const watchFrequency     = {};
+                    const watchWeightedScore = {};
                     for (const e of recentWithWatch) {
                         const items = Array.isArray(e.watchItems) ? e.watchItems : [];
-                        for (const w of items) {
-                            const key = w.name || 'unknown';
-                            watchFrequency[key] = (watchFrequency[key] || 0) + 1;
+                        const w = sessionRecencyWeight(e.date || e.timestamp || '');
+                        for (const item of items) {
+                            const key = item.name || 'unknown';
+                            watchFrequency[key]     = (watchFrequency[key]     || 0) + 1;
+                            watchWeightedScore[key] = (watchWeightedScore[key] || 0) + w;
                         }
                     }
-                    
-                    // Persistent = appeared 3+ times
-                    const persistentActions = Object.entries(actionFrequency).filter(([k, v]) => v >= 3);
-                    const persistentWatch = Object.entries(watchFrequency).filter(([k, v]) => v >= 3);
-                    
+
+                    const PERSIST_RAW_THRESHOLD      = 3;
+                    const PERSIST_WEIGHTED_THRESHOLD = 1.5;
+
+                    const persistentActions = Object.entries(actionFrequency).filter(([k, v]) =>
+                        v >= PERSIST_RAW_THRESHOLD &&
+                        (actionWeightedScore[k] || 0) >= PERSIST_WEIGHTED_THRESHOLD
+                    );
+                    const persistentWatch = Object.entries(watchFrequency).filter(([k, v]) =>
+                        v >= PERSIST_RAW_THRESHOLD &&
+                        (watchWeightedScore[k] || 0) >= PERSIST_WEIGHTED_THRESHOLD
+                    );
+
                     if (persistentActions.length > 0) {
-                        output += '**Recurring primary actions** (3+ appearances):\n';
+                        output += '**Recurring primary actions** (3+ appearances, recency-weighted):\n';
                         for (const [name, count] of persistentActions) {
-                            output += `- ${name}: ${count}/${recentWithActions.length} sessions\n`;
+                            const ws = (actionWeightedScore[name] || 0).toFixed(1);
+                            output += `- ${name}: ${count}/${recentWithActions.length} sessions (weighted: ${ws})\n`;
                         }
                         output += '\n';
                     }
-                    
+
                     if (persistentWatch.length > 0) {
-                        output += '**Recurring watch items** (3+ appearances):\n';
+                        output += '**Recurring watch items** (3+ appearances, recency-weighted):\n';
                         for (const [name, count] of persistentWatch) {
-                            output += `- ${name}: ${count}/${recentWithWatch.length} sessions\n`;
+                            const ws = (watchWeightedScore[name] || 0).toFixed(1);
+                            output += `- ${name}: ${count}/${recentWithWatch.length} sessions (weighted: ${ws})\n`;
                         }
                         output += '\n';
                     }
@@ -8731,25 +8935,77 @@
                     // conflictsWith and isf_contradiction tag. Form 2 MIXED_ATTRIBUTION
                     // finding (synthetic "All" timeblock) is suppressed — not clinically
                     // actionable. Underlying findings carry the contradiction signal.
+                    //
+                    // v3.5.19: Activity-contaminated ISF_INDUCED_LOW findings (sessionSensitivity
+                    // ≥ ISF_ACTIVITY_SENSITIVITY_THRESHOLD) are pre-resolved in favor of
+                    // ISF_SUPPRESSED_HIGH when ALL low findings are contaminated.
+                    // NOTE: ISF_ACTIVITY_SENSITIVITY_THRESHOLD = 1.20 matches the threshold in
+                    // getEvidenceQualityMultiplier (DIRECT_MEAL quality weighting, Spec 2). If
+                    // either is recalibrated, update both.
+                    const ISF_ACTIVITY_SENSITIVITY_THRESHOLD = 1.20;
+
                     const isfLowFindings  = aggregatedFindings.filter(f => f.type === FindingType.ISF_INDUCED_LOW);
                     const isfHighFindings = aggregatedFindings.filter(f => f.type === FindingType.ISF_SUPPRESSED_HIGH);
+
                     if (isfLowFindings.length > 0 && isfHighFindings.length > 0) {
-                        isfLowFindings.forEach(f => {
-                            f.conflictsWith = [...(f.conflictsWith || []),
-                                ...isfHighFindings.map(h => h.id || h.type)];
-                            if (!f.contributingFactors) f.contributingFactors = [];
-                            if (!f.contributingFactors.includes('isf_contradiction')) {
-                                f.contributingFactors.push('isf_contradiction');
+                        const activityContaminatedLows = isfLowFindings.filter(f =>
+                            f.sessionSensitivity !== undefined &&
+                            f.sessionSensitivity !== null &&
+                            f.sessionSensitivity >= ISF_ACTIVITY_SENSITIVITY_THRESHOLD
+                        );
+                        const cleanLows = isfLowFindings.filter(f =>
+                            !(f.sessionSensitivity !== undefined &&
+                              f.sessionSensitivity !== null &&
+                              f.sessionSensitivity >= ISF_ACTIVITY_SENSITIVITY_THRESHOLD)
+                        );
+
+                        if (cleanLows.length === 0 && activityContaminatedLows.length > 0) {
+                            // All low findings are activity-contaminated — pre-resolve in favor
+                            // of ISF_SUPPRESSED_HIGH (strengthen signal is valid).
+                            console.log(
+                                `ISF contradiction pre-resolved: all ${activityContaminatedLows.length} ` +
+                                `ISF_INDUCED_LOW finding(s) are activity-contaminated ` +
+                                `(sessionSensitivity ≥ ${ISF_ACTIVITY_SENSITIVITY_THRESHOLD}). ` +
+                                `ISF_SUPPRESSED_HIGH proceeding as valid strengthen signal.`
+                            );
+                            activityContaminatedLows.forEach(f => {
+                                if (!f.contributingFactors) f.contributingFactors = [];
+                                if (!f.contributingFactors.includes('activity_resolved'))
+                                    f.contributingFactors.push('activity_resolved');
+                            });
+                            // ISF_SUPPRESSED_HIGH is NOT tagged — remains a valid strengthen signal
+                        } else {
+                            // Some or all low findings are clean — genuine contradiction.
+                            const contradictionLows = cleanLows.length > 0 ? cleanLows : isfLowFindings;
+
+                            contradictionLows.forEach(f => {
+                                f.conflictsWith = [...(f.conflictsWith || []),
+                                    ...isfHighFindings.map(h => h.id || h.type)];
+                                if (!f.contributingFactors) f.contributingFactors = [];
+                                if (!f.contributingFactors.includes('isf_contradiction'))
+                                    f.contributingFactors.push('isf_contradiction');
+                            });
+                            isfHighFindings.forEach(f => {
+                                f.conflictsWith = [...(f.conflictsWith || []),
+                                    ...contradictionLows.map(l => l.id || l.type)];
+                                if (!f.contributingFactors) f.contributingFactors = [];
+                                if (!f.contributingFactors.includes('isf_contradiction'))
+                                    f.contributingFactors.push('isf_contradiction');
+                            });
+
+                            if (activityContaminatedLows.length > 0) {
+                                activityContaminatedLows.forEach(f => {
+                                    if (!f.contributingFactors) f.contributingFactors = [];
+                                    if (!f.contributingFactors.includes('activity_partial'))
+                                        f.contributingFactors.push('activity_partial');
+                                });
+                                console.log(
+                                    `ISF contradiction partially contaminated: ` +
+                                    `${activityContaminatedLows.length} activity-contaminated low(s), ` +
+                                    `${cleanLows.length} clean low(s). Contradiction holds on clean lows.`
+                                );
                             }
-                        });
-                        isfHighFindings.forEach(f => {
-                            f.conflictsWith = [...(f.conflictsWith || []),
-                                ...isfLowFindings.map(l => l.id || l.type)];
-                            if (!f.contributingFactors) f.contributingFactors = [];
-                            if (!f.contributingFactors.includes('isf_contradiction')) {
-                                f.contributingFactors.push('isf_contradiction');
-                            }
-                        });
+                        }
                     }
                     
                     // Calculate current basal percent for comparison
@@ -8862,6 +9118,82 @@
                         sensitivityHistoryLocal
                     );
                     
+                    // Spec 2A / v3.5.20: Stamp sessionSensitivity on findings using
+                    // date-keyed lookup against Sheets history entries. OLD findings get
+                    // the sensitivity from the session when their event occurred;
+                    // today's findings (or those with no history entry) get the current
+                    // session value. sensitivityHistoryLocal is populated at line 8349
+                    // and is in scope — no new data load required.
+                    const currentSessionSensitivity = carbAdjSensitivity ? parseFloat(carbAdjSensitivity) : null;
+
+                    const sensitivityByDate = {};
+                    if (sensitivityHistoryLocal && sensitivityHistoryLocal.length > 0) {
+                        sensitivityHistoryLocal.forEach(entry => {
+                            if (entry.date && entry.carbAdjSensitivity) {
+                                const val = parseFloat(entry.carbAdjSensitivity);
+                                if (!isNaN(val)) {
+                                    sensitivityByDate[entry.date] = val;
+                                }
+                            }
+                        });
+                    }
+
+                    const todayDate = new Date().toISOString().slice(0, 10);
+
+                    aggregatedFindings.forEach(f => {
+                        if (f.sessionSensitivity !== undefined) return; // already stamped
+
+                        const eventDate = f.eventTime
+                            ? new Date(f.eventTime).toISOString().slice(0, 10)
+                            : null;
+
+                        if (eventDate && eventDate !== todayDate &&
+                            sensitivityByDate[eventDate] !== undefined) {
+                            f.sessionSensitivity = sensitivityByDate[eventDate];
+                        } else {
+                            f.sessionSensitivity = currentSessionSensitivity;
+                        }
+                    });
+
+                    // Spec 3: Post-parameter-change recencyWeight decay for CORRECTION_INEFFECTIVE.
+                    // Findings that predate a parameter change at the same slot are decayed so
+                    // stale pre-change evidence does not drive conflicts against post-change findings.
+                    const POST_CHANGE_DECAY_FACTOR = 0.5;
+                    aggregatedFindings.forEach(f => {
+                        if (f.type !== FindingType.CORRECTION_INEFFECTIVE) return;
+                        if (!f.primaryParameter || !f.scheduleTime || !f.eventTime) return;
+
+                        const findingTime = new Date(f.eventTime);
+                        const slotChanges = ChangeTracker.getChangesForSlot(
+                            f.primaryParameter, f.scheduleTime
+                        );
+
+                        const supersedingChange = slotChanges
+                            .filter(c => new Date(c.date + 'T00:00:00') > findingTime)
+                            .sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+
+                        if (!supersedingChange) return;
+
+                        const changeDate = new Date(supersedingChange.date + 'T00:00:00');
+                        const now = new Date();
+                        const daysSinceChange = (now - changeDate) / (1000 * 60 * 60 * 24);
+
+                        const decayMultiplier = Math.max(
+                            0.3,
+                            1.0 - (POST_CHANGE_DECAY_FACTOR * daysSinceChange / 7)
+                        );
+
+                        const originalWeight = f.recencyWeight || 0;
+                        f.recencyWeight = originalWeight * decayMultiplier;
+
+                        console.log(
+                            `Post-change decay: ${f.type} @ ${f.scheduleTime} — ` +
+                            `superseded by ${f.primaryParameter} change on ${supersedingChange.date}, ` +
+                            `${daysSinceChange.toFixed(1)} days ago. ` +
+                            `recencyWeight: ${originalWeight.toFixed(3)} → ${f.recencyWeight.toFixed(3)}`
+                        );
+                    });
+
                     // Run recommendation engine
                     const schedules = activeSchedules;
                     const processedBundles = RecommendationEngine.process(
