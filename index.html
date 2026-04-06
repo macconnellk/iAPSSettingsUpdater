@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.21</title>
+    <title>Daily Insulin Settings Review v3.5.22</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4736,7 +4736,8 @@
                     periodSignals,
                     finalPercent,
                     tdd,
-                    hourlyAgpStats = null
+                    hourlyAgpStats7d  = null,   // 7-day: structural high% for AGP_HIGH detection
+                    hourlyAgpStats48h = null    // 48h: recent lows for per-hour safety exclusion gate
                 } = options;
                 
                 if (!currentBasalSchedule || currentBasalSchedule.length === 0 || !tdd || !finalPercent) {
@@ -4744,23 +4745,26 @@
                     return null;
                 }
 
-                // --- AGP_HIGH signal detection ---
-                // For INSUFFICIENT periods, check if AGP hourly data supports an increase.
-                // A period qualifies as AGP_HIGH if all its hours have lowPct ≤ 2%
-                // and avg highPct across those hours ≥ 25%.
-                // The low exclusion gate (lowPct > 2%) applies to ALL paths.
+                // --- AGP_HIGH signal detection (dual-window) ---
+                // Low exclusion gate: 48h window only (recent lows = current safety signal)
+                // AGP_HIGH period detection: 7d high% (structural), 48h low exclusion (safety)
+                // Per-hour candidate list: period hours not excluded by 48h gate
                 const AGP_HIGH_THRESHOLD = 25;
                 const AGP_LOW_EXCLUSION  = 2;
-                const agpHighPeriods  = new Set();
-                const lowExcludedHours = new Set();
+                const agpHighPeriods       = new Set();
+                const agpHighCandidateHours = {};      // period name → array of safe candidate hours
+                const lowExcludedHours     = new Set();
 
-                if (hourlyAgpStats) {
-                    hourlyAgpStats.forEach((stats, hour) => {
+                if (hourlyAgpStats48h) {
+                    // Low exclusion gate — 48h window only
+                    hourlyAgpStats48h.forEach((stats, hour) => {
                         if (stats && stats.lowPct > AGP_LOW_EXCLUSION) {
                             lowExcludedHours.add(hour);
                         }
                     });
+                }
 
+                if (hourlyAgpStats7d) {
                     CIRCADIAN_PERIODS.forEach(period => {
                         const periodSignal = periodSignals?.find(p => p.name === period.name);
                         const hasSufficientSignal = periodSignal?.hasSufficientData &&
@@ -4771,20 +4775,21 @@
                         for (let h = period.startHour; h < period.endHour; h++) {
                             periodHours.push(h);
                         }
-                        const anyLows = periodHours.some(h =>
-                            hourlyAgpStats[h] && hourlyAgpStats[h].lowPct > AGP_LOW_EXCLUSION
-                        );
-                        if (anyLows) return;
 
-                        const validHours = periodHours.filter(h => hourlyAgpStats[h]);
-                        if (validHours.length === 0) return;
-                        const avgHighPct = validHours.reduce(
-                            (sum, h) => sum + hourlyAgpStats[h].highPct, 0
-                        ) / validHours.length;
+                        // AGP_HIGH check uses 7-day high% — structural assessment
+                        const validHours7d = periodHours.filter(h => hourlyAgpStats7d[h]);
+                        if (validHours7d.length === 0) return;
+                        const avgHighPct = validHours7d.reduce(
+                            (sum, h) => sum + hourlyAgpStats7d[h].highPct, 0
+                        ) / validHours7d.length;
+                        if (avgHighPct < AGP_HIGH_THRESHOLD) return;
 
-                        if (avgHighPct >= AGP_HIGH_THRESHOLD) {
-                            agpHighPeriods.add(period.name);
-                        }
+                        // Candidate hours = period hours NOT excluded by 48h low gate
+                        const candidateHours = periodHours.filter(h => !lowExcludedHours.has(h));
+                        if (candidateHours.length === 0) return; // all hours have recent lows
+
+                        agpHighPeriods.add(period.name);
+                        agpHighCandidateHours[period.name] = candidateHours;
                     });
                 }
                 
@@ -4827,9 +4832,10 @@
                     currentHourly,
                     periodSignals,
                     incrementsNeeded,
-                    null,              // ratioProtection
+                    null,               // ratioProtection
                     lowExcludedHours,
-                    agpHighPeriods
+                    agpHighPeriods,
+                    agpHighCandidateHours
                 );
                 
                 // Build proposed schedule
@@ -4873,6 +4879,7 @@
                         proposedTotal,
                         method: distribution.method || distribution.distribution?.method || null,
                         agpHighPeriods: distribution.agpHighPeriods || [...agpHighPeriods],
+                        agpHighCandidateHours: distribution.agpHighCandidateHours || agpHighCandidateHours,
                         lowExcludedHours: distribution.lowExcludedHours || [...lowExcludedHours],
                         ratioProtection: distribution.ratioProtection || null
                     }
@@ -4915,7 +4922,7 @@
              * signal matches the direction of change needed.
              * Includes ratio protection to avoid making basal ratio worse.
              */
-            distributeIncrements(currentHourly, periodSignals, incrementsNeeded, ratioProtection = null, lowExcludedHours = new Set(), agpHighPeriods = new Set()) {
+            distributeIncrements(currentHourly, periodSignals, incrementsNeeded, ratioProtection = null, lowExcludedHours = new Set(), agpHighPeriods = new Set(), agpHighCandidateHours = {}) {
                 const AGP_LOW_EXCLUSION = 2; // mirrors generateProposedSchedule constant
                 const allInsufficient = !periodSignals ||
                     periodSignals.every(p =>
@@ -4925,6 +4932,36 @@
                 const currentTotal = currentHourly.reduce((s, r) => s + r, 0);
 
                 if (allInsufficient && currentTotal > 0) {
+                    // No AGP data: uniform proportional scaling (original behavior)
+                    if (lowExcludedHours.size === 0 && agpHighPeriods.size === 0) {
+                        const targetTotal = currentTotal + incrementsNeeded * this.PUMP_INCREMENT;
+                        const scaleFactor = targetTotal / currentTotal;
+                        const proposedHourly = currentHourly.map(r =>
+                            this.roundToIncrement(r * scaleFactor)
+                        );
+                        const proposedTotal = proposedHourly.reduce((s, r) => s + r, 0);
+                        const appliedHours = proposedHourly
+                            .map((rate, hour) => ({
+                                hour: `${String(hour).padStart(2, '0')}:00`,
+                                period: this.getPeriodForHour(hour)?.name,
+                                delta: rate - currentHourly[hour],
+                                newRate: rate
+                            }))
+                            .filter(h => Math.abs(h.delta) >= 0.001);
+                        return {
+                            schedule: proposedHourly,
+                            appliedHours,
+                            matchingPeriods: [],
+                            neutralPeriods: [],
+                            skippedPeriods: [],
+                            incrementsSkipped: 0,
+                            method: 'proportional-no-signal',
+                            agpHighPeriods: [],
+                            agpHighCandidateHours: {},
+                            lowExcludedHours: []
+                        };
+                    }
+
                     const availableHours = Array.from({length: 24}, (_, h) => h)
                         .filter(h => !lowExcludedHours.has(h));
 
@@ -4938,6 +4975,7 @@
                             incrementsSkipped: Math.abs(incrementsNeeded),
                             method: 'no-safe-hours',
                             agpHighPeriods: [...agpHighPeriods],
+                            agpHighCandidateHours,
                             lowExcludedHours: [...lowExcludedHours]
                         };
                     }
@@ -4976,6 +5014,7 @@
                         incrementsSkipped: 0,
                         method: 'proportional-agp-gated',
                         agpHighPeriods: [...agpHighPeriods],
+                        agpHighCandidateHours,
                         lowExcludedHours: [...lowExcludedHours]
                     };
                 }
@@ -5158,6 +5197,7 @@
                     skippedPeriods: opposite.map(p => p.period.name),
                     incrementsSkipped: remaining,
                     agpHighPeriods: [...agpHighPeriods],
+                    agpHighCandidateHours,
                     lowExcludedHours: [...lowExcludedHours],
                     ratioProtection: {
                         active: ratioBlockedCount > 0,
@@ -5861,8 +5901,24 @@
                     // AGP_HIGH periods — surfaces for Claude judgment, no auto-distribution
                     if (dist.agpHighPeriods?.length > 0) {
                         output += `\n**AGP_HIGH Periods (no clean windows — apply clinical judgment):**\n`;
+                        const fmtH = h => `${String(h).padStart(2, '0')}:00`;
                         dist.agpHighPeriods.forEach(periodName => {
-                            output += `- ${periodName}: sustained high% with no lows. No automated distribution applied. Recommend 1–2 first-step increases (0.05 U/hr) at clinical judgment.\n`;
+                            const candidates = dist.agpHighCandidateHours?.[periodName] || [];
+                            const period = CIRCADIAN_PERIODS?.find(p => p.name === periodName);
+                            const allHours = period
+                                ? Array.from({ length: period.endHour - period.startHour },
+                                    (_, i) => period.startHour + i)
+                                : [];
+                            const excluded = allHours.filter(h =>
+                                dist.lowExcludedHours?.includes(h) && !candidates.includes(h)
+                            );
+                            const candidateStr = candidates.length > 0
+                                ? `Candidate hours: ${candidates.map(fmtH).join(', ')}`
+                                : 'No candidate hours';
+                            const excludedStr = excluded.length > 0
+                                ? ` (${excluded.map(fmtH).join(', ')} excluded — recent lows present)`
+                                : '';
+                            output += `- ${periodName}: high% above threshold (7-day structural). ${candidateStr}${excludedStr}. No automated distribution applied — recommend 1–2 first-step increases (0.05 U/hr) at clinical judgment.\n`;
                         });
                         output += `\n`;
                     }
@@ -6081,7 +6137,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.21',
+                            version: '3.5.22',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6313,7 +6369,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.21',
+                        version: '3.5.22',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -6379,6 +6435,7 @@
                         periods: periodSignals,
                         agpBasalSignal: {
                             agpHighPeriods: analysisResults.basalOptimization?.distribution?.agpHighPeriods || [],
+                            agpHighCandidateHours: analysisResults.basalOptimization?.distribution?.agpHighCandidateHours || {},
                             lowExcludedHours: analysisResults.basalOptimization?.distribution?.lowExcludedHours || [],
                             method: analysisResults.basalOptimization?.distribution?.method || null
                         }
@@ -9208,19 +9265,21 @@
                     console.log('Final % for basal optimization:', finalPercent.toFixed(2), safetyOverrideActive ? '(SAFETY OVERRIDE)' : '');
                     
                     // Generate proposed basal schedule
-                    // Compute per-hour AGP data for low exclusion gate and AGP_HIGH detection.
+                    // Compute dual-window AGP data:
+                    //   7-day: structural high% assessment for AGP_HIGH detection
+                    //   48h:   recent low% for the per-hour safety exclusion gate
                     // OutputFormatter.calculateAGP is defined later in this scope — call inline.
-                    let hourlyAgpStats = null;
+                    let hourlyAgpStats7d  = null;
+                    let hourlyAgpStats48h = null;
                     if (nightscoutData?.glucose) {
-                        const agpResult = OutputFormatter.calculateAGP(nightscoutData.glucose, 7);
-                        if (agpResult?.hourlyStats) {
-                            hourlyAgpStats = agpResult.hourlyStats.map(stats => stats ? {
-                                lowPct:  (stats.tir.low  || 0) + (stats.tir.veryLow  || 0),
-                                highPct: (stats.tir.high || 0) + (stats.tir.veryHigh || 0),
-                                tir:  stats.tir.inRange || 0,
-                                mean: stats.mean || 0
-                            } : null);
-                        }
+                        const mapStats = (agpResult) => agpResult?.hourlyStats?.map(stats => stats ? {
+                            lowPct:  (stats.tir.low  || 0) + (stats.tir.veryLow  || 0),
+                            highPct: (stats.tir.high || 0) + (stats.tir.veryHigh || 0),
+                            tir:     stats.tir.inRange || 0,
+                            mean:    stats.mean || 0
+                        } : null) ?? null;
+                        hourlyAgpStats7d  = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 7));
+                        hourlyAgpStats48h = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 2));
                     }
 
                     const basalOptimization = BasalOptimizer.generateProposedSchedule({
@@ -9228,7 +9287,8 @@
                         periodSignals: signalAnalysis?.periods,
                         finalPercent: finalPercent,
                         tdd: tddForSignal,
-                        hourlyAgpStats
+                        hourlyAgpStats7d,
+                        hourlyAgpStats48h
                     });
                     
                     // Add safety override info to optimization result
@@ -9248,7 +9308,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.21: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.22: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10066,7 +10126,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.21 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.22 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
