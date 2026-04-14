@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.22</title>
+    <title>Daily Insulin Settings Review v3.5.24</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -3397,15 +3397,18 @@
              * Returns budget, ratio, categorised SMB arrays, and correction list.
              */
             _decomposeSMBs(treatments, glucose, mealTime, mealCarbs, crSchedule) {
-                // Upfront bolus: iAPS posts the meal bolus and carb entry as separate records.
-                // Capture any non-SMB bolus within ±5 minutes of meal time.
-                const upfrontBolus = treatments
+                // Upfront bolus: iAPS delivers after the carb entry, sometimes well after (≥30 min delay
+                // when algorithm is waiting for BG rise). Find the first non-SMB bolus in the [−2, +90] min
+                // window and use it as the upfront delivery amount.
+                const upfrontBolusEntry = treatments
                     .filter(t => {
                         if (!t.insulin || t.insulin <= 0 || !t.created_at) return false;
                         if (t.eventType && t.eventType.includes('SMB')) return false;
-                        return Math.abs(new Date(t.created_at) - mealTime) < 5 * 60 * 1000;
+                        const minsFromMeal = (new Date(t.created_at) - mealTime) / 60000;
+                        return minsFromMeal >= -2 && minsFromMeal <= 90;
                     })
-                    .reduce((sum, t) => sum + (t.insulin || 0), 0);
+                    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))[0];
+                const upfrontBolus = upfrontBolusEntry ? (upfrontBolusEntry.insulin || 0) : 0;
 
                 const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
                 const expectedBudget = (crEntry && crEntry.value > 0)
@@ -3528,6 +3531,18 @@
                     score += 0.15;
                 }
 
+                // Cat1 SMB completion with no corrections: the CR-calculated dose was the primary
+                // active insulin when the low occurred, regardless of timing. This handles the
+                // delayed-delivery pattern (upfront bolus 30–60 min after carb entry) where the
+                // nadir falls 150–240 min from meal ENTRY but only 90–160 min from actual delivery.
+                // Requires minsFromMealToLow > 90 to avoid double-counting with the timing factor above.
+                if (decomp.cat1SMBs.length > 0 &&
+                    decomp.correctionTotal === 0 &&
+                    minsFromMealToLow > 90 &&
+                    minsFromMealToLow <= 240) {
+                    score += 0.45;
+                }
+
                 return score;
             },
 
@@ -3572,7 +3587,13 @@
                 });
                 if (!hasRecentBolus) score += 0.4;
 
-                if (minsFromMealToLow > 180) score += 0.3;
+                // >180 min bonus signals fasting-context lows where no meal-related delivery is active.
+                // Suppress when Cat1 SMBs or an upfront bolus confirm post-meal delivery was present —
+                // the 195-min gap from meal ENTRY is misleading when upfront delivery was delayed.
+                if (minsFromMealToLow > 180 &&
+                    decomp.upfrontBolus === 0 && decomp.cat1SMBs.length === 0) {
+                    score += 0.3;
+                }
 
                 // Clean window signal shows LOW in the same circadian hour block
                 if (signalAnalysis && signalAnalysis.periods) {
@@ -6137,7 +6158,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.22',
+                            version: '3.5.24',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6369,7 +6390,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.22',
+                        version: '3.5.24',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9308,7 +9329,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.22: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.24: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10126,7 +10147,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.22 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.24 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
