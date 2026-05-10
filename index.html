@@ -143,7 +143,7 @@
             maxISFStrengthen: 0.03,
             
             // Basal constraints
-            basalRatioCap: 3.1,
+            basalRatioCap: 2.5,
             pumpIncrement: 0.05,
             
             // State detection
@@ -173,60 +173,8 @@
 
             // BUG-CAE-001: iAPS upfront bolus fraction — adjust if SMB settings change
             IAPS_UPFRONT_BOLUS_FRACTION: 0.70,
-
-            // Issue 1: sensitivity elevation threshold (comparison against Sheets-computed 75th-pct baseline)
-            SENSITIVITY_ELEVATION_THRESHOLD: 0.08,   // flag when today's CAS > baseline_CAS * (1 + 0.08)
         };
         
-        // =========================================================================
-        // Issue 1: carbAdjSensitivity elevation detection (Sheets-driven baseline)
-        // The 75th-percentile IPC baseline is computed by the sheet formula in
-        // column W (IPC_75th_Baseline) and read back via readHistoryData().
-        // This function derives the equivalent baseline CAS from that IPC value
-        // and tests whether today's CAS exceeds it by ≥8%.
-        // =========================================================================
-
-        /**
-         * Given today's carbAdjSensitivity and the sheet-computed ipc75thBaseline
-         * (75th percentile of the last 30 clean Insulin_per_Carb sessions), returns
-         * true when sensitivity is elevated ≥8% above the clean baseline.
-         *
-         * Why IPC baseline → CAS comparison works:
-         *   Higher IPC = more insulin per gram = resistance.
-         *   The 75th-pct IPC is what a "normal high-demand day" looks like.
-         *   If today's actual TDD is LOW relative to what carbs would predict at
-         *   that IPC level, carbAdjSensitivity will be high — genuine sensitivity.
-         *   Using the 75th-pct IPC (rather than mean) as the reference means
-         *   outlier high-resistance days don't inflate the baseline.
-         *
-         * The baseline CAS corresponding to 75th-pct IPC is 1.0 by construction
-         * (the sheet only stores IPC, not the derived CAS baseline). So the
-         * threshold is simply: today's CAS > 1.0 * (1 + SENSITIVITY_ELEVATION_THRESHOLD).
-         * This is equivalent to checking ipc75thBaseline directly:
-         *   today's IPC < ipc75thBaseline * (1 - SENSITIVITY_ELEVATION_THRESHOLD)
-         * but CAS is the metric the state detector already uses, so we keep that interface.
-         */
-        const isSensitivityElevated = (carbAdjSensitivity, ipc75thBaseline, basalTotal, todayCarbs, todayTdd24h) => {
-            if (carbAdjSensitivity === null || carbAdjSensitivity === undefined) return false;
-            if (!ipc75thBaseline || ipc75thBaseline <= 0) {
-                // Fallback: no sheet baseline available — use fixed ≥1.08 guard
-                // (conservative; avoids false positives without a clean reference)
-                return carbAdjSensitivity >= 1.08;
-            }
-            // Derive baseline CAS at the 75th-pct IPC level.
-            // If today's carbs were consumed at the 75th-pct IPC rate, expected TDD would be:
-            //   expectedTDD_at_baseline = (ipc75thBaseline * todayCarbs) + basalTotal
-            //   baseline_CAS = expectedTDD_at_baseline / todayTdd24h
-            // We then flag when today's CAS > baseline_CAS * (1 + threshold).
-            if (basalTotal > 0 && todayCarbs > 0 && todayTdd24h > 0) {
-                const expectedTDDAtBaseline = (ipc75thBaseline * todayCarbs) + basalTotal;
-                const baselineCAS = expectedTDDAtBaseline / todayTdd24h;
-                return carbAdjSensitivity > baselineCAS * (1 + CONFIG.SENSITIVITY_ELEVATION_THRESHOLD);
-            }
-            // Fallback when component values unavailable
-            return carbAdjSensitivity >= 1.08;
-        };
-
         // Helper to get local date in YYYY-MM-DD format
         // Using toISOString().split('T')[0] returns UTC date, which can be wrong near midnight
         // This returns the LOCAL date which is what users expect
@@ -517,7 +465,7 @@
         // =========================================================================
         
         const StateDetector = {
-            detect(signalAnalysis, tddHistory, changeHistory, userOverride = null, carbAdjSensitivity = null, sensitivityHistory = null, ipc75thBaseline = null, basalTotal = 0, todayCarbs = 0, todayTdd24h = 0) {
+            detect(signalAnalysis, tddHistory, changeHistory, userOverride = null, carbAdjSensitivity = null, sensitivityHistory = null) {
                 // Check for user-declared override first
                 if (userOverride && userOverride.active) {
                     return {
@@ -554,24 +502,22 @@
                     };
                 }
                 
-                // Issue 1: TRANSIENT_SENSITIVITY via 75th-percentile IPC baseline from Sheets.
-                // The sheet column IPC_75th_Baseline holds the PERCENTILE(75%) of the last 30
-                // clean (non-override) Insulin_per_Carb sessions. We derive a baseline CAS from
-                // that IPC value and flag when today's CAS exceeds it by ≥8%.
-                // ipc75thBaseline is null when the sheet hasn't computed it yet (< 30 rows).
-                // In that case isSensitivityElevated falls back to a conservative fixed guard.
-                if (carbAdjSensitivity !== null) {
-                    if (isSensitivityElevated(carbAdjSensitivity, ipc75thBaseline, basalTotal, todayCarbs, todayTdd24h)) {
-                        const baselineStr = ipc75thBaseline
-                            ? `75th-pct IPC baseline ${ipc75thBaseline.toFixed(4)} U/g (last 30 clean sessions)`
-                            : 'no Sheets baseline available — using fixed ≥1.08 guard';
+                // Check for sustained sensitivity elevation across consecutive sessions
+                // Two consecutive sessions with carbAdjSensitivity >= 1.10 = TRANSIENT_SENSITIVITY
+                // regardless of signal direction consistency (catches step-change scenarios)
+                if (carbAdjSensitivity !== null && carbAdjSensitivity >= 1.10 && sensitivityHistory) {
+                    const sortedHistory = [...sensitivityHistory]
+                        .filter(e => e.carbAdjSensitivity && !isNaN(parseFloat(e.carbAdjSensitivity)))
+                        .sort((a, b) => new Date(b.date || b.timestamp) - new Date(a.date || a.timestamp));
+                    const priorSensitivity = sortedHistory.length > 0 ? parseFloat(sortedHistory[0].carbAdjSensitivity) : null;
+                    if (priorSensitivity !== null && priorSensitivity >= 1.10) {
                         return {
                             state: BodyStateType.TRANSIENT_SENSITIVITY,
-                            confidence: ipc75thBaseline ? 0.85 : 0.65,
-                            daysInState: 1,
+                            confidence: 0.85,
+                            daysInState: 2,
                             contributingFactors: [
                                 `Carb-adjusted sensitivity ${carbAdjSensitivity.toFixed(2)} (current session)`,
-                                baselineStr
+                                `Prior session sensitivity ${priorSensitivity.toFixed(2)} — sustained elevation ≥1.10 for 2+ sessions`
                             ],
                             recommendedOverride: carbAdjSensitivity >= 1.20 ? 85 : 90
                         };
@@ -3196,6 +3142,31 @@
             },
             
             /**
+             * Returns the minimum CGM reading in the 120-minute window after windowCloseTime.
+             * Returns null if no readings exist in that window.
+             */
+            getPostWindowMinBG(glucose, windowCloseTime) {
+                const checkEnd = new Date(windowCloseTime.getTime() + 120 * 60 * 1000);
+                const postReadings = glucose.filter(r => {
+                    const rt = new Date(r.dateString);
+                    return rt > windowCloseTime && rt <= checkEnd;
+                });
+                if (postReadings.length === 0) return null;
+                return Math.min(...postReadings.map(r => r.sgv));
+            },
+
+            /**
+             * Classifies post-window minimum BG into one of three outcomes.
+             * Returns null when no post-window data is available.
+             */
+            classifyPostWindow(minBG) {
+                if (minBG === null) return null;
+                if (minBG > 115) return 'CONFIRMED_INEFFECTIVE';
+                if (minBG >= 70)  return 'CORRECTION_DELAYED';
+                return 'CORRECTION_OVERCORRECTED';
+            },
+
+            /**
              * DETECTOR 6: Correction Ineffectiveness
              * Pattern: Overnight corrections fail to bring BG to target
              * Output: Finding of type CORRECTION_INEFFECTIVE (ISF strengthening)
@@ -3399,12 +3370,34 @@
                     const period = CIRCADIAN_PERIODS.find(p => 
                         segmentMidpointHour >= p.startHour && segmentMidpointHour < p.endHour
                     );
-                    
+
+                    // Post-window nadir check: corrections late in segment may peak after
+                    // window closes. Compute window close time for this segment-night and
+                    // check the 120-minute window following it.
+                    const lastSegmentReading = sortedReadings[sortedReadings.length - 1];
+                    const windowCloseTime = new Date(lastSegmentReading.dateString);
+                    windowCloseTime.setHours(segment.endHour === 24 ? 0 : segment.endHour, 0, 0, 0);
+                    if (segment.endHour === 24 || windowCloseTime <= new Date(lastSegmentReading.dateString)) {
+                        windowCloseTime.setDate(windowCloseTime.getDate() + 1);
+                    }
+                    const postWindowMinBG = this.getPostWindowMinBG(nightscoutData.glucose, windowCloseTime);
+                    const postWindowClassification = this.classifyPostWindow(postWindowMinBG);
+
+                    let adjustedChangePercent = adjustmentPercent;
+                    let postWindowNote = null;
+                    if (postWindowClassification === 'CORRECTION_DELAYED') {
+                        adjustedChangePercent = 0;
+                        postWindowNote = `Post-window check (${windowCloseTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}+120min): BG reached ${postWindowMinBG} mg/dL — corrections reached target after window closed. Strengthen suppressed.`;
+                    } else if (postWindowClassification === 'CORRECTION_OVERCORRECTED') {
+                        adjustedChangePercent = 0;
+                        postWindowNote = `Post-window check: BG dropped to ${postWindowMinBG} mg/dL — correction overcorrected post-window. Strengthen blocked. Review as ISF_INDUCED_LOW candidate.`;
+                    }
+
                     findings.push({
                         id: `finding_corr_ineff_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.CORRECTION_INEFFECTIVE,
                         detectedAt: new Date().toISOString(),
-                        eventTime: corrections[0]?.created_at || new Date().toISOString(), // BUG-022: Store original timestamp
+                        eventTime: corrections[0]?.created_at || new Date().toISOString(),
                         scheduleTime: isfEntry.time,
                         period: period?.name || segment.name,
                         severity: 0.7,
@@ -3415,13 +3408,18 @@
                         similarEventsCount: corrections.length,
                         daysWithPattern: 1,
                         primaryParameter: 'isf',
-                        suggestedChangePercent: adjustmentPercent,
+                        suggestedChangePercent: adjustedChangePercent,
                         contributingFactors: ['weak_isf', 'persistent_highs'],
                         claimedEventIds: corrections.map(c => getEventId(c)),
                         conflictsWith: [],
                         recencyWeight: 1.0,
                         details: `${segment.name} (${segment.label}): BG averaged ${avgBG.toFixed(0)} mg/dL, staying above ${iapsTarget} target ${aboveTargetPercent.toFixed(0)}% of the time despite ${corrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U total).`,
-                        safetyNote: targetNote,
+                        safetyNote: postWindowNote || targetNote,
+                        postWindowCheck: {
+                            minBG: postWindowMinBG,
+                            classification: postWindowClassification,
+                            recommendationModified: postWindowClassification === 'CORRECTION_DELAYED' || postWindowClassification === 'CORRECTION_OVERCORRECTED'
+                        },
                         segmentAnalysis: {
                             segment: segment.name,
                             timeRange: segment.label,
@@ -4384,11 +4382,31 @@
                     const bgAt120 = bgInWindow[bgInWindow.length - 1];
                     if (bgAt120.sgv <= bgTarget) return;
 
-                    sessions.push({ smb: t, smbTime, bgAt120, bgInWindow });
+                    const postWindowCloseTime = new Date(smbTime.getTime() + 120 * 60 * 1000);
+                    const postWindowMinBG = this.getPostWindowMinBG(nightscoutData.glucose, postWindowCloseTime);
+                    const postWindowClassification = this.classifyPostWindow(postWindowMinBG);
+
+                    sessions.push({ smb: t, smbTime, bgAt120, bgInWindow, postWindowMinBG, postWindowClassification });
                 });
 
                 // §6.2 threshold: 3+ sessions required
                 if (sessions.length < 3) return findings;
+
+                // Most conservative classification across all sessions wins.
+                // OVERCORRECTED > DELAYED > CONFIRMED > null
+                const sessionClassifications = sessions.map(s => s.postWindowClassification);
+                let aggregatePostWindow = 'CONFIRMED_INEFFECTIVE';
+                if (sessionClassifications.some(c => c === 'CORRECTION_OVERCORRECTED')) {
+                    aggregatePostWindow = 'CORRECTION_OVERCORRECTED';
+                } else if (sessionClassifications.some(c => c === 'CORRECTION_DELAYED')) {
+                    aggregatePostWindow = 'CORRECTION_DELAYED';
+                } else if (sessionClassifications.every(c => c === null)) {
+                    aggregatePostWindow = null;
+                }
+                const wakingAdjustedChangePercent = (
+                    aggregatePostWindow === 'CORRECTION_DELAYED' ||
+                    aggregatePostWindow === 'CORRECTION_OVERCORRECTED'
+                ) ? 0 : -5;
 
                 const repr = sessions[0];
                 const isfEntry = getISFForTime(repr.smbTime.toISOString(), isfSchedule);
@@ -4414,7 +4432,7 @@
                     similarEventsCount: sessions.length,
                     daysWithPattern: sessions.length,
                     primaryParameter: 'isf',
-                    suggestedChangePercent: -5,
+                    suggestedChangePercent: wakingAdjustedChangePercent,
                     contributingFactors: ['weak_isf', 'daytime_correction_ineffective', 'cat3_smb', 'cat3_corrections'],
                     // NOTE: 'cat3_corrections' is intentionally written here and read by
                     // getEvidenceQualityMultiplier() to identify waking-hour fasting correction
@@ -4423,7 +4441,12 @@
                     conflictsWith: [],
                     recencyWeight: 1.0,
                     details: `${sessions.length} daytime fasting corrections (Cat3 SMBs) failed to reach within 20 mg/dL of target within 120 minutes. Average BG at 120min: ${avgBGAt120.toFixed(0)} mg/dL (target: ${bgTarget} mg/dL). ISF may be too weak for fasting corrections.`,
-                    safetyNote: null
+                    safetyNote: null,
+                    postWindowCheck: {
+                        minBG: aggregatePostWindow !== null ? Math.min(...sessions.map(s => s.postWindowMinBG).filter(v => v !== null)) : null,
+                        classification: aggregatePostWindow,
+                        recommendationModified: wakingAdjustedChangePercent === 0 && aggregatePostWindow !== null
+                    }
                 });
 
                 sessions.forEach(s => claimedEvents.corrections.add(getEventId(s.smb)));
@@ -8956,7 +8979,6 @@
                     
                     // Calculate Carb-Adjusted Sensitivity from Sheets history
                     let carbAdjSensitivity = null;
-                    let ipc75thBaseline = null;  // Issue 1: from Sheets IPC_75th_Baseline column
                     let sensitivityHistoryLocal = null;
                     const basalTotal = activeSchedules?.basal
                         ? computeBasalDailyTotal(activeSchedules.basal) // BUG-A FIX: duration-weighted
@@ -8985,53 +9007,57 @@
                             
                             // Capture for StateDetector — cachedSheetsEntries React state not yet propagated at detect() call
                             sensitivityHistoryLocal = historyEntries;
-
-                            // Issue 1: extract 75th-pct IPC baseline from the most recent non-today
-                            // entry that has a computed IPC_75th_Baseline value. The sheet formula
-                            // populates this column automatically; we just read it back.
-                            const todayForBaseline = getLocalDateString();
-                            const baselineEntry = [...historyEntries]
-                                .filter(e => e.date !== todayForBaseline && e.ipc75thBaseline)
-                                .sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-                            if (baselineEntry) {
-                                ipc75thBaseline = parseFloat(baselineEntry.ipc75thBaseline) || null;
-                                console.log(`IPC_75th_Baseline from Sheets (${baselineEntry.date}): ${ipc75thBaseline}`);
-                            }
                             
                             if (historyEntries.length > 0) {
-                                // Compute carbAdjSensitivity using non-override sessions with TDD and carbs.
-                                // The clean 75th-pct IPC baseline is maintained by the Sheets formula
-                                // column (IPC_75th_Baseline) and already read into ipc75thBaseline above.
-                                // This calculation produces the CAS metric value only.
+                                // Log first entry fields for debugging
+                                const sample = historyEntries[0];
+                                console.log('Carb-Adjusted: Sample entry fields:', Object.keys(sample));
+                                console.log('Carb-Adjusted: Sample entry values:', {
+                                    tdd24h: sample.tdd24h, 
+                                    carbs24h: sample.carbs24h, 
+                                    isOverride: sample.isOverride,
+                                    date: sample.date
+                                });
+                                
+                                // Filter valid entries (non-override, has TDD and carbs)
                                 const validEntries = historyEntries.filter(e => {
                                     const isOverride = e.isOverride === true || e.isOverride === 'TRUE' || e.isOverride === 'true';
-                                    return !isOverride &&
+                                    return !isOverride && 
                                         e.tdd24h && parseFloat(e.tdd24h) > 0 &&
                                         e.carbs24h && parseFloat(e.carbs24h) > 0;
                                 });
-
-                                console.log(`Carb-Adjusted: ${validEntries.length} valid of ${historyEntries.length} entries`);
-
+                                
+                                console.log(`Carb-Adjusted: ${validEntries.length} valid of ${historyEntries.length} total entries`);
+                                
                                 if (validEntries.length >= 3) {
+                                    // Calculate baseline averages
                                     const avgTDD = validEntries.reduce((sum, e) => sum + parseFloat(e.tdd24h), 0) / validEntries.length;
                                     const avgCarbs = validEntries.reduce((sum, e) => sum + parseFloat(e.carbs24h), 0) / validEntries.length;
-                                    const avgBolus = avgTDD - basalTotal;
+                                    
+                                    // Calculate baseline basal
+                                    let baselineBasal = basalTotal; // From earlier calculation
+                                    
+                                    // Calculate baseline bolus per carb
+                                    const avgBolus = avgTDD - baselineBasal;
                                     const baselineBolusPerCarb = avgBolus / avgCarbs;
+                                    
+                                    // Calculate expected TDD for today's carbs
                                     const expectedBolus = baselineBolusPerCarb * totalCarbs24h;
-                                    const expectedTDD = expectedBolus + basalTotal;
+                                    const expectedTDD = expectedBolus + baselineBasal;
+                                    
+                                    // Carb-Adjusted Sensitivity = Expected / Actual
                                     carbAdjSensitivity = expectedTDD / tdd24h;
-
+                                    
                                     console.log('Carb-Adjusted calculation:', {
                                         validEntries: validEntries.length,
                                         avgTDD: avgTDD.toFixed(1),
                                         avgCarbs: avgCarbs.toFixed(0),
-                                        basalTotal: basalTotal.toFixed(1),
+                                        baselineBasal: baselineBasal.toFixed(1),
                                         baselineBolusPerCarb: baselineBolusPerCarb.toFixed(3),
                                         todayCarbs: totalCarbs24h,
                                         expectedTDD: expectedTDD.toFixed(1),
                                         actualTDD: tdd24h,
-                                        carbAdjSensitivity: carbAdjSensitivity.toFixed(2),
-                                        ipc75thBaseline: ipc75thBaseline
+                                        carbAdjSensitivity: carbAdjSensitivity.toFixed(2)
                                     });
                                 } else {
                                     console.log(`Insufficient history for Carb-Adjusted calculation (${validEntries.length} entries, need 3+)`);
@@ -9379,11 +9405,7 @@
                         changeHistory,
                         userOverride.active ? userOverride : null,
                         carbAdjSensitivity || null,
-                        sensitivityHistoryLocal,
-                        ipc75thBaseline,     // Issue 1: 75th-pct IPC from Sheets
-                        basalTotal || 0,
-                        totalCarbs24h || 0,
-                        tdd24h || 0
+                        sensitivityHistoryLocal
                     );
                     
                     // Spec 2A / v3.5.26: Stamp sessionSensitivity on findings using
