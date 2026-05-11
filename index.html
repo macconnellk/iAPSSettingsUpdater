@@ -4622,31 +4622,6 @@
                         return;
                     }
 
-                    // Gate C: no APS zero-temp (enacted.rate === 0 strictly, not null) in prior 90 min
-                    const gateC_cutoff = new Date(readingTime.getTime() - 90 * 60 * 1000);
-                    const failsGateC = (nightscoutData.deviceStatus || []).some(s => {
-                        if (!s.created_at) return false;
-                        const sTime = new Date(s.created_at);
-                        return sTime >= gateC_cutoff && sTime <= readingTime &&
-                               s.openaps?.enacted?.rate === 0;
-                    });
-                    if (failsGateC) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateC' });
-                    // TEMP DIAGNOSTIC — remove after diagnosis
-                    {
-                        const _diagHour = readingTime.getHours();
-                        if (_diagHour >= 22 || _diagHour < 6) {
-                            const _last = candidateReadings[candidateReadings.length - 1];
-                            console.log(`[CW-DIAG] ${readingTime.toISOString().slice(11,16)} | ` +
-                                `closestStatus: ${closestStatus ? 'found' : 'NULL'} | ` +
-                                `cob: ${cob} | ` +
-                                `rejectedBy: ${_last?.rejectedBy ?? 'CLEAN'}`
-                            );
-                        }
-                    }
-                        return;
-                    }
-
                     // Passed all gates — clean window
                     candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: null });
                     // TEMP DIAGNOSTIC — remove after diagnosis
