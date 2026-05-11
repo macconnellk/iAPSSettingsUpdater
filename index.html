@@ -1437,102 +1437,97 @@
                 };
             },
             
+            // Part A helper: maps overnight segment names to basal schedule times
+            getBasalHourForSegment(segmentName) {
+                const map = {
+                    'Late Evening':  '22:00',
+                    'Early Night':   '00:00',
+                    'Mid Night':     '03:00',
+                    'Late Night':    '05:00',
+                    'Pre-Breakfast': '07:00',
+                    'Morning':       '08:00',
+                };
+                return map[segmentName] || null;
+            },
+
             findingToRecommendation(finding, schedules, basalRatioInfo = null) {
                 if (finding.type === FindingType.MIXED_ATTRIBUTION) return null;
                 if (finding.type === FindingType.RESISTANT_HIGH) return null;
+                if (finding.type === FindingType.PRESSURE_ARTIFACT) return null;
                 if (!finding.primaryParameter || !finding.scheduleTime) return null;
-                
-                const schedule = schedules[finding.primaryParameter.toLowerCase()];
-                if (!schedule) return null;
-                
-                const currentEntry = schedule.find(e => e.time === finding.scheduleTime);
-                if (!currentEntry) return null;
-                
-                const changePercent = finding.suggestedChangePercent || 
+
+                // Part A: basal_insufficiency routing.
+                let effectiveParameter = finding.primaryParameter;
+                let effectiveScheduleTime = finding.scheduleTime;
+                let effectiveChangePercent = finding.suggestedChangePercent ||
                     (this.isStrengthening(finding) ? -2 : 5);
-                
+
+                if (
+                    finding.type === FindingType.CORRECTION_INEFFECTIVE &&
+                    finding.diagnosticContext?.patternType === 'basal_insufficiency'
+                ) {
+                    effectiveParameter = 'basal';
+                    const segmentHour = finding.segmentAnalysis
+                        ? this.getBasalHourForSegment(finding.segmentAnalysis.segment)
+                        : null;
+                    effectiveScheduleTime = segmentHour || finding.scheduleTime;
+                    effectiveChangePercent = 10;
+                }
+
+                const schedule = schedules[effectiveParameter.toLowerCase()];
+                if (!schedule) return null;
+                const currentEntry = schedule.find(e => e.time === effectiveScheduleTime);
+                if (!currentEntry) return null;
+
                 let newValue;
-                let ratioProtected = false;
-                let ratioProtectionReason = null;
-                
-                if (finding.primaryParameter === 'basal') {
-                    // For basal, round to pump increment (0.05)
-                    const rawNew = currentEntry.value * (1 + changePercent / 100);
+                if (effectiveParameter === 'basal') {
+                    const rawNew = currentEntry.value * (1 + effectiveChangePercent / 100);
                     newValue = Math.round(rawNew * 20) / 20;
-                    
-                    // Ensure at least one pump increment of change if any change was requested
-                    if (newValue === currentEntry.value && changePercent !== 0) {
-                        // Force at least one increment in the direction of change
-                        newValue = changePercent > 0 
+                    if (newValue === currentEntry.value && effectiveChangePercent !== 0) {
+                        newValue = effectiveChangePercent > 0
                             ? currentEntry.value + CONFIG.pumpIncrement
                             : currentEntry.value - CONFIG.pumpIncrement;
-                        // Clamp to minimum 0.05
                         newValue = Math.max(CONFIG.pumpIncrement, newValue);
                     }
-                    newValue = Math.round(newValue * 20) / 20; // Final rounding
-                    
-                    // Apply ratio protection for basal changes
-                    if (basalRatioInfo && basalRatioInfo.exceedsCap) {
-                        const targetRatioCap = 2.0;
-                        const isDecrease = newValue < currentEntry.value;
-                        const isIncrease = newValue > currentEntry.value;
-                        
-                        if (isDecrease) {
-                            // When decreasing and ratio already exceeded:
-                            // Don't allow ANY rate to go to or below current minimum
-                            // This prevents entrenching low rates
-                            const minAllowedRate = Math.round((basalRatioInfo.maxRate / targetRatioCap) * 20) / 20;
-                            const strictMinRate = basalRatioInfo.minRate + CONFIG.pumpIncrement; // Stay above current min
-                            const effectiveMin = Math.max(minAllowedRate, strictMinRate);
-                            
-                            if (newValue < effectiveMin) {
-                                console.log(`Ratio protection: Blocking decrease from ${currentEntry.value} to ${newValue} (min allowed: ${effectiveMin})`);
-                                // If current value is already at or near min, block entirely
-                                if (currentEntry.value <= effectiveMin) {
-                                    newValue = currentEntry.value; // No change
-                                    ratioProtected = true;
-                                    ratioProtectionReason = `Rate already at/near minimum (${basalRatioInfo.minRate} U/hr) - cannot decrease further`;
-                                } else {
-                                    newValue = effectiveMin; // Clamp to minimum allowed
-                                    ratioProtected = true;
-                                    ratioProtectionReason = `Clamped to ${effectiveMin} U/hr floor to protect ratio`;
-                                }
-                            }
-                        } else if (isIncrease) {
-                            // When increasing: don't go above (minRate * targetRatioCap)
-                            const maxAllowedRate = Math.round((basalRatioInfo.minRate * targetRatioCap) * 20) / 20;
-                            if (newValue > maxAllowedRate) {
-                                console.log(`Ratio protection: Blocking increase from ${currentEntry.value} to ${newValue} (max allowed: ${maxAllowedRate})`);
-                                newValue = Math.min(currentEntry.value, maxAllowedRate); // Don't increase past threshold
-                                ratioProtected = true;
-                                ratioProtectionReason = `Would worsen ratio above ${maxAllowedRate} U/hr ceiling`;
-                            }
-                        }
-                    }
+                    newValue = Math.round(newValue * 20) / 20;
                 } else {
-                    newValue = parseFloat((currentEntry.value * (1 + changePercent / 100)).toFixed(1));
+                    newValue = parseFloat((currentEntry.value * (1 + effectiveChangePercent / 100)).toFixed(1));
                 }
-                
-                // If ratio protection blocked the change entirely, don't create recommendation
-                if (newValue === currentEntry.value) {
-                    if (ratioProtected) {
-                        console.log(`Ratio protection: Skipping recommendation for ${finding.scheduleTime} - change blocked to maintain ratio`);
-                    }
-                    return null;
-                }
-                
-                // Recalculate actual change percent based on rounded values
+
+                if (newValue === currentEntry.value) return null;
+
                 const actualChangePercent = ((newValue - currentEntry.value) / currentEntry.value) * 100;
-                
+
+                // Part B: ratio soft warning — never blocks.
+                let ratioWarning = null;
+                if (basalRatioInfo && effectiveParameter === 'basal') {
+                    const currentMax = basalRatioInfo.maxRate;
+                    const currentMin = basalRatioInfo.minRate;
+                    const cap = basalRatioInfo.cap || CONFIG.basalRatioCap;
+                    const newMax = Math.max(newValue, currentMax);
+                    const newRatio = newMax / currentMin;
+                    if (newRatio > cap) {
+                        const minNeededForRatio = Math.ceil((newMax / cap) * 20) / 20;
+                        ratioWarning = {
+                            currentRatio: basalRatioInfo.ratio || basalRatioInfo.value,
+                            newRatio: parseFloat(newRatio.toFixed(2)),
+                            cap,
+                            minimumHour: basalRatioInfo.minHour || null,
+                            minimumCurrentRate: currentMin,
+                            minimumNeededForRatio: minNeededForRatio,
+                            minimumChangeNeeded: parseFloat((minNeededForRatio - currentMin).toFixed(2))
+                        };
+                    }
+                }
+
                 return {
-                    param: finding.primaryParameter,
-                    scheduleTime: finding.scheduleTime,
+                    param: effectiveParameter,
+                    scheduleTime: effectiveScheduleTime,
                     currentValue: currentEntry.value,
                     newValue,
                     changePercent: actualChangePercent,
-                    protectionLevel: ratioProtected ? ProtectionLevel.CAUTION : ProtectionLevel.CLEAR,
-                    protectionReason: ratioProtectionReason,
-                    ratioProtected
+                    protectionLevel: ProtectionLevel.CLEAR,
+                    ratioWarning
                 };
             },
             
@@ -5894,114 +5889,30 @@
                 
                 output += `---\n\n`;
                 
-                // Basal Optimization Section
-                if (analysisResults.basalOptimization && analysisResults.basalOptimization.distribution?.direction !== 'none') {
-                    output += `## Proposed Basal Schedule\n\n`;
-                    
-                    // BUG-023: Show safety override warning if active
-                    if (analysisResults.basalOptimization.safetyOverride) {
-                        output += `**Safety Override Active:** ${analysisResults.basalOptimization.safetyOverrideReason}\n\n`;
-                    }
-                    
-                    const dist = analysisResults.basalOptimization.distribution;
-                    const change = dist.proposedTotal - dist.currentTotal;
-                    
-                    // Show the reasoning (BUG-022: add context)
-                    const tdd = analysisResults.tdd || analysisResults.basalOptimization.tdd;
-                    const finalPercent = analysisResults.finalPercent;
-                    if (tdd && finalPercent) {
-                        const targetBasal = (finalPercent / 100) * tdd;
-                        output += `**Target:** ${finalPercent.toFixed(1)}% of ${tdd.toFixed(1)} U TDD = ${targetBasal.toFixed(2)} U/day basal\n\n`;
-                    }
-                    
-                    output += `**Summary:** ${dist.currentTotal.toFixed(2)} U/day → ${dist.proposedTotal.toFixed(2)} U/day (${change >= 0 ? '+' : ''}${change.toFixed(2)} U, ${dist.incrementsNeeded} increments)\n\n`;
-
-                    const effectiveChanges = analysisResults.basalOptimization
-                        .hourlyChanges.filter(h => h.hasChange).length;
-
-                    if (effectiveChanges === 0 && dist.incrementsNeeded !== 0) {
-                        output += `_Note: ${Math.abs(dist.incrementsNeeded)} increment(s) indicated but absorbed by pump rounding — no rate changes required._\n\n`;
-                    }
-
-                    if (dist.method === 'proportional-no-signal') {
-                        output += `_Proposed adjustment: uniform ${
-                            ((dist.scaleFactor - 1) * 100).toFixed(1)
-                        }% proportional scaling — no period signal available, schedule shape preserved._\n\n`;
-                    }
-                    if (dist.method === 'proportional-agp-gated') {
-                        output += `_Proposed adjustment: AGP-gated proportional scaling — low-excluded hours frozen, schedule shape preserved in remaining hours._\n\n`;
-                    }
-                    if (dist.method === 'no-safe-hours') {
-                        output += `_No distribution applied — all hours excluded by AGP low gate. No basal changes proposed._\n\n`;
-                    }
-
-                    output += `| Hour | Current | Proposed | Change |\n`;
-                    output += `|------|---------|----------|--------|\n`;
-                    
-                    analysisResults.basalOptimization.hourlyChanges.forEach(h => {
-                        if (h.hasChange) {
-                            const changeStr = `${h.change >= 0 ? '+' : ''}${h.change.toFixed(2)}`;
-                            output += `| ${h.hour} | ${h.current.toFixed(2)} | **${h.proposed.toFixed(2)}** | ${changeStr} |\n`;
-                        }
+                // Part C: Projected Basal Schedule markdown output
+                if (analysisResults.projectedBasalSchedule?.hasChanges) {
+                    const pbs = analysisResults.projectedBasalSchedule;
+                    const delta = pbs.projectedTotal - pbs.currentTotal;
+                    output += `## Projected Basal Schedule (if tonight's actions applied)\n\n`;
+                    output += `Current: ${pbs.currentTotal.toFixed(2)} U/day → Projected: ${pbs.projectedTotal.toFixed(2)} U/day (${delta >= 0 ? '+' : ''}${delta.toFixed(2)} U)\n\n`;
+                    output += `| Hour | Current | Projected | Change | Source |\n`;
+                    output += `|------|---------|-----------|--------|--------|\n`;
+                    pbs.changes.forEach(entry => {
+                        const chg = entry.rec.newValue - entry.rec.currentValue;
+                        output += `| ${entry.rec.scheduleTime} | ${entry.rec.currentValue.toFixed(2)} | **${entry.rec.newValue.toFixed(2)}** | ${chg >= 0 ? '+' : ''}${chg.toFixed(2)} | ${entry.rec.sourceBundleName} |\n`;
                     });
                     output += `\n`;
-                    
-                    // Show distribution info
-                    const parts = [];
-                    if (dist.matchingPeriods?.length > 0) {
-                        parts.push(`Signal-aligned: ${dist.matchingPeriods.join(', ')}`);
-                    }
-                    if (dist.neutralPeriods?.length > 0) {
-                        parts.push(`Neutral: ${dist.neutralPeriods.join(', ')}`);
-                    }
-                    if (dist.skippedPeriods?.length > 0) {
-                        parts.push(`Skipped (opposite signal): ${dist.skippedPeriods.join(', ')}`);
-                    }
-                    if (parts.length > 0) {
-                        output += `**Distribution:** ${parts.join(' | ')}\n`;
-                    }
-                    if (dist.incrementsSkipped > 0) {
-                        output += `⚠️ ${dist.incrementsSkipped} increment(s) not applied - no suitable periods available.\n`;
-                    }
-                    // Show ratio protection info
-                    if (dist.ratioProtection?.active) {
-                        output += `🛡️ **Ratio Protection:** ${dist.ratioProtection.blockedCount} change(s) blocked to maintain ≤2:1 ratio (min rate floor: ${dist.ratioProtection.minAllowedRate} U/hr)\n`;
-                    }
-
-                    // AGP_HIGH periods — surfaces for Claude judgment, no auto-distribution
-                    if (dist.agpHighPeriods?.length > 0) {
-                        output += `\n**AGP_HIGH Periods (no clean windows — apply clinical judgment):**\n`;
-                        const fmtH = h => `${String(h).padStart(2, '0')}:00`;
-                        dist.agpHighPeriods.forEach(periodName => {
-                            const candidates = dist.agpHighCandidateHours?.[periodName] || [];
-                            const period = CIRCADIAN_PERIODS?.find(p => p.name === periodName);
-                            const allHours = period
-                                ? Array.from({ length: period.endHour - period.startHour },
-                                    (_, i) => period.startHour + i)
-                                : [];
-                            const excluded = allHours.filter(h =>
-                                dist.lowExcludedHours?.includes(h) && !candidates.includes(h)
-                            );
-                            const candidateStr = candidates.length > 0
-                                ? `Candidate hours: ${candidates.map(fmtH).join(', ')}`
-                                : 'No candidate hours';
-                            const excludedStr = excluded.length > 0
-                                ? ` (${excluded.map(fmtH).join(', ')} excluded — recent lows present)`
-                                : '';
-                            output += `- ${periodName}: high% above threshold (7-day structural). ${candidateStr}${excludedStr}. No automated distribution applied — recommend 1–2 first-step increases (0.05 U/hr) at clinical judgment.\n`;
+                    if (pbs.ratioWarnings?.length > 0) {
+                        pbs.ratioWarnings.forEach(rw => {
+                            output += `   - ⚠️ **Ratio Warning:** This change raises basal ratio to ${rw.newRatio}:1 `;
+                            output += `(cap ${rw.cap}:1). To maintain ratio, ${rw.minimumHour} basal `;
+                            output += `would need to increase from ${rw.minimumCurrentRate} → ${rw.minimumNeededForRatio} U/hr `;
+                            output += `(+${rw.minimumChangeNeeded} U/hr).\n\n`;
                         });
-                        output += `\n`;
                     }
-
-                    // Low-excluded hours
-                    if (dist.lowExcludedHours?.length > 0) {
-                        const fmtHour = h => `${String(h).padStart(2, '0')}:00`;
-                        output += `**Low-excluded hours (frozen — AGP lows present):** ${dist.lowExcludedHours.map(fmtHour).join(', ')}\n`;
-                    }
-
-                    output += `\n`;
+                } else {
+                    output += `## Proposed Basal Schedule\n\nNo basal changes in tonight's recommendations.\n\n`;
                 }
-                
                 output += `---\n\n`;
                 
                 // Next Steps section (when blocked items exist)
@@ -9352,21 +9263,9 @@
                         hourlyAgpStats48h = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 2));
                     }
 
-                    const basalOptimization = BasalOptimizer.generateProposedSchedule({
-                        currentBasalSchedule: activeSchedules.basal,
-                        periodSignals: signalAnalysis?.periods,
-                        finalPercent: finalPercent,
-                        tdd: tddForSignal,
-                        hourlyAgpStats7d,
-                        hourlyAgpStats48h
-                    });
-                    
-                    // Add safety override info to optimization result
-                    if (basalOptimization) {
-                        basalOptimization.safetyOverride = safetyOverrideActive;
-                        basalOptimization.safetyOverrideReason = safetyOverrideReason;
-                    }
-                    
+                    // Part C: generateProposedSchedule retained but no longer called.
+                    const basalOptimization = null;
+
                     // Detect body state
                     const changeHistory = ChangeTracker.getHistory();
                     const detectedState = StateDetector.detect(
@@ -9463,7 +9362,47 @@
                         schedules,
                         basalRatioInfo
                     );
-                    
+
+                    // Part C: Build projected basal schedule from bundle recommendations.
+                    const buildProjectedBasalSchedule = (currentBasalSchedule, bundles) => {
+                        const basalRecs = [];
+                        bundles.forEach(bundle => {
+                            (bundle.recommendations || []).forEach(rec => {
+                                if (rec.param === 'basal' && rec.newValue !== rec.currentValue) {
+                                    basalRecs.push({
+                                        scheduleTime: rec.scheduleTime,
+                                        currentValue: rec.currentValue,
+                                        newValue: rec.newValue,
+                                        changePercent: rec.changePercent,
+                                        sourceBundleName: bundle.name,
+                                        sourcePriority: bundle.priority,
+                                        ratioWarning: rec.ratioWarning || null
+                                    });
+                                }
+                            });
+                        });
+                        if (basalRecs.length === 0) {
+                            return { hasChanges: false, changes: [], currentTotal: null, projectedTotal: null };
+                        }
+                        const projected = (currentBasalSchedule || []).map(entry => {
+                            const rec = basalRecs.find(r => r.scheduleTime === entry.time);
+                            return rec ? { ...entry, value: rec.newValue, rec } : { ...entry, rec: null };
+                        });
+                        const currentTotal  = (currentBasalSchedule || []).reduce((s, e) => s + e.value, 0);
+                        const projectedTotal = projected.reduce((s, e) => s + e.value, 0);
+                        return {
+                            hasChanges: true,
+                            changes: projected.filter(e => e.rec !== null),
+                            allHours: projected,
+                            currentTotal,
+                            projectedTotal,
+                            ratioWarnings: basalRecs.filter(r => r.ratioWarning).map(r => r.ratioWarning)
+                        };
+                    };
+                    const projectedBasalSchedule = buildProjectedBasalSchedule(
+                        activeSchedules.basal, processedBundles
+                    );
+
                     // Set results
                     setAnalysisResults({
                         findings: aggregatedFindings,
@@ -9475,7 +9414,8 @@
                         effectiveBasalTarget,
                         effectiveTargetSource,
                         finalPercent,
-                        basalOptimization,
+                        basalOptimization,           // retained for compatibility (null)
+                        projectedBasalSchedule,      // Part C: finding-driven projection
                         tdd: tddForSignal,  // For calculations (2-week preferred)
                         tdd24h: tdd24h,     // 24-hour TDD for trend comparison
                         tdd2Week: tdd2Week, // 2-week TDD for stable baseline
@@ -10543,6 +10483,9 @@
                                                 {analysisResults.signalAnalysis.weightedDeviation.toFixed(1)} mg/dL from target
                                             </div>
                                         )}
+                                        <div className="mt-2 text-xs text-gray-600 italic">
+                                            Basal recommendations are driven by parametric findings, not this ratio.
+                                        </div>
                                     </div>
                                 )}
                                 
