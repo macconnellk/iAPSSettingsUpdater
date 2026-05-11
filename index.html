@@ -1395,9 +1395,19 @@
             },
             
             createBundle(id, name, tier, findings, schedules, basalRatioInfo = null) {
-                const recommendations = findings.map(f => 
+                const allRecommendations = findings.map(f => 
                     this.findingToRecommendation(f, schedules, basalRatioInfo)
                 ).filter(r => r !== null);
+
+                // Deduplicate: multiple findings at the same schedule time often produce
+                // identical recommendations. Keep the first occurrence per param+time+value.
+                const seen = new Set();
+                const recommendations = allRecommendations.filter(rec => {
+                    const key = `${rec.param}_${rec.scheduleTime}_${rec.newValue}`;
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                });
                 
                 const confidence = findings.length > 0
                     ? findings.reduce((sum, f) => sum + (f.calculatedConfidence || f.severity || 0.5), 0) / findings.length
