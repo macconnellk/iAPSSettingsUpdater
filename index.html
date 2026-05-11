@@ -6261,13 +6261,18 @@
                             }
                             // Signal support from structural findings (fix operator precedence)
                             if (f.type === 'basal_signal_low' || f.type === 'basal_signal_high') {
+                                // Read date distribution from signalAnalysis.periods — authoritative source.
+                                // f.windowsByDate/contributingDayCount may be stale if finding was cached;
+                                // the period object is always freshly computed for this session.
+                                const matchingPeriod = analysisResults.signalAnalysis?.periods
+                                    ?.find(p => p.name === f.period);
                                 evidence.signalSupport = {
                                     period: f.period || f.scheduleTime,
                                     deviation: evt0.medianDeviation ?? f.medianDeviation ?? null,
                                     signal: evt0.signal ?? f.signal ?? null,
                                     cleanWindows: evt0.cleanWindows ?? null,
-                                    contributingDayCount: f.contributingDayCount ?? null,
-                                    windowsByDate: f.windowsByDate ?? null,
+                                    contributingDayCount: matchingPeriod?.contributingDayCount ?? f.contributingDayCount ?? null,
+                                    windowsByDate: matchingPeriod?.windowsByDate ?? f.windowsByDate ?? null,
                                 };
                             }
                         });
