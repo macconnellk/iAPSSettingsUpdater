@@ -143,7 +143,7 @@
             maxISFStrengthen: 0.03,
             
             // Basal constraints
-            basalRatioCap: 3.1,
+            basalRatioCap: 2.5,
             pumpIncrement: 0.05,
             
             // State detection
@@ -3142,31 +3142,6 @@
             },
             
             /**
-             * Returns the minimum CGM reading in the 120-minute window after windowCloseTime.
-             * Returns null if no readings exist in that window.
-             */
-            getPostWindowMinBG(glucose, windowCloseTime) {
-                const checkEnd = new Date(windowCloseTime.getTime() + 120 * 60 * 1000);
-                const postReadings = glucose.filter(r => {
-                    const rt = new Date(r.dateString);
-                    return rt > windowCloseTime && rt <= checkEnd;
-                });
-                if (postReadings.length === 0) return null;
-                return Math.min(...postReadings.map(r => r.sgv));
-            },
-
-            /**
-             * Classifies post-window minimum BG into one of three outcomes.
-             * Returns null when no post-window data is available.
-             */
-            classifyPostWindow(minBG) {
-                if (minBG === null) return null;
-                if (minBG > 115) return 'CONFIRMED_INEFFECTIVE';
-                if (minBG >= 70)  return 'CORRECTION_DELAYED';
-                return 'CORRECTION_OVERCORRECTED';
-            },
-
-            /**
              * DETECTOR 6: Correction Ineffectiveness
              * Pattern: Overnight corrections fail to bring BG to target
              * Output: Finding of type CORRECTION_INEFFECTIVE (ISF strengthening)
@@ -3370,34 +3345,12 @@
                     const period = CIRCADIAN_PERIODS.find(p => 
                         segmentMidpointHour >= p.startHour && segmentMidpointHour < p.endHour
                     );
-
-                    // Post-window nadir check: corrections late in segment may peak after
-                    // window closes. Compute window close time for this segment-night and
-                    // check the 120-minute window following it.
-                    const lastSegmentReading = sortedReadings[sortedReadings.length - 1];
-                    const windowCloseTime = new Date(lastSegmentReading.dateString);
-                    windowCloseTime.setHours(segment.endHour === 24 ? 0 : segment.endHour, 0, 0, 0);
-                    if (segment.endHour === 24 || windowCloseTime <= new Date(lastSegmentReading.dateString)) {
-                        windowCloseTime.setDate(windowCloseTime.getDate() + 1);
-                    }
-                    const postWindowMinBG = this.getPostWindowMinBG(nightscoutData.glucose, windowCloseTime);
-                    const postWindowClassification = this.classifyPostWindow(postWindowMinBG);
-
-                    let adjustedChangePercent = adjustmentPercent;
-                    let postWindowNote = null;
-                    if (postWindowClassification === 'CORRECTION_DELAYED') {
-                        adjustedChangePercent = 0;
-                        postWindowNote = `Post-window check (${windowCloseTime.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}+120min): BG reached ${postWindowMinBG} mg/dL — corrections reached target after window closed. Strengthen suppressed.`;
-                    } else if (postWindowClassification === 'CORRECTION_OVERCORRECTED') {
-                        adjustedChangePercent = 0;
-                        postWindowNote = `Post-window check: BG dropped to ${postWindowMinBG} mg/dL — correction overcorrected post-window. Strengthen blocked. Review as ISF_INDUCED_LOW candidate.`;
-                    }
-
+                    
                     findings.push({
                         id: `finding_corr_ineff_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.CORRECTION_INEFFECTIVE,
                         detectedAt: new Date().toISOString(),
-                        eventTime: corrections[0]?.created_at || new Date().toISOString(),
+                        eventTime: corrections[0]?.created_at || new Date().toISOString(), // BUG-022: Store original timestamp
                         scheduleTime: isfEntry.time,
                         period: period?.name || segment.name,
                         severity: 0.7,
@@ -3408,18 +3361,13 @@
                         similarEventsCount: corrections.length,
                         daysWithPattern: 1,
                         primaryParameter: 'isf',
-                        suggestedChangePercent: adjustedChangePercent,
+                        suggestedChangePercent: adjustmentPercent,
                         contributingFactors: ['weak_isf', 'persistent_highs'],
                         claimedEventIds: corrections.map(c => getEventId(c)),
                         conflictsWith: [],
                         recencyWeight: 1.0,
                         details: `${segment.name} (${segment.label}): BG averaged ${avgBG.toFixed(0)} mg/dL, staying above ${iapsTarget} target ${aboveTargetPercent.toFixed(0)}% of the time despite ${corrections.length} corrections (${totalCorrectionInsulin.toFixed(2)}U total).`,
-                        safetyNote: postWindowNote || targetNote,
-                        postWindowCheck: {
-                            minBG: postWindowMinBG,
-                            classification: postWindowClassification,
-                            recommendationModified: postWindowClassification === 'CORRECTION_DELAYED' || postWindowClassification === 'CORRECTION_OVERCORRECTED'
-                        },
+                        safetyNote: targetNote,
                         segmentAnalysis: {
                             segment: segment.name,
                             timeRange: segment.label,
@@ -3722,10 +3670,43 @@
                     const mealTime = new Date(governingMeal.created_at);
                     const minsFromMealToLow = (lowTime - mealTime) / 60000;
 
+                    // Minimum onset guard: rapid-acting insulin requires ~20 min to begin
+                    // meaningful BG-lowering action. If the governing meal was bolused < 20 min
+                    // before the nadir, it cannot be the causal mechanism. Fall back to the
+                    // prior meal in the window (e.g. the 09:30 snack when lunch bolus fires at 12:30
+                    // and nadir is at 12:42 driven by snack completion IOB tail).
+                    let effectiveGoverningMeal = governingMeal;
+                    let effectiveMealTime = mealTime;
+                    let effectiveMinsFromMealToLow = minsFromMealToLow;
+
+                    if (minsFromMealToLow < 20) {
+                        const priorMeal = nightscoutData.treatments
+                            .filter(t => {
+                                if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution) return false;
+                                if (!t.created_at) return false;
+                                const tt = new Date(t.created_at);
+                                if (!(tt >= fourHoursBefore && tt < mealTime)) return false;
+                                const bgAtEntry = nightscoutData.glucose.find(r =>
+                                    Math.abs(new Date(r.dateString) - tt) < 10 * 60 * 1000
+                                );
+                                if (bgAtEntry && bgAtEntry.sgv < 80) return false;
+                                return true;
+                            })
+                            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+
+                        if (priorMeal) {
+                            effectiveGoverningMeal = priorMeal;
+                            effectiveMealTime = new Date(priorMeal.created_at);
+                            effectiveMinsFromMealToLow = (lowTime - effectiveMealTime) / 60000;
+                        }
+                        // If no prior meal exists, keep original governing meal.
+                        // Axis scoring will produce a weak signal at ≤20 min — correct behavior.
+                    }
+
                     // §5.6 Step 3: SMB decomposition
                     const decomp = this._decomposeSMBs(
                         nightscoutData.treatments, nightscoutData.glucose,
-                        mealTime, governingMeal.carbs, crSchedule
+                        effectiveMealTime, effectiveGoverningMeal.carbs, crSchedule
                     );
 
                     const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
@@ -3736,18 +3717,18 @@
 
                     // §5.7 Step 4: Axis scoring
                     const crScore = this._scoreCRAxisLow(
-                        decomp, minsFromMealToLow,
-                        nightscoutData.glucose, mealTime, lowTime
+                        decomp, effectiveMinsFromMealToLow,
+                        nightscoutData.glucose, effectiveMealTime, lowTime
                     );
                     const isfScore = this._scoreISFAxisLow(decomp, correctionToEvent, iobAtLow);
                     const basalScore = this._scoreBasalAxisLow(
-                        decomp, minsFromMealToLow, iobAtLow,
+                        decomp, effectiveMinsFromMealToLow, iobAtLow,
                         nightscoutData.treatments, lowTime, signalAnalysis
                     );
 
                     // §5.8 Step 5: Dominant axis → finding
                     const period = CIRCADIAN_PERIODS.find(p => {
-                        const h = mealTime.getHours();
+                        const h = effectiveMealTime.getHours();
                         return h >= p.startHour && h < p.endHour;
                     });
                     const periodName = period ? period.name : 'Unknown';
@@ -3788,7 +3769,7 @@
                         // MIXED: top two both ≥ 0.35 and within 0.15 of each other
                         if (top.score >= 0.35 && second.score >= 0.35 &&
                             (top.score - second.score) <= 0.15) {
-                            const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
+                            const crEntry = getCRForTime(effectiveMealTime.toISOString(), crSchedule);
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.MIXED_ATTRIBUTION,
@@ -3799,8 +3780,8 @@
                                 primaryParameter: null,
                                 suggestedChangePercent: 0,
                                 contributingFactors: axisFactors,
-                                details: `Low ${low.bg} mg/dL following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
-                                turn1Question: `Low following ${governingMeal.carbs}g meal — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
+                                details: `Low ${low.bg} mg/dL following ${effectiveGoverningMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
+                                turn1Question: `Low following ${effectiveGoverningMeal.carbs}g meal — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
                             };
                         } else if (top.score < 0.4) {
                             // Dominant axis exists but score is too weak → RESISTANT_LOW
@@ -3830,7 +3811,7 @@
                                 details: `Low ${low.bg} mg/dL — basal axis dominant (${basalScore.toFixed(2)}). Near-zero IOB, no recent bolus.`
                             };
                         } else if (top.axis === 'isf') {
-                            const isfEntry = getISFForTime(mealTime.toISOString(), isfSchedule);
+                            const isfEntry = getISFForTime(effectiveMealTime.toISOString(), isfSchedule);
                             const adj = (correctionToEvent !== null && correctionToEvent < 60)
                                 ? 7.5 : 5;
                             finding = {
@@ -3847,7 +3828,7 @@
                             };
                         } else {
                             // CR axis dominant → DIRECT_MEAL_LOW (§5.9)
-                            const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
+                            const crEntry = getCRForTime(effectiveMealTime.toISOString(), crSchedule);
                             const adj = low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5;
                             const sev = low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.7;
                             finding = {
@@ -3860,7 +3841,7 @@
                                 primaryParameter: 'cr',
                                 suggestedChangePercent: adj,
                                 contributingFactors: [...axisFactors, 'strong_cr'],
-                                details: `Meal (${governingMeal.carbs}g) → Low ${low.bg} mg/dL at ${minsFromMealToLow.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                                details: `Meal (${effectiveGoverningMeal.carbs}g) → Low ${low.bg} mg/dL at ${effectiveMinsFromMealToLow.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
                             };
                         }
                     }
@@ -4382,31 +4363,11 @@
                     const bgAt120 = bgInWindow[bgInWindow.length - 1];
                     if (bgAt120.sgv <= bgTarget) return;
 
-                    const postWindowCloseTime = new Date(smbTime.getTime() + 120 * 60 * 1000);
-                    const postWindowMinBG = this.getPostWindowMinBG(nightscoutData.glucose, postWindowCloseTime);
-                    const postWindowClassification = this.classifyPostWindow(postWindowMinBG);
-
-                    sessions.push({ smb: t, smbTime, bgAt120, bgInWindow, postWindowMinBG, postWindowClassification });
+                    sessions.push({ smb: t, smbTime, bgAt120, bgInWindow });
                 });
 
                 // §6.2 threshold: 3+ sessions required
                 if (sessions.length < 3) return findings;
-
-                // Most conservative classification across all sessions wins.
-                // OVERCORRECTED > DELAYED > CONFIRMED > null
-                const sessionClassifications = sessions.map(s => s.postWindowClassification);
-                let aggregatePostWindow = 'CONFIRMED_INEFFECTIVE';
-                if (sessionClassifications.some(c => c === 'CORRECTION_OVERCORRECTED')) {
-                    aggregatePostWindow = 'CORRECTION_OVERCORRECTED';
-                } else if (sessionClassifications.some(c => c === 'CORRECTION_DELAYED')) {
-                    aggregatePostWindow = 'CORRECTION_DELAYED';
-                } else if (sessionClassifications.every(c => c === null)) {
-                    aggregatePostWindow = null;
-                }
-                const wakingAdjustedChangePercent = (
-                    aggregatePostWindow === 'CORRECTION_DELAYED' ||
-                    aggregatePostWindow === 'CORRECTION_OVERCORRECTED'
-                ) ? 0 : -5;
 
                 const repr = sessions[0];
                 const isfEntry = getISFForTime(repr.smbTime.toISOString(), isfSchedule);
@@ -4432,7 +4393,7 @@
                     similarEventsCount: sessions.length,
                     daysWithPattern: sessions.length,
                     primaryParameter: 'isf',
-                    suggestedChangePercent: wakingAdjustedChangePercent,
+                    suggestedChangePercent: -5,
                     contributingFactors: ['weak_isf', 'daytime_correction_ineffective', 'cat3_smb', 'cat3_corrections'],
                     // NOTE: 'cat3_corrections' is intentionally written here and read by
                     // getEvidenceQualityMultiplier() to identify waking-hour fasting correction
@@ -4441,12 +4402,7 @@
                     conflictsWith: [],
                     recencyWeight: 1.0,
                     details: `${sessions.length} daytime fasting corrections (Cat3 SMBs) failed to reach within 20 mg/dL of target within 120 minutes. Average BG at 120min: ${avgBGAt120.toFixed(0)} mg/dL (target: ${bgTarget} mg/dL). ISF may be too weak for fasting corrections.`,
-                    safetyNote: null,
-                    postWindowCheck: {
-                        minBG: aggregatePostWindow !== null ? Math.min(...sessions.map(s => s.postWindowMinBG).filter(v => v !== null)) : null,
-                        classification: aggregatePostWindow,
-                        recommendationModified: wakingAdjustedChangePercent === 0 && aggregatePostWindow !== null
-                    }
+                    safetyNote: null
                 });
 
                 sessions.forEach(s => claimedEvents.corrections.add(getEventId(s.smb)));
