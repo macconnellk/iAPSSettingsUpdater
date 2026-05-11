@@ -4504,8 +4504,12 @@
             analyzeCleanWindows(nightscoutData, basalWindow, targetBG = 110, basalSchedule = null, isfSchedule = null, tdd = null) {
                 const analysisStart = new Date(Date.now() - basalWindow * 24 * 60 * 60 * 1000);
                 
-                // Find clean windows (IOB < 0.1, COB = 0) with ENH-CAE-001 gates A/B/C.
-                // candidateReadings: all readings passing the IOB/COB filter.
+                // Find clean windows (COB = 0) with ENH-CAE-001 gates A/B/C.
+                // IOB filter removed: iAPS SMB IOB is not a contaminant — it is the loop's
+                // response to the basal signal being measured. Gate B (rate of change ≤ 1.5
+                // mg/dL/min) protects against active correction descent without excluding stable
+                // elevated readings that constitute the basal insufficiency signal.
+                // candidateReadings: all readings passing the COB filter.
                 // rejectedBy null = passed all gates (counts as a clean window).
                 const candidateReadings = [];
                 const cleanWindows = [];
@@ -4526,15 +4530,18 @@
                     const iob = closestStatus.iob || closestStatus.openaps?.iob?.iob || 0;
                     const cob = closestStatus.cob || closestStatus.openaps?.cob?.cob || 0;
 
-                    if (!(iob < 0.1 && cob === 0)) return;
+                    if (cob !== 0) return;
 
-                    // Candidate: passed IOB/COB filter. Now apply gates in order.
+                    // Candidate: passed COB filter. Now apply gates in order.
                     const deviation = reading.sgv - targetBG;
 
-                    // Gate A: no insulin treatment within 180 minutes before reading
+                    // Gate A: no carb entry within 180 minutes before reading.
+                    // Food contamination gate — iAPS SMBs are not food and must not reset
+                    // this clock. A reading is fasting-contaminated only when carbs were logged,
+                    // not when the loop fired an automated correction bolus.
                     const gateA_cutoff = new Date(readingTime.getTime() - 180 * 60 * 1000);
                     const failsGateA = (nightscoutData.treatments || []).some(t =>
-                        t.insulin > 0 && t.created_at &&
+                        t.carbs > 0 && t.created_at &&
                         new Date(t.created_at) > gateA_cutoff &&
                         new Date(t.created_at) <= readingTime
                     );
