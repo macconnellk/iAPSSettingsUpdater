@@ -1183,6 +1183,7 @@
                     // Check for signal conflict
                     const signalConflict = this.checkSignalConflict(finding, signalAnalysis);
                     if (signalConflict) {
+                        if (!finding.conflictsWith) finding.conflictsWith = [];
                         finding.conflictsWith.push(signalConflict);
                     }
                     
@@ -1215,7 +1216,10 @@
 
                 signalFindings.forEach(finding => {
                     const conflict = this.checkSignalConflict(finding, signalAnalysis);
-                    if (conflict) finding.conflictsWith.push(conflict);
+                    if (conflict) {
+                        if (!finding.conflictsWith) finding.conflictsWith = [];
+                        finding.conflictsWith.push(conflict);
+                    }
 
                     const bundle = this.createBundle(
                         `bundle_signal_${finding.scheduleTime}_${finding.type}`,
@@ -1242,7 +1246,10 @@
                     // Check for signal conflicts in non-safety findings too
                     windowFindings.forEach(f => {
                         const conflict = this.checkSignalConflict(f, signalAnalysis);
-                        if (conflict) f.conflictsWith.push(conflict);
+                        if (conflict) {
+                            if (!f.conflictsWith) f.conflictsWith = [];
+                            f.conflictsWith.push(conflict);
+                        }
                     });
                     
                     bundles.push(this.createBundle(
