@@ -1634,9 +1634,25 @@
                     const icon = f.eventsLast24h > 0 ? '✓' : 
                                 f.eventsLast3Days > 0 ? '○' : 
                                 f.isStructural ? '●' : '⚠️';
+
+                    let detail = f.details || 'No details available';
+
+                    // Append window distribution line for basal signal findings
+                    if ((f.type === 'basal_signal_high' || f.type === 'basal_signal_low') &&
+                        f.windowsByDate && Object.keys(f.windowsByDate).length > 0) {
+                        const distStr = Object.entries(f.windowsByDate)
+                            .sort(([a], [b]) => a.localeCompare(b))
+                            .map(([date, count]) => {
+                                const d = new Date(date + 'T12:00:00');
+                                return `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} (${count})`;
+                            })
+                            .join(', ');
+                        detail += ` | Distribution: ${distStr}`;
+                    }
+
                     return {
                         icon,
-                        detail: f.details || 'No details available',
+                        detail,
                         type: f.type,
                         severity: f.severity
                     };
@@ -2972,7 +2988,9 @@
                         claimedEventIds: [],
                         conflictsWith: [],
                         recencyWeight: 0.85,
-                        details: `${period.name} (${period.hours}): ${period.cleanWindowCount} clean windows show median deviation ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL from target.`
+                        details: `${period.name} (${period.hours}): ${period.cleanWindowCount} clean windows from ${period.contributingDayCount ?? '?'} of ${analysisWindow} days show median deviation ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL from target.`,
+                        windowsByDate: period.windowsByDate || {},
+                        contributingDayCount: period.contributingDayCount || 0,
                     });
                 });
                 
@@ -4558,19 +4576,7 @@
                         new Date(t.created_at) <= readingTime
                     );
                     if (failsGateA) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateA' });
-                    // TEMP DIAGNOSTIC — remove after diagnosis
-                    {
-                        const _diagHour = readingTime.getHours();
-                        if (_diagHour >= 22 || _diagHour < 6) {
-                            const _last = candidateReadings[candidateReadings.length - 1];
-                            console.log(`[CW-DIAG] ${readingTime.toISOString().slice(11,16)} | ` +
-                                `closestStatus: ${closestStatus ? 'found' : 'NULL'} | ` +
-                                `cob: ${cob} | ` +
-                                `rejectedBy: ${_last?.rejectedBy ?? 'CLEAN'}`
-                            );
-                        }
-                    }
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: readingTime.toISOString().slice(0,10), rejectedBy: 'gateA' });
                         return;
                     }
 
@@ -4585,19 +4591,7 @@
                         return diffMin > 0 && diffMin <= 20;
                     });
                     if (priorCGM.length === 0) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateB' });
-                    // TEMP DIAGNOSTIC — remove after diagnosis
-                    {
-                        const _diagHour = readingTime.getHours();
-                        if (_diagHour >= 22 || _diagHour < 6) {
-                            const _last = candidateReadings[candidateReadings.length - 1];
-                            console.log(`[CW-DIAG] ${readingTime.toISOString().slice(11,16)} | ` +
-                                `closestStatus: ${closestStatus ? 'found' : 'NULL'} | ` +
-                                `cob: ${cob} | ` +
-                                `rejectedBy: ${_last?.rejectedBy ?? 'CLEAN'}`
-                            );
-                        }
-                    }
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: readingTime.toISOString().slice(0,10), rejectedBy: 'gateB' });
                         return;
                     }
                     const prior = priorCGM.reduce((c, r) =>
@@ -4606,37 +4600,14 @@
                     const deltaTime = (readingTime - new Date(prior.dateString)) / 60000;
                     const deltaBG = reading.sgv - prior.sgv;
                     if (Math.abs(deltaBG / deltaTime) > 4.0) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateB' });
-                    // TEMP DIAGNOSTIC — remove after diagnosis
-                    {
-                        const _diagHour = readingTime.getHours();
-                        if (_diagHour >= 22 || _diagHour < 6) {
-                            const _last = candidateReadings[candidateReadings.length - 1];
-                            console.log(`[CW-DIAG] ${readingTime.toISOString().slice(11,16)} | ` +
-                                `closestStatus: ${closestStatus ? 'found' : 'NULL'} | ` +
-                                `cob: ${cob} | ` +
-                                `rejectedBy: ${_last?.rejectedBy ?? 'CLEAN'}`
-                            );
-                        }
-                    }
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: readingTime.toISOString().slice(0,10), rejectedBy: 'gateB' });
                         return;
                     }
 
                     // Passed all gates — clean window
-                    candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: null });
-                    // TEMP DIAGNOSTIC — remove after diagnosis
-                    {
-                        const _diagHour = readingTime.getHours();
-                        if (_diagHour >= 22 || _diagHour < 6) {
-                            const _last = candidateReadings[candidateReadings.length - 1];
-                            console.log(`[CW-DIAG] ${readingTime.toISOString().slice(11,16)} | ` +
-                                `closestStatus: ${closestStatus ? 'found' : 'NULL'} | ` +
-                                `cob: ${cob} | ` +
-                                `rejectedBy: ${_last?.rejectedBy ?? 'CLEAN'}`
-                            );
-                        }
-                    }
-                    cleanWindows.push({ time: readingTime, bg: reading.sgv, deviation });
+                    const dateStr = readingTime.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+                    candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr, rejectedBy: null });
+                    cleanWindows.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr });
                 });
 
                 // Group by period
@@ -4650,11 +4621,18 @@
                     const rejectedByGate = {
                         gateA: candidatesInPeriod.filter(c => c.rejectedBy === 'gateA').length,
                         gateB: candidatesInPeriod.filter(c => c.rejectedBy === 'gateB').length,
-                        gateC: candidatesInPeriod.filter(c => c.rejectedBy === 'gateC').length,
                     };
                     const windowQuality = candidateWindowCount > 0
                         ? windowsInPeriod.length / candidateWindowCount
                         : 0;
+
+                    // Step 2: Date distribution — how many calendar dates contributed clean windows
+                    const windowsByDate = {};
+                    windowsInPeriod.forEach(w => {
+                        if (w.date) windowsByDate[w.date] = (windowsByDate[w.date] || 0) + 1;
+                    });
+                    const contributingDates = Object.keys(windowsByDate).sort();
+                    const contributingDayCount = contributingDates.length;
 
                     // --- Parameter-change population partitioning ---
                     // If a basal change was applied to any entry in this period's hours during
@@ -4737,6 +4715,9 @@
                         populationSplit,
                         postChangeCount,
                         splitChangeDate: splitChangeDate ? splitChangeDate.toISOString() : null,
+                        windowsByDate,
+                        contributingDates,
+                        contributingDayCount,
                     };
                 });
                 
@@ -6284,7 +6265,9 @@
                                     period: f.period || f.scheduleTime,
                                     deviation: evt0.medianDeviation ?? f.medianDeviation ?? null,
                                     signal: evt0.signal ?? f.signal ?? null,
-                                    cleanWindows: evt0.cleanWindows ?? null
+                                    cleanWindows: evt0.cleanWindows ?? null,
+                                    contributingDayCount: evt0.contributingDayCount ?? null,
+                                    windowsByDate: evt0.windowsByDate ?? null,
                                 };
                             }
                         });
