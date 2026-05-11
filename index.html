@@ -4450,16 +4450,25 @@
                     let cascadeCount = 0;
                     let basalCount = 0;
 
+                    const DRIFT_THRESHOLD_MG = 10; // BG must rise ≥ 10 mg/dL entry→exit to confirm fasting drift
+
                     nights.forEach(readings => {
                         if (readings.length < 4) return;
                         const entryBG = readings[0];
-                        const nadir = Math.min(...readings);
+                        const exitBG  = readings[readings.length - 1];
+                        const nadir   = Math.min(...readings);
+                        const drift   = exitBG - entryBG;
 
                         if (entryBG > 150 && nadir < 70) {
+                            // Carryover cascade: started elevated from upstream meal, crashed to low
                             cascadeCount++;
-                        } else if (entryBG <= 140 && nadir >= 70) {
+                        } else if (entryBG <= 140 && nadir >= 70 && drift >= DRIFT_THRESHOLD_MG) {
+                            // Basal insufficiency: started near-normal, BG drifted upward during fasting
+                            // despite corrections. Drift ≥ 10 mg/dL confirms rising pattern, not stable elevation.
                             basalCount++;
                         }
+                        // Unclassified: no cascade, no confirmed drift. Not counted in totalClassified.
+                        // Includes nights where corrections held BG stable (basal may be adequate).
                     });
 
                     const totalClassified = cascadeCount + basalCount;
@@ -4484,7 +4493,8 @@
                         patternType,
                         cascadeNights: cascadeCount,
                         basalInsufficiencyNights: basalCount,
-                        totalNightsAnalyzed: nights.length
+                        totalNightsAnalyzed: nights.length,
+                        driftThresholdMg: DRIFT_THRESHOLD_MG
                     };
                 });
             }
@@ -10430,11 +10440,7 @@
                                                     </span>
                                                 )}
                                                 {dynamicTarget?.confidence && analysisResults.effectiveTargetSource !== 'signal-fallback' && (
-                                                    <span className={`text-xs px-1.5 py-0.5 rounded ${
-                                                        dynamicTarget.confidence === 'HIGH' ? 'bg-green-500/20 text-green-400' :
-                                                        dynamicTarget.confidence === 'MEDIUM' ? 'bg-yellow-500/20 text-yellow-400' :
-                                                        'bg-orange-500/20 text-orange-400'
-                                                    }`}>
+                                                    <span className="text-xs px-1.5 py-0.5 rounded bg-gray-500/20 text-gray-400">
                                                         {dynamicTarget.confidence}
                                                     </span>
                                                 )}
@@ -10464,11 +10470,7 @@
                                                         {analysisResults.signalAnalysis.signalOnlyAnchor.toFixed(1)}%
                                                     </span>
                                                     {' '}
-                                                    <span className={
-                                                        (analysisResults.signalAnalysis.signalOnlyAnchor - analysisResults.effectiveBasalTarget) > 0.5 ? 'text-red-400' :
-                                                        (analysisResults.signalAnalysis.signalOnlyAnchor - analysisResults.effectiveBasalTarget) < -0.5 ? 'text-blue-400' :
-                                                        'text-green-400'
-                                                    }>
+                                                    <span className="text-gray-500">
                                                         ({(analysisResults.signalAnalysis.signalOnlyAnchor - analysisResults.effectiveBasalTarget) >= 0 ? '+' : ''}
                                                         {(analysisResults.signalAnalysis.signalOnlyAnchor - analysisResults.effectiveBasalTarget).toFixed(1)}%)
                                                     </span>
