@@ -4557,7 +4557,10 @@
                         return;
                     }
 
-                    // Gate B: |deltaBG / deltaTime| ≤ 1.5 mg/dL/min.
+                    // Gate B: artifact guard — excludes CGM sensor artifacts and post-hypoglycemia
+                    // counter-regulatory surges (>4.0 mg/dL/min). Normal physiological overnight
+                    // BG movement (GH rise, dawn phenomenon, correction responses) is not filtered.
+                    // Rising or falling fasting BG is the basal signal, not noise.
                     // No prior reading within 20 minutes → exclude as a precaution.
                     const priorCGM = (nightscoutData.glucose || []).filter(r => {
                         const rt = new Date(r.dateString);
@@ -4573,7 +4576,7 @@
                     );
                     const deltaTime = (readingTime - new Date(prior.dateString)) / 60000;
                     const deltaBG = reading.sgv - prior.sgv;
-                    if (Math.abs(deltaBG / deltaTime) > 1.5) {
+                    if (Math.abs(deltaBG / deltaTime) > 4.0) {
                         candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, rejectedBy: 'gateB' });
                         return;
                     }
