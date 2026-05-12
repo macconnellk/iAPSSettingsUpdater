@@ -3284,32 +3284,33 @@
                     // Skip if had a low (not safe to strengthen)
                     if (hasLow) return;
 
-                    // Meal bolus gate: if a logged meal bolus (carbs + significant insulin)
-                    // fired within the segment window, this is a meal-delivery period, not a
-                    // fasting correction period. Exclude — the BG response is expected post-meal.
-                    const segmentDateRef = readings[0] || corrections[0];
-                    if (segmentDateRef) {
-                        const refTime = new Date(segmentDateRef.dateString || segmentDateRef.created_at);
-                        const segStart = new Date(refTime);
-                        segStart.setHours(segment.startHour, 0, 0, 0);
-                        // Handle overnight segments that cross midnight
-                        if (segment.startHour < 6 && refTime.getHours() >= 22) {
-                            segStart.setDate(segStart.getDate() + 1);
-                        }
-                        const segEnd = new Date(segStart);
-                        const endHourNorm = segment.endHour === 24 ? 0 : segment.endHour;
-                        segEnd.setHours(endHourNorm, 0, 0, 0);
-                        if (segment.endHour === 24 || segEnd <= segStart) {
-                            segEnd.setDate(segEnd.getDate() + 1);
-                        }
+                    // Meal bolus gate — fixed anchor date.
+                    // Use readings[0].dateString to get the correct night's date.
+                    // The segmentAnalysis entry groups readings by getSegmentKey() (night-of date),
+                    // so all readings belong to the same night. Do NOT use a global first reading
+                    // or analysis window start — those produce the wrong date for later nights.
+                    if (readings.length > 0) {
+                        const anchorDate = new Date(readings[0].dateString);
+                        const segmentStart = new Date(
+                            anchorDate.getFullYear(),
+                            anchorDate.getMonth(),
+                            anchorDate.getDate(),
+                            segment.startHour, 0, 0, 0
+                        );
+                        const segmentEnd = new Date(
+                            anchorDate.getFullYear(),
+                            anchorDate.getMonth(),
+                            anchorDate.getDate(),
+                            segment.endHour, 0, 0, 0
+                        );
 
-                        const mealBolusInSegment = (nightscoutData.treatments || []).some(t => {
+                        const hasMealBolus = (nightscoutData.treatments || []).some(t => {
                             if (!t.carbs || t.carbs < 10 || !t.insulin || t.insulin < 1.0) return false;
-                            const tt = new Date(t.created_at);
-                            return tt >= segStart && tt < segEnd;
+                            const tTime = new Date(t.created_at);
+                            return tTime >= segmentStart && tTime < segmentEnd;
                         });
 
-                        if (mealBolusInSegment) return; // Meal delivery period — not a valid fasting correction window
+                        if (hasMealBolus) return;
                     }
                     
                     // Check for treatment rebound pattern (unannounced carb treatment)
