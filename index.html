@@ -3283,6 +3283,34 @@
                     
                     // Skip if had a low (not safe to strengthen)
                     if (hasLow) return;
+
+                    // Meal bolus gate: if a logged meal bolus (carbs + significant insulin)
+                    // fired within the segment window, this is a meal-delivery period, not a
+                    // fasting correction period. Exclude — the BG response is expected post-meal.
+                    const segmentDateRef = readings[0] || corrections[0];
+                    if (segmentDateRef) {
+                        const refTime = new Date(segmentDateRef.dateString || segmentDateRef.created_at);
+                        const segStart = new Date(refTime);
+                        segStart.setHours(segment.startHour, 0, 0, 0);
+                        // Handle overnight segments that cross midnight
+                        if (segment.startHour < 6 && refTime.getHours() >= 22) {
+                            segStart.setDate(segStart.getDate() + 1);
+                        }
+                        const segEnd = new Date(segStart);
+                        const endHourNorm = segment.endHour === 24 ? 0 : segment.endHour;
+                        segEnd.setHours(endHourNorm, 0, 0, 0);
+                        if (segment.endHour === 24 || segEnd <= segStart) {
+                            segEnd.setDate(segEnd.getDate() + 1);
+                        }
+
+                        const mealBolusInSegment = (nightscoutData.treatments || []).some(t => {
+                            if (!t.carbs || t.carbs < 10 || !t.insulin || t.insulin < 1.0) return false;
+                            const tt = new Date(t.created_at);
+                            return tt >= segStart && tt < segEnd;
+                        });
+
+                        if (mealBolusInSegment) return; // Meal delivery period — not a valid fasting correction window
+                    }
                     
                     // Check for treatment rebound pattern (unannounced carb treatment)
                     // Pattern: Low followed by rapid rise (>2 mg/dL/min) to >130
@@ -3797,8 +3825,8 @@
                                 primaryParameter: null,
                                 suggestedChangePercent: 0,
                                 contributingFactors: axisFactors,
-                                details: `Low ${low.bg} mg/dL following ${effectiveGoverningMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
-                                turn1Question: `Low following ${effectiveGoverningMeal.carbs}g meal — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
+                                details: `Low ${low.bg} mg/dL on ${formatTimeForDisplay(low.time)} following ${effectiveGoverningMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
+                                turn1Question: `Low following ${effectiveGoverningMeal.carbs}g meal on ${formatTimeForDisplay(low.time)} — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
                             };
                         } else if (top.score < 0.4) {
                             // Dominant axis exists but score is too weak → RESISTANT_LOW
@@ -4244,8 +4272,8 @@
                                 primaryParameter: null,
                                 suggestedChangePercent: 0,
                                 contributingFactors: axisFactors,
-                                details: `High ${high.bg} mg/dL following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
-                                turn1Question: `High following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}. Did a correction fire and fail, or did BG peak without any correction? Your answer determines whether we adjust CR or ISF.`
+                                details: `High ${high.bg} mg/dL on ${formatTimeForDisplay(high.time)} following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
+                                turn1Question: `High following ${governingMeal.carbs}g meal on ${formatTimeForDisplay(high.time)} — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}. Did a correction fire and fail, or did BG peak without any correction? Your answer determines whether we adjust CR or ISF.`
                             };
                         } else if (top.score < 0.4) {
                             finding = {
