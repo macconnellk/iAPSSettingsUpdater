@@ -3284,11 +3284,12 @@
                     // Skip if had a low (not safe to strengthen)
                     if (hasLow) return;
 
-                    // Meal bolus gate — fixed anchor date.
-                    // Use readings[0].dateString to get the correct night's date.
-                    // The segmentAnalysis entry groups readings by getSegmentKey() (night-of date),
-                    // so all readings belong to the same night. Do NOT use a global first reading
-                    // or analysis window start — those produce the wrong date for later nights.
+                    // Meal bolus gate — fixed anchor date + split treatment check.
+                    // Uses readings[0].dateString as the correct night's anchor.
+                    // iAPS writes meal boluses as two separate Nightscout treatments:
+                    // one with carbs only and one with insulin only. No single object
+                    // has both fields, so the gate checks them across the set of
+                    // treatments in the window rather than on a single object.
                     if (readings.length > 0) {
                         const anchorDate = new Date(readings[0].dateString);
                         const segmentStart = new Date(
@@ -3304,13 +3305,15 @@
                             segment.endHour, 0, 0, 0
                         );
 
-                        const hasMealBolus = (nightscoutData.treatments || []).some(t => {
-                            if (!t.carbs || t.carbs < 10 || !t.insulin || t.insulin < 1.0) return false;
+                        const treatmentsInWindow = (nightscoutData.treatments || []).filter(t => {
                             const tTime = new Date(t.created_at);
                             return tTime >= segmentStart && tTime < segmentEnd;
                         });
 
-                        if (hasMealBolus) return;
+                        const hasMealCarbs  = treatmentsInWindow.some(t => t.carbs  && t.carbs  >= 10);
+                        const hasMealInsulin = treatmentsInWindow.some(t => t.insulin && t.insulin >= 1.0);
+
+                        if (hasMealCarbs && hasMealInsulin) return;
                     }
                     
                     // Check for treatment rebound pattern (unannounced carb treatment)
