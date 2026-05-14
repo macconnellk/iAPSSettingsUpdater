@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.26</title>
+    <title>Daily Insulin Settings Review v3.5.27</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -3019,7 +3019,7 @@
              * When IOB data is unavailable the code defaults to PATH B (conservative).
              * This is the correct behavior: if we cannot rule out excess basal, we flag it.
              */
-            detectUnexplainedLows(lowProblems, nightscoutData, basalSchedule, claimedEvents, analysisWindow) {
+            detectUnexplainedLows(lowProblems, nightscoutData, basalSchedule, claimedEvents, analysisWindow, crSchedule = null) {
                 const findings = [];
                 
                 lowProblems.forEach(low => {
@@ -3027,22 +3027,70 @@
                     if (claimedEvents.lows.has(lowId)) return;
                     
                     const lowTime = new Date(low.localTime || low.time);
-                    
+
+                    // Post-meal Cat2 completion check — runs before IOB gate.
+                    const D5_COMPLETION_FRACTION = 0.30;
+                    const D5_COMPLETION_THRESHOLD_U = 0.5;
+                    const D5_THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+
+                    const mealWithin3h = (nightscoutData.treatments || [])
+                        .filter(t => {
+                            if (!t.carbs || t.carbs < 10 || !t.created_at) return false;
+                            const tTime = new Date(t.created_at);
+                            const elapsed = lowTime - tTime;
+                            return elapsed >= 0 && elapsed <= D5_THREE_HOURS_MS;
+                        })
+                        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+
+                    let probableMealCompletion_D5 = false;
+                    let estimatedCompletionU_D5 = 0;
+
+                    if (mealWithin3h && crSchedule) {
+                        const crEntry = getCRForTime(mealWithin3h.created_at, crSchedule);
+                        if (crEntry && crEntry.value > 0) {
+                            estimatedCompletionU_D5 = (mealWithin3h.carbs / crEntry.value) * D5_COMPLETION_FRACTION;
+                            if (estimatedCompletionU_D5 >= D5_COMPLETION_THRESHOLD_U) {
+                                probableMealCompletion_D5 = true;
+                            }
+                        }
+                    }
+
                     // Check IOB at time of low
                     const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
                     
-                    // If IOB is negative or very low, this is a resistant low
+                    // If IOB is negative or very low, this is a resistant low (or completion reclassification)
                     if (iobAtLow !== null && iobAtLow < 0.2) {
                         const period = CIRCADIAN_PERIODS.find(p => {
                             const hour = lowTime.getHours();
                             return hour >= p.startHour && hour < p.endHour;
                         });
                         
+                        if (probableMealCompletion_D5) {
+                            findings.push({
+                                id: `finding_resistant_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.DIRECT_MEAL_LOW,
+                                detectedAt: new Date().toISOString(),
+                                eventTime: low.localTime || low.time,
+                                scheduleTime: getCRForTime(mealWithin3h.created_at, crSchedule)?.time || `${String(lowTime.getHours()).padStart(2,'0')}:00`,
+                                period: period?.name || 'Unknown',
+                                severity: low.bg < 55 ? 0.85 : low.bg < 65 ? 0.75 : 0.6,
+                                primaryParameter: 'cr',
+                                suggestedChangePercent: low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5,
+                                contributingFactors: ['probable_meal_completion'],
+                                claimedEventIds: [lowId],
+                                conflictsWith: [],
+                                recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
+                                details: `Low ${low.bg} mg/dL — probable Cat2 SMB completion low. Meal ${mealWithin3h.carbs}g at ${formatTimeForDisplay(mealWithin3h.created_at)}, estimated completion ~${estimatedCompletionU_D5.toFixed(2)}U. IOB near-zero at nadir because completion SMBs already metabolized. CR too strong is the probable cause.`
+                            });
+                            claimedEvents.lows.add(lowId);
+                            return;
+                        }
+
                         findings.push({
                             id: `finding_resistant_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                             type: FindingType.RESISTANT_LOW,
                             detectedAt: new Date().toISOString(),
-                            eventTime: low.localTime || low.time, // BUG-022: Store original timestamp
+                            eventTime: low.localTime || low.time,
                             scheduleTime: `${String(lowTime.getHours()).padStart(2, '0')}:00`,
                             period: period?.name || 'Unknown',
                             severity: 0.5, // Lower severity - hard to fix
@@ -3791,20 +3839,58 @@
 
                     let finding = null;
 
-                    // All axes below threshold → RESISTANT_LOW
+                    // Cat2 completion check — runs before axis routing.
+                    // Near-zero IOB at nadir does not indicate non-insulin cause when
+                    // Cat2 completion delivery from the governing meal was material
+                    // (already fired and metabolized before the nadir).
+                    const COMPLETION_FRACTION = 1 - CONFIG.IAPS_UPFRONT_BOLUS_FRACTION; // 0.30
+                    const MATERIAL_COMPLETION_THRESHOLD_U = 0.5;
+                    const POST_MEAL_COMPLETION_WINDOW_MS = 3 * 60 * 60 * 1000;
+
+                    let probableMealCompletion = false;
+                    let estimatedCompletionU = 0;
+
+                    if (lowTime - effectiveMealTime <= POST_MEAL_COMPLETION_WINDOW_MS) {
+                        const crEntryForCompletion = getCRForTime(effectiveGoverningMeal.created_at, crSchedule);
+                        if (crEntryForCompletion && crEntryForCompletion.value > 0) {
+                            const totalBudgetU = effectiveGoverningMeal.carbs / crEntryForCompletion.value;
+                            estimatedCompletionU = totalBudgetU * COMPLETION_FRACTION;
+                            if (estimatedCompletionU >= MATERIAL_COMPLETION_THRESHOLD_U) {
+                                probableMealCompletion = true;
+                            }
+                        }
+                    }
+
+                    // Helper: DIRECT_MEAL_LOW finding for completion reclassification
+                    const makeCompletionFinding = (detailSuffix) => ({
+                        id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                        type: FindingType.DIRECT_MEAL_LOW,
+                        eventTime: low.time,
+                        scheduleTime: getCRForTime(effectiveGoverningMeal.created_at, crSchedule)?.time || null,
+                        period: periodName,
+                        severity: low.bg < 55 ? 0.85 : low.bg < 65 ? 0.75 : 0.6,
+                        primaryParameter: 'cr',
+                        suggestedChangePercent: low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5,
+                        contributingFactors: [...axisFactors, 'probable_meal_completion'],
+                        details: `Low ${low.bg} mg/dL — probable Cat2 SMB completion low. Governing meal ${effectiveGoverningMeal.carbs}g at ${formatTimeForDisplay(effectiveGoverningMeal.created_at)}, estimated completion delivery ~${estimatedCompletionU.toFixed(2)}U. ${detailSuffix}`
+                    });
+
+                    // All axes below threshold → RESISTANT_LOW (or completion reclassification)
                     if (crScore < 0.25 && isfScore < 0.25 && basalScore < 0.25) {
-                        finding = {
-                            id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                            type: FindingType.RESISTANT_LOW,
-                            eventTime: low.time,
-                            scheduleTime: null,
-                            period: periodName,
-                            severity: 0.4,
-                            primaryParameter: null,
-                            suggestedChangePercent: 0,
-                            contributingFactors: axisFactors,
-                            details: `Low ${low.bg} mg/dL — all axis scores below threshold. Non-insulin cause suspected.`
-                        };
+                        finding = probableMealCompletion
+                            ? makeCompletionFinding('Axis scores below threshold because completion SMBs metabolized before nadir. CR too strong is the probable cause.')
+                            : {
+                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                type: FindingType.RESISTANT_LOW,
+                                eventTime: low.time,
+                                scheduleTime: null,
+                                period: periodName,
+                                severity: 0.4,
+                                primaryParameter: null,
+                                suggestedChangePercent: 0,
+                                contributingFactors: axisFactors,
+                                details: `Low ${low.bg} mg/dL — all axis scores below threshold. Non-insulin cause suspected.`
+                            };
                     } else {
                         // Sort axes descending
                         const axes = [
@@ -3833,19 +3919,21 @@
                                 turn1Question: `Low following ${effectiveGoverningMeal.carbs}g meal on ${formatTimeForDisplay(low.time)} — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
                             };
                         } else if (top.score < 0.4) {
-                            // Dominant axis exists but score is too weak → RESISTANT_LOW
-                            finding = {
-                                id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                                type: FindingType.RESISTANT_LOW,
-                                eventTime: low.time,
-                                scheduleTime: null,
-                                period: periodName,
-                                severity: 0.4,
-                                primaryParameter: null,
-                                suggestedChangePercent: 0,
-                                contributingFactors: axisFactors,
-                                details: `Low ${low.bg} mg/dL — dominant axis below 0.4 threshold. Unclear cause.`
-                            };
+                            // Dominant axis exists but score is too weak
+                            finding = probableMealCompletion
+                                ? makeCompletionFinding('Dominant axis below 0.4 threshold — axis scoring unable to attribute, but meal completion delivery is material. CR too strong is the probable cause.')
+                                : {
+                                    id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                    type: FindingType.RESISTANT_LOW,
+                                    eventTime: low.time,
+                                    scheduleTime: null,
+                                    period: periodName,
+                                    severity: 0.4,
+                                    primaryParameter: null,
+                                    suggestedChangePercent: 0,
+                                    contributingFactors: axisFactors,
+                                    details: `Low ${low.bg} mg/dL — dominant axis below 0.4 threshold. Unclear cause.`
+                                };
                         } else if (top.axis === 'basal') {
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -6176,7 +6264,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.26',
+                            version: '3.5.27',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6415,7 +6503,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.26',
+                        version: '3.5.27',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9090,7 +9178,7 @@
                     
                     // Detector 5: Unexplained Lows
                     allFindings.push(...PatternDetectors.detectUnexplainedLows(
-                        lowProblems, nightscoutData, activeSchedules.basal, claimedEvents, analysisWindow
+                        lowProblems, nightscoutData, activeSchedules.basal, claimedEvents, analysisWindow, activeSchedules.cr
                     ));
                     
                     // Detector 6: Correction Ineffectiveness (overnight ISF strengthening)
@@ -9342,7 +9430,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.26: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.27: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10201,7 +10289,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.26 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.27 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
