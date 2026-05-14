@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.27</title>
+    <title>Daily Insulin Settings Review v3.5.32</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -226,6 +226,28 @@
             { name: 'Evening', emoji: '🌆', startHour: 17, endHour: 21, description: 'Melatonin onset, insulin nadir' },
             { name: 'Sleep Onset', emoji: '😴', startHour: 21, endHour: 24, description: 'High melatonin, lowest insulin' }
         ];
+
+        // Returns a Map<periodName, avgTIR> from 7-day hourly AGP stats.
+        // Shared by AGP Priority table generation and periodHoldApplicable computation.
+        const computePeriodTIR = (agp7day) => {
+            const result = new Map();
+            if (!agp7day || !agp7day.hourlyStats) return result;
+            const periodHours = {
+                'Deep Sleep':  [0, 1, 2, 3],
+                'Dawn':        [4, 5, 6, 7],
+                'Morning':     [8, 9, 10, 11],
+                'Afternoon':   [12, 13, 14, 15, 16],
+                'Evening':     [17, 18, 19, 20],
+                'Sleep Onset': [21, 22, 23]
+            };
+            for (const [periodName, hours] of Object.entries(periodHours)) {
+                const hourData = hours.map(h => agp7day.hourlyStats[h]).filter(Boolean);
+                if (hourData.length === 0) continue;
+                const avgTIR = hourData.reduce((sum, s) => sum + s.tir.inRange, 0) / hourData.length;
+                result.set(periodName, avgTIR);
+            }
+            return result;
+        };
         
         // Independent time blocks for multi-action support
         // Changes in different blocks don't compound with each other
@@ -3806,6 +3828,17 @@
                         effectiveMealTime, effectiveGoverningMeal.carbs, crSchedule
                     );
 
+                    // IOB confound check.
+                    // Pre-meal corrections create active IOB when the meal dose lands.
+                    // budgetRatio reflects meal insulin only — effective delivery is higher.
+                    const IOB_CONFOUND_THRESHOLD_U = 0.3;
+                    const iobAtMealEntry = this.getIOBAtTime(nightscoutData.deviceStatus, effectiveMealTime);
+                    const mealIobConfounded = iobAtMealEntry !== null
+                        && iobAtMealEntry >= IOB_CONFOUND_THRESHOLD_U;
+                    const effectiveBudgetRatio = (mealIobConfounded && decomp.expectedBudget > 0)
+                        ? (decomp.actualTotal + iobAtMealEntry) / decomp.expectedBudget
+                        : null;
+
                     const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
 
                     const correctionToEvent = decomp.corrections.length > 0
@@ -3905,6 +3938,15 @@
                         if (top.score >= 0.35 && second.score >= 0.35 &&
                             (top.score - second.score) <= 0.15) {
                             const crEntry = getCRForTime(effectiveMealTime.toISOString(), crSchedule);
+
+                            // IOB overlap check for MIXED_ATTRIBUTION lows.
+                            // A low < 45 minutes post-meal cannot be driven by the current meal's
+                            // insulin — minimum absorption time is ~45 min. Tag as probable
+                            // prior-IOB overlap and suppress the Turn 1 Question.
+                            const IOB_OVERLAP_WINDOW_MINS = 45;
+                            const iobOverlapProbable = effectiveMinsFromMealToLow != null
+                                && effectiveMinsFromMealToLow < IOB_OVERLAP_WINDOW_MINS;
+
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.MIXED_ATTRIBUTION,
@@ -3914,9 +3956,13 @@
                                 severity: 0.5,
                                 primaryParameter: null,
                                 suggestedChangePercent: 0,
-                                contributingFactors: axisFactors,
+                                contributingFactors: [
+                                    ...axisFactors,
+                                    ...(mealIobConfounded ? ['iob_confounded'] : []),
+                                    ...(iobOverlapProbable ? ['iob_overlap_probable'] : [])
+                                ],
                                 details: `Low ${low.bg} mg/dL on ${formatTimeForDisplay(low.time)} following ${effectiveGoverningMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
-                                turn1Question: `Low following ${effectiveGoverningMeal.carbs}g meal on ${formatTimeForDisplay(low.time)} — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
+                                turn1Question: iobOverlapProbable ? null : `Low following ${effectiveGoverningMeal.carbs}g meal on ${formatTimeForDisplay(low.time)} — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
                             };
                         } else if (top.score < 0.4) {
                             // Dominant axis exists but score is too weak
@@ -3977,8 +4023,16 @@
                                 severity: sev,
                                 primaryParameter: 'cr',
                                 suggestedChangePercent: adj,
-                                contributingFactors: [...axisFactors, 'strong_cr'],
+                                contributingFactors: [
+                                    ...axisFactors,
+                                    'strong_cr',
+                                    ...(mealIobConfounded ? ['iob_confounded'] : [])
+                                ],
+                                ...(effectiveBudgetRatio !== null ? { effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)) } : {}),
                                 details: `Meal (${effectiveGoverningMeal.carbs}g) → Low ${low.bg} mg/dL at ${effectiveMinsFromMealToLow.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                                    + (mealIobConfounded
+                                        ? ` Active IOB at meal entry: ${iobAtMealEntry.toFixed(2)}U. Effective budget ratio: ${effectiveBudgetRatio.toFixed(2)}x (meal + IOB vs CR budget).`
+                                        : '')
                             };
                         }
                     }
@@ -4292,6 +4346,15 @@
                         mealTime, governingMeal.carbs, crSchedule
                     );
 
+                    // IOB confound check (same logic as low path).
+                    const IOB_CONFOUND_THRESHOLD_U = 0.3;
+                    const iobAtMealEntry = this.getIOBAtTime(nightscoutData.deviceStatus, mealTime);
+                    const mealIobConfounded = iobAtMealEntry !== null
+                        && iobAtMealEntry >= IOB_CONFOUND_THRESHOLD_U;
+                    const effectiveBudgetRatio = (mealIobConfounded && decomp.expectedBudget > 0)
+                        ? (decomp.actualTotal + iobAtMealEntry) / decomp.expectedBudget
+                        : null;
+
                     const iobAtHigh = this.getIOBAtTime(
                         nightscoutData.deviceStatus, highTime
                     );
@@ -4363,7 +4426,10 @@
                                 severity: 0.5,
                                 primaryParameter: null,
                                 suggestedChangePercent: 0,
-                                contributingFactors: axisFactors,
+                                contributingFactors: [
+                                    ...axisFactors,
+                                    ...(mealIobConfounded ? ['iob_confounded'] : [])
+                                ],
                                 details: `High ${high.bg} mg/dL on ${formatTimeForDisplay(high.time)} following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
                                 turn1Question: `High following ${governingMeal.carbs}g meal on ${formatTimeForDisplay(high.time)} — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}. Did a correction fire and fail, or did BG peak without any correction? Your answer determines whether we adjust CR or ISF.`
                             };
@@ -4426,8 +4492,16 @@
                                 severity: sev,
                                 primaryParameter: 'cr',
                                 suggestedChangePercent: adj,
-                                contributingFactors: [...axisFactors, 'weak_cr'],
+                                contributingFactors: [
+                                    ...axisFactors,
+                                    'weak_cr',
+                                    ...(mealIobConfounded ? ['iob_confounded'] : [])
+                                ],
+                                ...(effectiveBudgetRatio !== null ? { effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)) } : {}),
                                 details: `Meal (${governingMeal.carbs}g) → High ${high.bg} mg/dL at ${minsFromMealToPeak.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                                    + (mealIobConfounded
+                                        ? ` Active IOB at meal entry: ${iobAtMealEntry.toFixed(2)}U. Effective budget ratio: ${effectiveBudgetRatio.toFixed(2)}x (meal + IOB vs CR budget).`
+                                        : '')
                             };
                         }
                     }
@@ -5980,6 +6054,8 @@
                         
                         const periodStats = [];
                         
+                        const periodTIRMap = computePeriodTIR(agp7day);
+                        
                         Object.entries(periodHours).forEach(([periodName, config]) => {
                             const { hours, emoji } = config;
                             const hourData = hours
@@ -5988,7 +6064,7 @@
                             
                             if (hourData.length === 0) return;
                             
-                            const avgTIR = hourData.reduce((sum, item) => sum + item.stats.tir.inRange, 0) / hourData.length;
+                            const avgTIR = periodTIRMap.get(periodName) ?? 100;
                             
                             // Find worst hour (correctly tracking original hour)
                             let worstHour = hours[0];
@@ -6162,7 +6238,7 @@
                             `${dc.basalInsufficiencyNights} basal / ` +
                             `${dc.totalNightsAnalyzed} nights analyzed\n\n`;
                     }
-                    if (finding.turn1Question) {
+                    if (finding.turn1Question && finding.eventsLast24h > 0) {
                         output += `   - **Turn 1 Question:** ${finding.turn1Question}\n\n`;
                     } else {
                         output += `\n`;
@@ -6264,7 +6340,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.27',
+                            version: '3.5.32',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6405,6 +6481,9 @@
                         urgent: bundle.isUrgent || false,
                         recency,
                         name: bundle.name,
+                        ...(bundle.consecutiveCrashAlert ? { consecutiveCrashAlert: true } : {}),
+                        ...(bundle.periodHoldApplicable === false ? { periodHoldApplicable: false } : {}),
+                        ...(bundle.pre_change_context ? { pre_change_context: true } : {}),
                         detector: (() => {
                             const f = bundle.findings || [];
                             if (f.some(x => x.type === FindingType.DIRECT_MEAL_HIGH))
@@ -6503,7 +6582,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.27',
+                        version: '3.5.32',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -8674,6 +8753,17 @@
                                 confidence: b.confidence ? b.confidence.toFixed(2) : '0'
                             })));
                         } catch(e) { return '[]'; }
+                    })(),
+                    safetyLowSlots: (() => {
+                        // Collect scheduleTime for any finding with a sub-60 mg/dL event
+                        try {
+                            return [...new Set(
+                                (findings || [])
+                                    .filter(f => (f.events || []).some(e => ((e.lowBG ?? e.bg) < 60)))
+                                    .map(f => f.scheduleTime)
+                                    .filter(Boolean)
+                            )];
+                        } catch(e) { return []; }
                     })()
                 };
                 
@@ -9430,7 +9520,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.27: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.32: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -9798,6 +9888,116 @@
                     // Generate structured JSON export
                     let structuredJSON = '';
                     try {
+                        // Part C: consecutiveCrashAlert — attach to bundles before serialization.
+                        // Scan history for slots with sub-60 lows in 2+ sessions.
+                        const historyForAlert = cachedSheetsEntries || [];
+                        const slotSessionCount = {};
+                        for (const entry of historyForAlert) {
+                            const slots = Array.isArray(entry.safetyLowSlots) ? entry.safetyLowSlots : [];
+                            for (const slot of slots) {
+                                slotSessionCount[slot] = (slotSessionCount[slot] || 0) + 1;
+                            }
+                        }
+                        const CRASH_ALERT_THRESHOLD = 2;
+                        const alertSlots = new Set(
+                            Object.entries(slotSessionCount)
+                                .filter(([, count]) => count >= CRASH_ALERT_THRESHOLD)
+                                .map(([slot]) => slot)
+                        );
+                        if (alertSlots.size > 0) {
+                            (bundles || []).forEach(bundle => {
+                                if (!bundle.recommendations || bundle.recommendations.length === 0) return;
+                                const primaryRec = bundle.recommendations[0];
+                                if (primaryRec && alertSlots.has(primaryRec.scheduleTime)) {
+                                    bundle.consecutiveCrashAlert = true;
+                                }
+                            });
+                        }
+
+                        // periodHoldApplicable flag: when 48h delta ≥ 10 and a bundle's target
+                        // period still has avg TIR ≤ 65%, the aggregate improvement does not
+                        // justify blocking that period. Flag it for Claude.
+                        const PERIOD_HOLD_THRESHOLD_TIR = 65;
+                        const HOLD_TRIGGER_DELTA = 10;
+                        const agp48hDelta = analysisResults?.agp?.trend48h?.delta ?? 0;
+
+                        if (agp48hDelta >= HOLD_TRIGGER_DELTA && analysisResults?.agp) {
+                            const periodTIRMap = computePeriodTIR(analysisResults.agp);
+
+                            const attachPeriodHoldFlag = (bundle) => {
+                                if (!bundle.recommendations || bundle.recommendations.length === 0) return;
+                                const scheduleTime = bundle.recommendations[0].scheduleTime;
+                                if (!scheduleTime) return;
+                                const hour = parseInt(scheduleTime.split(':')[0]);
+                                if (isNaN(hour)) return;
+                                const period = CIRCADIAN_PERIODS.find(p => hour >= p.startHour && hour < p.endHour);
+                                if (!period) return;
+                                const periodTIR = periodTIRMap.get(period.name);
+                                if (periodTIR !== undefined && periodTIR <= PERIOD_HOLD_THRESHOLD_TIR) {
+                                    bundle.periodHoldApplicable = false;
+                                }
+                            };
+
+                            (bundles || []).forEach(attachPeriodHoldFlag);
+                        }
+
+                        // pre_change_context flag for isf_induced_low bundles.
+                        // When ISF was recently changed at a slot, OLD findings predating that
+                        // change are stale — they reflect pre-change behavior, not current evidence.
+                        const PRE_CHANGE_WINDOW_DAYS = 4;
+
+                        const attachPreChangeFlag = (bundle) => {
+                            // Only applies to isf_induced_low bundles with no recent events
+                            const isIsfInducedLow = bundle.findings?.some(
+                                f => f.type === FindingType.ISF_INDUCED_LOW
+                            );
+                            if (!isIsfInducedLow) return;
+                            if (bundle.hasRecentEvents) return; // [NEW] — not stale
+                            if (!bundle.recommendations || bundle.recommendations.length === 0) return;
+
+                            const scheduleTime = bundle.recommendations[0].scheduleTime;
+                            if (!scheduleTime) return;
+
+                            // Get ISF changes at this slot within the window
+                            const allChanges = ChangeTracker.getChangesForSlot('isf', scheduleTime);
+                            const windowCutoff = new Date();
+                            windowCutoff.setDate(windowCutoff.getDate() - PRE_CHANGE_WINDOW_DAYS);
+                            windowCutoff.setHours(0, 0, 0, 0); // date-level boundary: midnight
+
+                            const recentChange = allChanges
+                                .filter(c => new Date(c.date + 'T00:00:00') >= windowCutoff)
+                                .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
+
+                            if (!recentChange) return;
+
+                            const changeDate = new Date(recentChange.date + 'T00:00:00');
+
+                            // Use raw finding eventTimes — bundle.evidence doesn't exist yet
+                            const findings = bundle.findings || [];
+                            const eventTimes = findings
+                                .filter(f => f.type === FindingType.ISF_INDUCED_LOW && f.eventTime)
+                                .map(f => new Date(f.eventTime));
+
+                            if (eventTimes.length === 0) {
+                                // No event timestamps — fall back to recency-based signal
+                                bundle.pre_change_context = true;
+                                bundle.confidence = parseFloat((bundle.confidence * 0.5).toFixed(4));
+                                return;
+                            }
+
+                            const hasPostChangeEvent = eventTimes.some(t => {
+                                const eventDay = new Date(t.getFullYear(), t.getMonth(), t.getDate());
+                                return eventDay >= changeDate;
+                            });
+
+                            if (!hasPostChangeEvent) {
+                                bundle.pre_change_context = true;
+                                bundle.confidence = parseFloat((bundle.confidence * 0.5).toFixed(4));
+                            }
+                        };
+
+                        (bundles || []).forEach(attachPreChangeFlag);
+
                         const structured = OutputFormatter.generateStructuredExport(
                             analysisResults,
                             bodyState,
@@ -10289,7 +10489,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.27 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.32 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
