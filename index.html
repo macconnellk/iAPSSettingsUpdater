@@ -10141,6 +10141,31 @@
                             alert('Copy failed on this browser. Try long-pressing the button, or use Chrome/Safari.');
                         }
                     }
+
+                    // Also save the same payload to Google Drive (fire-and-forget).
+                    // Mirrors saveDecisionLog: no-cors POST, opaque response, optimistic.
+                    // One file per day, overwritten on re-run (Apps Script handles dedupe by filename).
+                    if (sheetsWebAppUrl) {
+                        const driveFilename = `claude-review-${getLocalDateString()}.md`;
+                        try {
+                            await fetch(sheetsWebAppUrl, {
+                                method: 'POST',
+                                mode: 'no-cors',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    date: getLocalDateString(),
+                                    driveSave: true,
+                                    filename: driveFilename,
+                                    content: combinedOutput
+                                })
+                            });
+                            // no-cors response is opaque — can't confirm; log optimistically.
+                            console.log('Drive save POST sent:', driveFilename, '(opaque response, assumed OK)');
+                        } catch (driveErr) {
+                            // Only catches network-level failures; does not block the copy UX.
+                            console.error('Drive save POST failed:', driveErr);
+                        }
+                    }
                 } catch (err) {
                     console.error('copyForClaudeReview error:', err);
                     console.error('Error stack:', err.stack);
