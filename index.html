@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.32</title>
+    <title>Daily Insulin Settings Review v3.5.33</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -3947,6 +3947,57 @@
                             const iobOverlapProbable = effectiveMinsFromMealToLow != null
                                 && effectiveMinsFromMealToLow < IOB_OVERLAP_WINDOW_MINS;
 
+                            // Build event context for Turn 1 question
+                            const buildLowEventContext = (glucose, treatments, lowT, mealT) => {
+                                const bgAtMeal = (glucose || []).find(r =>
+                                    Math.abs(new Date(r.dateString) - mealT) < 10 * 60 * 1000
+                                );
+                                const correctionsFired = (treatments || []).filter(t => {
+                                    if (!t.eventType || !t.eventType.includes('SMB')) return false;
+                                    if (!t.created_at) return false;
+                                    const tTime = new Date(t.created_at);
+                                    return tTime > mealT && tTime < lowT;
+                                });
+                                const thirtyMinBefore = new Date(lowT.getTime() - 30 * 60 * 1000);
+                                const preNadirReadings = (glucose || [])
+                                    .filter(r => {
+                                        const rt = new Date(r.dateString);
+                                        return rt >= thirtyMinBefore && rt < lowT;
+                                    })
+                                    .sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
+                                let trend = null;
+                                if (preNadirReadings.length >= 2) {
+                                    const first = preNadirReadings[0].sgv;
+                                    const last = preNadirReadings[preNadirReadings.length - 1].sgv;
+                                    trend = last > first ? 'rising' : last < first ? 'falling' : 'flat';
+                                }
+                                return { bgAtMeal: bgAtMeal?.sgv || null, correctionsFired: correctionsFired.length, trend };
+                            };
+
+                            const lowEventCtx = buildLowEventContext(
+                                nightscoutData.glucose, nightscoutData.treatments, lowTime, effectiveMealTime
+                            );
+
+                            const ctxParts = [];
+                            if (lowEventCtx.bgAtMeal !== null) ctxParts.push(`BG was ${lowEventCtx.bgAtMeal} mg/dL at meal entry`);
+                            if (lowEventCtx.trend !== null) ctxParts.push(`trending ${lowEventCtx.trend} in the 30 min before the low`);
+                            const correctionNote = lowEventCtx.correctionsFired > 0
+                                ? `A correction fired before the low.`
+                                : `No correction appears between the meal and the low.`;
+                            const ctxPrefix = ctxParts.length > 0
+                                ? `${ctxParts.join(', ')}. ${correctionNote} `
+                                : `${correctionNote} `;
+                            const isfSlot = getISFForTime(effectiveMealTime.toISOString(), isfSchedule)?.time || crEntry?.time || '(current)';
+
+                            const enrichedTurn1Low = iobOverlapProbable ? null :
+                                `Low to ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}, `
+                                + `${effectiveMinsFromMealToLow.toFixed(0)} min after a ${effectiveGoverningMeal.carbs}g meal. `
+                                + ctxPrefix
+                                + (lowEventCtx.correctionsFired > 0
+                                    ? `Was BG still rising and the correction overcorrected — or had BG already peaked and was falling on its own?`
+                                    : `Was this the meal insulin nadir with no correction involved — or did iAPS fire a correction that drove it further down?`)
+                                + ` Your answer determines whether the lever is ${crEntry?.time || '(current)'} CR or ${isfSlot} ISF.`;
+
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.MIXED_ATTRIBUTION,
@@ -3962,7 +4013,7 @@
                                     ...(iobOverlapProbable ? ['iob_overlap_probable'] : [])
                                 ],
                                 details: `Low ${low.bg} mg/dL on ${formatTimeForDisplay(low.time)} following ${effectiveGoverningMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
-                                turn1Question: iobOverlapProbable ? null : `Low following ${effectiveGoverningMeal.carbs}g meal on ${formatTimeForDisplay(low.time)} — pattern scores CR ${crScore.toFixed(2)} and ISF ${isfScore.toFixed(2)}. Was BG rising before the correction, or was this the meal nadir? Your answer determines whether we adjust CR or ISF.`
+                                turn1Question: enrichedTurn1Low
                             };
                         } else if (top.score < 0.4) {
                             // Dominant axis exists but score is too weak
@@ -4417,6 +4468,58 @@
                         if (top.score >= 0.35 && second.score >= 0.35 &&
                             (top.score - second.score) <= 0.15) {
                             const crEntry = getCRForTime(mealTime.toISOString(), crSchedule);
+
+                            // Build event context for Turn 1 question (high path)
+                            const buildHighEventContext = (glucose, treatments, highT, mealT) => {
+                                const bgAtMeal = (glucose || []).find(r =>
+                                    Math.abs(new Date(r.dateString) - mealT) < 10 * 60 * 1000
+                                );
+                                const correctionsBefore = (treatments || []).filter(t => {
+                                    if (!t.eventType || !t.eventType.includes('SMB')) return false;
+                                    if (!t.created_at) return false;
+                                    const tTime = new Date(t.created_at);
+                                    return tTime > mealT && tTime < highT;
+                                });
+                                const thirtyMinAfter = new Date(highT.getTime() + 30 * 60 * 1000);
+                                const postPeakReadings = (glucose || [])
+                                    .filter(r => {
+                                        const rt = new Date(r.dateString);
+                                        return rt > highT && rt <= thirtyMinAfter;
+                                    })
+                                    .sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
+                                let postPeakTrend = null;
+                                if (postPeakReadings.length >= 2) {
+                                    const first = postPeakReadings[0].sgv;
+                                    const last = postPeakReadings[postPeakReadings.length - 1].sgv;
+                                    postPeakTrend = last < first - 20 ? 'dropped rapidly' : last < first ? 'dropped slowly' : 'stayed elevated';
+                                }
+                                return { bgAtMeal: bgAtMeal?.sgv || null, correctionsBefore: correctionsBefore.length, postPeakTrend };
+                            };
+
+                            const highCtx = buildHighEventContext(
+                                nightscoutData.glucose, nightscoutData.treatments, highTime, mealTime
+                            );
+
+                            const highCtxParts = [];
+                            if (highCtx.bgAtMeal !== null) highCtxParts.push(`BG was ${highCtx.bgAtMeal} mg/dL at meal entry`);
+                            if (highCtx.postPeakTrend !== null) highCtxParts.push(`BG ${highCtx.postPeakTrend} after the peak`);
+                            const highCorrectionNote = highCtx.correctionsBefore > 0
+                                ? `A correction fired before the peak.`
+                                : `No correction appears between the meal and the peak.`;
+                            const highCtxPrefix = highCtxParts.length > 0
+                                ? `${highCtxParts.join(', ')}. ${highCorrectionNote} `
+                                : `${highCorrectionNote} `;
+                            const highIsfSlot = getISFForTime(mealTime.toISOString(), isfSchedule)?.time || crEntry?.time || '(current)';
+
+                            const enrichedTurn1High =
+                                `High to ${high.bg} mg/dL at ${formatTimeForDisplay(high.time)}, `
+                                + `${minsFromMealToPeak.toFixed(0)} min after a ${governingMeal.carbs}g meal. `
+                                + highCtxPrefix
+                                + (highCtx.correctionsBefore > 0
+                                    ? `Did the correction bring BG down — or did it fail to reach target?`
+                                    : `Did BG peak without any correction firing, or did a correction fire after and bring it down?`)
+                                + ` Your answer determines whether the lever is ${crEntry?.time || '(current)'} CR or ${highIsfSlot} ISF.`;
+
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.MIXED_ATTRIBUTION,
@@ -4431,7 +4534,7 @@
                                     ...(mealIobConfounded ? ['iob_confounded'] : [])
                                 ],
                                 details: `High ${high.bg} mg/dL on ${formatTimeForDisplay(high.time)} following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
-                                turn1Question: `High following ${governingMeal.carbs}g meal on ${formatTimeForDisplay(high.time)} — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}. Did a correction fire and fail, or did BG peak without any correction? Your answer determines whether we adjust CR or ISF.`
+                                turn1Question: enrichedTurn1High
                             };
                         } else if (top.score < 0.4) {
                             finding = {
@@ -6340,7 +6443,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.32',
+                            version: '3.5.33',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6582,7 +6685,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.32',
+                        version: '3.5.33',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9520,7 +9623,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.32: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.33: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10141,31 +10244,6 @@
                             alert('Copy failed on this browser. Try long-pressing the button, or use Chrome/Safari.');
                         }
                     }
-
-                    // Also save the same payload to Google Drive (fire-and-forget).
-                    // Mirrors saveDecisionLog: no-cors POST, opaque response, optimistic.
-                    // One file per day, overwritten on re-run (Apps Script handles dedupe by filename).
-                    if (sheetsWebAppUrl) {
-                        const driveFilename = `claude-review-${getLocalDateString()}.md`;
-                        try {
-                            await fetch(sheetsWebAppUrl, {
-                                method: 'POST',
-                                mode: 'no-cors',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    date: getLocalDateString(),
-                                    driveSave: true,
-                                    filename: driveFilename,
-                                    content: combinedOutput
-                                })
-                            });
-                            // no-cors response is opaque — can't confirm; log optimistically.
-                            console.log('Drive save POST sent:', driveFilename, '(opaque response, assumed OK)');
-                        } catch (driveErr) {
-                            // Only catches network-level failures; does not block the copy UX.
-                            console.error('Drive save POST failed:', driveErr);
-                        }
-                    }
                 } catch (err) {
                     console.error('copyForClaudeReview error:', err);
                     console.error('Error stack:', err.stack);
@@ -10514,7 +10592,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.32 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.33 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
