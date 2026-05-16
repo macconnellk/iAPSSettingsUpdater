@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.33</title>
+    <title>Daily Insulin Settings Review v3.5.34</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -6443,7 +6443,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.33',
+                            version: '3.5.34',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6685,7 +6685,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.33',
+                        version: '3.5.34',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9623,7 +9623,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.33: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.34: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -9901,6 +9901,30 @@
                 
                 // Calculate recency tier for each grouped finding
                 Object.values(grouped).forEach(finding => {
+                    // Recompute eventsLast24h and eventsLast3Days from distinct event timestamps.
+                    // The accumulation loop counts one per grouped finding, which equals the number
+                    // of CGM-interval findings merged at the same key. Instead count distinct
+                    // clinical events by their timestamps.
+                    if (!finding.isStructural) {
+                        const _now = Date.now();
+                        const _cutoff24h = _now - 24 * 60 * 60 * 1000;
+                        const _cutoff3d  = _now - 3 * 24 * 60 * 60 * 1000;
+                        const _events = finding.events || [];
+
+                        if (_events.length > 0) {
+                            finding.eventsLast24h = _events.filter(e => {
+                                const t = new Date(e.time || e.eventTime || e.created_at || e.dateString || e.date).getTime();
+                                return !isNaN(t) && t >= _cutoff24h;
+                            }).length;
+                            finding.eventsLast3Days = _events.filter(e => {
+                                const t = new Date(e.time || e.eventTime || e.created_at || e.dateString || e.date).getTime();
+                                return !isNaN(t) && t >= _cutoff3d;
+                            }).length;
+                        }
+                        // Invariant: 3-day count >= 24h count
+                        finding.eventsLast3Days = Math.max(finding.eventsLast3Days, finding.eventsLast24h);
+                    }
+
                     // Structural findings are always current
                     if (finding.isStructural) {
                         finding.recencyTier = 'CURRENT';
@@ -10592,7 +10616,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.33 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.34 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
