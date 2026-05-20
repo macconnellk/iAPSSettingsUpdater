@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.37</title>
+    <title>Daily Insulin Settings Review v3.5.38</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -3769,24 +3769,20 @@
                     // §5.4 Step 1: Governing meal — most recent meal with
                     // carbs ≥ minMealCarbsForAttribution within 4 hours before low
                     const fourHoursBefore = new Date(lowTime.getTime() - 4 * 60 * 60 * 1000);
-                    const governingMeal = nightscoutData.treatments
-                        .filter(t => {
-                            if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution) return false;
-                            if (!t.created_at) return false;
-                            const tt = new Date(t.created_at);
-                            if (!(tt >= fourHoursBefore && tt < lowTime)) return false;
-
-                            // Exclude rescue carbs eaten during a hypoglycemic episode.
-                            // If BG < 80 at time of entry, this is treatment, not a meal.
-                            // Consistent with the same guard in detectDirectMealLows (line 2221),
-                            // detectTransientHighWithLow, and runHighCausalAttributionEngine (line 3772).
-                            const bgAtEntry = nightscoutData.glucose.find(r =>
-                                Math.abs(new Date(r.dateString) - tt) < 10 * 60 * 1000
-                            );
-                            if (bgAtEntry && bgAtEntry.sgv < 80) return false;
-
-                            return true;
-                        })
+                    // Named array for consolidation step — filter body unchanged
+                    const qualifyingMeals = nightscoutData.treatments.filter(t => {
+                        if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution) return false;
+                        if (!t.created_at) return false;
+                        const tt = new Date(t.created_at);
+                        if (!(tt >= fourHoursBefore && tt < lowTime)) return false;
+                        const bgAtEntry = nightscoutData.glucose.find(r =>
+                            Math.abs(new Date(r.dateString) - tt) < 10 * 60 * 1000
+                        );
+                        if (bgAtEntry && bgAtEntry.sgv < 80) return false;
+                        return true;
+                    });
+                    const governingMeal = qualifyingMeals
+                        .slice()
                         .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
 
                     // No governing meal → fasting context; leave for detectUnexplainedLows
@@ -3829,10 +3825,29 @@
                         // Axis scoring will produce a weak signal at ≤20 min — correct behavior.
                     }
 
+                    // Governing meal consolidation: adjacent carb entries within 15 min of
+                    // effectiveGoverningMeal are part of the same eating episode (split logging).
+                    // Sum their carbs and use the earliest timestamp as the effective meal time.
+                    const GOVERNING_MEAL_CONSOLIDATION_WINDOW_MS = 15 * 60 * 1000;
+                    const effectiveTimeMs = effectiveMealTime.getTime();
+                    const clusterEntries = qualifyingMeals.filter(t =>
+                        Math.abs(new Date(t.created_at).getTime() - effectiveTimeMs)
+                            <= GOVERNING_MEAL_CONSOLIDATION_WINDOW_MS
+                    );
+                    const consolidatedCarbs = clusterEntries.reduce((sum, t) => sum + (t.carbs || 0), 0);
+                    const consolidatedMealTime = new Date(
+                        Math.min(...clusterEntries.map(t => new Date(t.created_at).getTime()))
+                    );
+                    if (consolidatedMealTime < effectiveMealTime) {
+                        effectiveMealTime = consolidatedMealTime;
+                        effectiveMinsFromMealToLow = (lowTime - effectiveMealTime) / 60000;
+                    }
+                    const splitMealConsolidated = clusterEntries.length > 1;
+
                     // §5.6 Step 3: SMB decomposition
                     const decomp = this._decomposeSMBs(
                         nightscoutData.treatments, nightscoutData.glucose,
-                        effectiveMealTime, effectiveGoverningMeal.carbs, crSchedule
+                        effectiveMealTime, consolidatedCarbs, crSchedule
                     );
 
                     // IOB confound check.
@@ -3893,7 +3908,7 @@
                     if (lowTime - effectiveMealTime <= POST_MEAL_COMPLETION_WINDOW_MS) {
                         const crEntryForCompletion = getCRForTime(effectiveGoverningMeal.created_at, crSchedule);
                         if (crEntryForCompletion && crEntryForCompletion.value > 0) {
-                            const totalBudgetU = effectiveGoverningMeal.carbs / crEntryForCompletion.value;
+                            const totalBudgetU = consolidatedCarbs / crEntryForCompletion.value;
                             estimatedCompletionU = totalBudgetU * COMPLETION_FRACTION;
                             if (estimatedCompletionU >= MATERIAL_COMPLETION_THRESHOLD_U) {
                                 probableMealCompletion = true;
@@ -3911,8 +3926,8 @@
                         severity: low.bg < 55 ? 0.85 : low.bg < 65 ? 0.75 : 0.6,
                         primaryParameter: 'cr',
                         suggestedChangePercent: low.bg < 55 ? 10 : low.bg < 65 ? 7.5 : 5,
-                        contributingFactors: [...axisFactors, 'probable_meal_completion'],
-                        details: `Low ${low.bg} mg/dL — probable Cat2 SMB completion low. Governing meal ${effectiveGoverningMeal.carbs}g at ${formatTimeForDisplay(effectiveGoverningMeal.created_at)}, estimated completion delivery ~${estimatedCompletionU.toFixed(2)}U. ${detailSuffix}`
+                        contributingFactors: [...axisFactors, 'probable_meal_completion', ...(splitMealConsolidated ? ['split_meal_consolidated'] : [])],
+                        details: `Low ${low.bg} mg/dL — probable Cat2 SMB completion low. Governing meal ${consolidatedCarbs}g at ${formatTimeForDisplay(effectiveGoverningMeal.created_at)}, estimated completion delivery ~${estimatedCompletionU.toFixed(2)}U. ${detailSuffix}`
                     });
 
                     // All axes below threshold → RESISTANT_LOW (or completion reclassification)
@@ -3998,7 +4013,7 @@
 
                             const enrichedTurn1Low = iobOverlapProbable ? null :
                                 `Low to ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)}, `
-                                + `${effectiveMinsFromMealToLow.toFixed(0)} min after a ${effectiveGoverningMeal.carbs}g meal. `
+                                + `${effectiveMinsFromMealToLow.toFixed(0)} min after a ${consolidatedCarbs}g meal. `
                                 + ctxPrefix
                                 + (lowEventCtx.correctionsFired > 0
                                     ? `Was BG still rising and the correction overcorrected — or had BG already peaked and was falling on its own?`
@@ -4019,7 +4034,7 @@
                                     ...(mealIobConfounded ? ['iob_confounded'] : []),
                                     ...(iobOverlapProbable ? ['iob_overlap_probable'] : [])
                                 ],
-                                details: `Low ${low.bg} mg/dL on ${formatTimeForDisplay(low.time)} following ${effectiveGoverningMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
+                                details: `Low ${low.bg} mg/dL on ${formatTimeForDisplay(low.time)} following ${consolidatedCarbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
                                 turn1Question: enrichedTurn1Low
                             };
                         } else if (top.score < 0.4) {
@@ -4084,10 +4099,11 @@
                                 contributingFactors: [
                                     ...axisFactors,
                                     'strong_cr',
-                                    ...(mealIobConfounded ? ['iob_confounded'] : [])
+                                    ...(mealIobConfounded ? ['iob_confounded'] : []),
+                                    ...(splitMealConsolidated ? ['split_meal_consolidated'] : [])
                                 ],
                                 ...(effectiveBudgetRatio !== null ? { effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)) } : {}),
-                                details: `Meal (${effectiveGoverningMeal.carbs}g) → Low ${low.bg} mg/dL at ${effectiveMinsFromMealToLow.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                                details: `Meal (${consolidatedCarbs}g) → Low ${low.bg} mg/dL at ${effectiveMinsFromMealToLow.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
                                     + (mealIobConfounded
                                         ? ` Active IOB at meal entry: ${iobAtMealEntry.toFixed(2)}U. Effective budget ratio: ${effectiveBudgetRatio.toFixed(2)}x (meal + IOB vs CR budget).`
                                         : '')
@@ -4350,21 +4366,33 @@
                     // §5.4 Step 1: Governing meal
                     const fourHoursBefore =
                         new Date(highTime.getTime() - 4 * 60 * 60 * 1000);
-                    const governingMeal = nightscoutData.treatments
-                        .filter(t => {
-                            if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution)
-                                return false;
-                            if (!t.created_at) return false;
-                            const tt = new Date(t.created_at);
-                            return tt >= fourHoursBefore && tt < highTime;
-                        })
-                        .sort((a, b) =>
-                            new Date(b.created_at) - new Date(a.created_at))[0];
+                    // Named array for consolidation step — filter body unchanged
+                    const qualifyingMealsHigh = nightscoutData.treatments.filter(t => {
+                        if (!t.carbs || t.carbs < CONFIG.minMealCarbsForAttribution) return false;
+                        if (!t.created_at) return false;
+                        const tt = new Date(t.created_at);
+                        return tt >= fourHoursBefore && tt < highTime;
+                    });
+                    const governingMeal = qualifyingMealsHigh
+                        .slice()
+                        .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
 
                     // No governing meal → fasting context; not in engine scope
                     if (!governingMeal) continue;
 
                     const mealTime = new Date(governingMeal.created_at);
+
+                    // Governing meal consolidation — high path
+                    const GOVERNING_MEAL_CONSOLIDATION_WINDOW_MS_H = 15 * 60 * 1000;
+                    const clusterEntriesHigh = qualifyingMealsHigh.filter(t =>
+                        Math.abs(new Date(t.created_at).getTime() - mealTime.getTime())
+                            <= GOVERNING_MEAL_CONSOLIDATION_WINDOW_MS_H
+                    );
+                    const consolidatedCarbs = clusterEntriesHigh.reduce((sum, t) => sum + (t.carbs || 0), 0);
+                    const consolidatedMealTimeHigh = new Date(
+                        Math.min(...clusterEntriesHigh.map(t => new Date(t.created_at).getTime()))
+                    );
+                    const splitMealConsolidated = clusterEntriesHigh.length > 1;
                     const minsFromMealToPeak = (highTime - mealTime) / 60000;
 
                     // Minimum causal latency: peak < 30 min after meal predates meal causally
@@ -4380,7 +4408,7 @@
                     if (!mealDuringLow) {
                         const crEntryReb = getCRForTime(governingMeal.created_at, crSchedule);
                         if (crEntryReb && crEntryReb.value > 0) {
-                            const expectedBolus = governingMeal.carbs / crEntryReb.value;
+                            const expectedBolus = consolidatedCarbs / crEntryReb.value;
                             const actualBolus   = governingMeal.insulin || 0;
                             const pctGiven = expectedBolus > 0
                                 ? (actualBolus / expectedBolus) * 100
@@ -4401,7 +4429,7 @@
                     // §5.6 Step 3: SMB decomposition (shared with low path)
                     const decomp = this._decomposeSMBs(
                         nightscoutData.treatments, nightscoutData.glucose,
-                        mealTime, governingMeal.carbs, crSchedule
+                        mealTime, consolidatedCarbs, crSchedule
                     );
 
                     // IOB confound check (same logic as low path).
@@ -4520,7 +4548,7 @@
 
                             const enrichedTurn1High =
                                 `High to ${high.bg} mg/dL at ${formatTimeForDisplay(high.time)}, `
-                                + `${minsFromMealToPeak.toFixed(0)} min after a ${governingMeal.carbs}g meal. `
+                                + `${minsFromMealToPeak.toFixed(0)} min after a ${consolidatedCarbs}g meal. `
                                 + highCtxPrefix
                                 + (highCtx.correctionsBefore > 0
                                     ? `Did the correction bring BG down — or did it fail to reach target?`
@@ -4540,7 +4568,7 @@
                                     ...axisFactors,
                                     ...(mealIobConfounded ? ['iob_confounded'] : [])
                                 ],
-                                details: `High ${high.bg} mg/dL on ${formatTimeForDisplay(high.time)} following ${governingMeal.carbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
+                                details: `High ${high.bg} mg/dL on ${formatTimeForDisplay(high.time)} following ${consolidatedCarbs}g meal — CR ${crScore.toFixed(2)}, ISF ${isfScore.toFixed(2)}, Basal ${basalScore.toFixed(2)}. Deferred to Turn 1 question.`,
                                 turn1Question: enrichedTurn1High
                             };
                         } else if (top.score < 0.4) {
@@ -4605,10 +4633,11 @@
                                 contributingFactors: [
                                     ...axisFactors,
                                     'weak_cr',
-                                    ...(mealIobConfounded ? ['iob_confounded'] : [])
+                                    ...(mealIobConfounded ? ['iob_confounded'] : []),
+                                    ...(splitMealConsolidated ? ['split_meal_consolidated'] : [])
                                 ],
                                 ...(effectiveBudgetRatio !== null ? { effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)) } : {}),
-                                details: `Meal (${governingMeal.carbs}g) → High ${high.bg} mg/dL at ${minsFromMealToPeak.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                                details: `Meal (${consolidatedCarbs}g) → High ${high.bg} mg/dL at ${minsFromMealToPeak.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
                                     + (mealIobConfounded
                                         ? ` Active IOB at meal entry: ${iobAtMealEntry.toFixed(2)}U. Effective budget ratio: ${effectiveBudgetRatio.toFixed(2)}x (meal + IOB vs CR budget).`
                                         : '')
@@ -6450,7 +6479,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.37',
+                            version: '3.5.38',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6692,7 +6721,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.37',
+                        version: '3.5.38',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9630,7 +9659,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.37: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.38: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10718,7 +10747,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.37 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.38 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
