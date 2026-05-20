@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.34</title>
+    <title>Daily Insulin Settings Review v3.5.37</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -1290,6 +1290,13 @@
             checkSignalConflict(finding, signalAnalysis) {
                 if (!signalAnalysis || !signalAnalysis.periods || !finding.scheduleTime) return null;
                 
+                // Signal conflict only applies to basal recommendations.
+                // Basal signal direction reflects fasting insulin delivery adequacy.
+                // CR and ISF address meal bolus size and correction strength — mechanistically
+                // independent delivery channels that can point opposite to the basal signal.
+                // e.g., Dawn HIGH + CR weaken is valid: need more fasting basal AND less meal insulin.
+                if (finding.primaryParameter && finding.primaryParameter !== 'basal') return null;
+
                 // Find the period for this finding's schedule time
                 const [hours] = finding.scheduleTime.split(':').map(Number);
                 const period = CIRCADIAN_PERIODS.find(p => hours >= p.startHour && hours < p.endHour);
@@ -6443,7 +6450,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.34',
+                            version: '3.5.37',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6685,7 +6692,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.34',
+                        version: '3.5.37',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9623,7 +9630,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.34: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.37: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -9709,11 +9716,81 @@
                         basalRatioInfo
                     );
 
+                    // Bimodal period divergence detection.
+                    // Period average AGP may read HIGH while individual hours have safety lows.
+                    // Demote basal_signal_high bundles to Watch List when any hour in the target
+                    // period has AGP lowPct > 4% — Safety Rule #1 overrides the aggregate signal.
+                    const BIMODAL_LOW_HOUR_THRESHOLD = 4;
+                    if (hourlyAgpStats7d) {
+                        processedBundles.forEach(bundle => {
+                            // Only applies to basal_signal_high bundles already promoted
+                            if (bundle.priority !== 'PRIMARY') return;
+                            const hasBasalSignalHigh = (bundle.findings || []).some(
+                                f => f.type === FindingType.BASAL_SIGNAL_HIGH
+                            );
+                            if (!hasBasalSignalHigh) return;
+
+                            // Get the primary recommendation's schedule time to identify the period
+                            const rec = (bundle.recommendations || [])[0];
+                            if (!rec || !rec.scheduleTime) return;
+                            // Only applies to basal-strengthen recommendations
+                            if (rec.param !== 'basal' || rec.changePercent <= 0) return;
+
+                            const [recHour] = rec.scheduleTime.split(':').map(Number);
+                            const period = CIRCADIAN_PERIODS.find(
+                                p => recHour >= p.startHour && recHour < p.endHour
+                            );
+                            if (!period) return;
+
+                            const periodHours = [];
+                            for (let h = period.startHour; h < period.endHour; h++) {
+                                periodHours.push(h);
+                            }
+
+                            const hoursWithLows = periodHours.filter(h => {
+                                const hourData = hourlyAgpStats7d[h];
+                                return hourData && hourData.lowPct > BIMODAL_LOW_HOUR_THRESHOLD;
+                            });
+
+                            if (hoursWithLows.length === 0) return;
+
+                            const worstHour = hoursWithLows.reduce((worst, h) =>
+                                (hourlyAgpStats7d[h]?.lowPct || 0) > (hourlyAgpStats7d[worst]?.lowPct || 0) ? h : worst
+                            , hoursWithLows[0]);
+
+                            const bimodalReason =
+                                `Bimodal period: ${hoursWithLows.length} hour(s) with >${BIMODAL_LOW_HOUR_THRESHOLD}% lows ` +
+                                `(worst: ${worstHour}:00 at ${hourlyAgpStats7d[worstHour]?.lowPct?.toFixed(0)}% low). ` +
+                                `Safety Rule #1: do not strengthen basal into hours with documented lows.`;
+
+                            bundle.priority = 'REFERENCE';
+                            bundle.bimodalDivergence = {
+                                type: 'SIGNAL_HIGH_AGP_BIMODAL',
+                                hoursWithLows,
+                                worstHour,
+                                worstLowPct: hourlyAgpStats7d[worstHour]?.lowPct
+                            };
+                            bundle.blockedBy = bimodalReason;
+                            bundle.signalConflict = bimodalReason;
+                        });
+                    }
+
                     // Part C: Build projected basal schedule from bundle recommendations.
                     const buildProjectedBasalSchedule = (currentBasalSchedule, bundles) => {
                         const basalRecs = [];
                         bundles.forEach(bundle => {
+                            // Bug A fix: only PRIMARY and URGENT bundles are actionable tonight.
+                            // Watch List (REFERENCE) items — locked, compound-blocked, deferred —
+                            // are never applied tonight and must not appear in the projected schedule.
+                            const isActionable = bundle.priority === 'PRIMARY' || bundle.priority === 'URGENT';
+                            if (!isActionable) return;
+
                             (bundle.recommendations || []).forEach(rec => {
+                                // Secondary guard: explicit protection-level check.
+                                // Catches any locked/protected recs that survive the priority filter.
+                                if (rec.protectionLevel === ProtectionLevel.LOCKED ||
+                                    rec.protectionLevel === ProtectionLevel.PROTECTED) return;
+
                                 if (rec.param === 'basal' && rec.newValue !== rec.currentValue) {
                                     basalRecs.push({
                                         scheduleTime: rec.scheduleTime,
@@ -9722,7 +9799,6 @@
                                         changePercent: rec.changePercent,
                                         sourceBundleName: bundle.name,
                                         sourcePriority: bundle.priority,
-                                        ratioWarning: rec.ratioWarning || null
                                     });
                                 }
                             });
@@ -9736,13 +9812,39 @@
                         });
                         const currentTotal  = (currentBasalSchedule || []).reduce((s, e) => s + e.value, 0);
                         const projectedTotal = projected.reduce((s, e) => s + e.value, 0);
+
+                        // Bug B fix: compute ratio warning exactly once on the final projected state,
+                        // not once per item. N concurrent PRIMARY actions previously generated N warnings.
+                        const projectedValues = projected.map(e => e.value).filter(v => v > 0);
+                        let ratioWarning = null;
+                        if (projectedValues.length > 0) {
+                            const projectedMax = Math.max(...projectedValues);
+                            const projectedMin = Math.min(...projectedValues);
+                            const projectedRatio = projectedMin > 0 ? projectedMax / projectedMin : null;
+                            if (projectedRatio !== null && projectedRatio > CONFIG.basalRatioCap) {
+                                // Find the minimum hour for concurrent adjustment guidance
+                                const minEntry = projected.find(e => e.value === projectedMin);
+                                ratioWarning = {
+                                    currentRatio: null, // pre-change ratio not recomputed here
+                                    newRatio: parseFloat(projectedRatio.toFixed(2)),
+                                    cap: CONFIG.basalRatioCap,
+                                    minimumHour: minEntry?.time || null,
+                                    minimumCurrentRate: projectedMin,
+                                    minimumNeededForRatio: parseFloat((projectedMax / CONFIG.basalRatioCap).toFixed(2)),
+                                    minimumChangeNeeded: parseFloat(
+                                        (projectedMax / CONFIG.basalRatioCap - projectedMin).toFixed(2)
+                                    )
+                                };
+                            }
+                        }
+
                         return {
                             hasChanges: true,
                             changes: projected.filter(e => e.rec !== null),
                             allHours: projected,
                             currentTotal,
                             projectedTotal,
-                            ratioWarnings: basalRecs.filter(r => r.ratioWarning).map(r => r.ratioWarning)
+                            ratioWarnings: ratioWarning ? [ratioWarning] : []
                         };
                     };
                     const projectedBasalSchedule = buildProjectedBasalSchedule(
@@ -10616,7 +10718,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.34 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.37 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
