@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.42</title>
+    <title>Daily Insulin Settings Review v3.5.44</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -6531,7 +6531,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.42',
+                            version: '3.5.44',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6774,7 +6774,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.42',
+                        version: '3.5.44',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9422,6 +9422,19 @@
                         lowProblems, nightscoutData, activeSchedules.cr, activeSchedules.isf,
                         claimedEvents, analysisWindow, signalAnalysis
                     ));
+
+                    // v3.5.44: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
+                    // Detector 3 has no dependency on CAE output — it reads only nightscoutData,
+                    // crSchedule, claimedEvents, and analysisWindow. Running it first ensures
+                    // REBOUND_HIGH meals have their post-meal highs claimed in claimedEvents.highs
+                    // before the high CAE sees them. This prevents DIRECT_MEAL_HIGH from firing
+                    // for the same event that Detector 3 classifies as REBOUND_HIGH.
+                    // (v3.5.39-A placed the claim inside Detector 3, but Detector 3 was running
+                    // after the CAE — claim was too late. Reordering is the correct fix.)
+                    allFindings.push(...PatternDetectors.detectPostMealHighs(
+                        nightscoutData, activeSchedules.cr, claimedEvents, analysisWindow
+                    ));
+
                     allFindings.push(...PatternDetectors.runHighCausalAttributionEngine(
                         highProblems, nightscoutData, activeSchedules.cr, activeSchedules.isf,
                         claimedEvents, analysisWindow, signalAnalysis
@@ -9449,10 +9462,6 @@
                     ));
                     
                     // Detector 3: Post-Meal Highs (REBOUND_HIGH all hours; POST_MEAL_HIGH overnight only — see guard inside function)
-                    allFindings.push(...PatternDetectors.detectPostMealHighs(
-                        nightscoutData, activeSchedules.cr, claimedEvents, analysisWindow
-                    ));
-                    
                     // Detector 4: Basal Signals
                     // AGP stats needed for intra-period entry evaluation — computed here
                     // so they're available inside detectBasalSignals.
@@ -9709,7 +9718,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.42: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.44: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -9873,13 +9882,34 @@
                             if (!hasBasalInsufficiency) return;
 
                             const rec = (bundle.recommendations || [])[0];
-                            if (!rec || rec.param !== 'basal' || !rec.scheduleTime) return;
+                            let segmentHours;
 
-                            const schedHour = parseInt(rec.scheduleTime.split(':')[0]);
-                            if (isNaN(schedHour)) return;
+                            if (rec && rec.scheduleTime) {
+                                // Recommendation exists — derive segment hours from schedule time
+                                const schedHour = parseInt(rec.scheduleTime.split(':')[0]);
+                                if (isNaN(schedHour)) return;
+                                segmentHours = [schedHour, (schedHour + 1) % 24];
+                            } else {
+                                // No recommendation (findingToRecommendation returned null —
+                                // basal schedule has no entry at the mapped hour).
+                                // Derive segment hours from the finding's segment analysis instead.
+                                // All overnight segments are 2 hours; getBasalHourForSegment
+                                // returns the start hour as "HH:00".
+                                const finding = (bundle.findings || []).find(f =>
+                                    f.type === FindingType.CORRECTION_INEFFECTIVE &&
+                                    f.segmentAnalysis?.segment
+                                );
+                                if (!finding) return;
+                                const segStartStr = RecommendationEngine.getBasalHourForSegment(
+                                    finding.segmentAnalysis.segment
+                                );
+                                if (!segStartStr) return;
+                                const segStart = parseInt(segStartStr.split(':')[0]);
+                                if (isNaN(segStart)) return;
+                                segmentHours = [segStart, (segStart + 1) % 24];
+                            }
 
-                            // Check the 2-hour segment covered by this schedule entry
-                            const segmentHours = [schedHour, (schedHour + 1) % 24];
+                            if (!segmentHours || segmentHours.length === 0) return;
 
                             const agpPersistent = segmentHours.some(h => {
                                 const hourData = hourlyAgpStats7d[h];
@@ -10839,7 +10869,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.42 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.44 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
