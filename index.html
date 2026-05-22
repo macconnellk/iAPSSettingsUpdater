@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.40</title>
+    <title>Daily Insulin Settings Review v3.5.42</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -2980,31 +2980,44 @@
              * Pattern: Clean windows showing consistent deviation
              * Output: Finding of type BASAL_SIGNAL_HIGH or BASAL_SIGNAL_LOW
              */
-            detectBasalSignals(signalAnalysis, basalSchedule, targetPercent, analysisWindow) {
+            detectBasalSignals(signalAnalysis, basalSchedule, targetPercent, analysisWindow, hourlyAgpStats7d = null) {
                 const findings = [];
+                const INTRA_PERIOD_TIR_THRESHOLD = 60;
+                const INTRA_PERIOD_LOW_THRESHOLD  = 4;
                 
                 if (!signalAnalysis || !signalAnalysis.periods) return findings;
                 
                 signalAnalysis.periods.forEach(period => {
                     if (!period.hasSufficientData) return;
-                    if (period.cleanWindowCount < CONFIG.minEventsHighConfidence) return; // Synced with SignalAnalysis threshold
+                    if (period.cleanWindowCount < CONFIG.minEventsHighConfidence) return;
                     
                     const deviation = period.medianDeviation;
-                    if (Math.abs(deviation) <= 10) return; // Only act on confirmed HIGH/LOW signal (aligns with signal label threshold)
+                    if (Math.abs(deviation) <= 10) return;
                     
                     const type = deviation > 0 ? FindingType.BASAL_SIGNAL_HIGH : FindingType.BASAL_SIGNAL_LOW;
-                    // BUG FIX: Correct the sign
-                    // BG HIGH (deviation > 0) → need MORE basal → POSITIVE adjustment
-                    // BG LOW (deviation < 0) → need LESS basal → NEGATIVE adjustment
                     const adjustmentPercent = deviation > 0 
-                        ? Math.min(Math.abs(deviation) * 0.5, 5)     // BG high → increase basal
-                        : -Math.min(Math.abs(deviation) * 0.5, 7.5); // BG low → decrease basal
-                    
-                    // Find schedule time in this period
+                        ? Math.min(Math.abs(deviation) * 0.5, 5)
+                        : -Math.min(Math.abs(deviation) * 0.5, 7.5);
+
+                    // Resolve period start hour
                     const periodStart = period.startHour || CIRCADIAN_PERIODS.find(p => p.name === period.name)?.startHour || 0;
-                    const scheduleTime = `${String(periodStart).padStart(2, '0')}:00`;
-                    
-                    findings.push({
+                    const periodEnd   = period.endHour   || CIRCADIAN_PERIODS.find(p => p.name === period.name)?.endHour   || periodStart + 3;
+
+                    // Collect all basal schedule entries in this period, ascending
+                    const periodEntries = (basalSchedule || [])
+                        .filter(e => {
+                            const h = parseInt(e.time.split(':')[0]);
+                            return h >= periodStart && h < periodEnd;
+                        })
+                        .sort((a, b) => parseInt(a.time) - parseInt(b.time));
+
+                    // Determine anchor schedule time: first entry in period, or period start
+                    const anchorTime = periodEntries.length > 0
+                        ? periodEntries[0].time
+                        : `${String(periodStart).padStart(2, '0')}:00`;
+
+                    // Helper: build a full finding object for a schedule entry
+                    const buildFinding = (scheduleTime, extra = {}) => ({
                         id: `finding_basal_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type,
                         detectedAt: new Date().toISOString(),
@@ -3028,7 +3041,38 @@
                         details: `${period.name} (${period.hours}): ${period.cleanWindowCount} clean windows from ${period.contributingDayCount ?? '?'} of ${analysisWindow} days show median deviation ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL from target.`,
                         windowsByDate: period.windowsByDate || {},
                         contributingDayCount: period.contributingDayCount || 0,
+                        ...extra
                     });
+
+                    // Emit anchor finding (existing behavior unchanged)
+                    findings.push(buildFinding(anchorTime));
+
+                    // Intra-period pass: HIGH periods only, when AGP stats available
+                    // LOW periods are not evaluated intra-period (no clean-window evidence
+                    // for sub-period weakening).
+                    if (deviation > 0 && hourlyAgpStats7d && periodEntries.length > 1) {
+                        for (let i = 1; i < periodEntries.length; i++) {
+                            const entry     = periodEntries[i];
+                            const entryHour = parseInt(entry.time.split(':')[0]);
+                            const nextHour  = i + 1 < periodEntries.length
+                                ? parseInt(periodEntries[i + 1].time.split(':')[0])
+                                : periodEnd;
+
+                            const coveredHours = [];
+                            for (let h = entryHour; h < nextHour; h++) coveredHours.push(h);
+
+                            const independentlyFailing = coveredHours.some(h => {
+                                const agp = hourlyAgpStats7d[h];
+                                return agp != null
+                                    && agp.tir    < INTRA_PERIOD_TIR_THRESHOLD
+                                    && agp.lowPct <= INTRA_PERIOD_LOW_THRESHOLD;
+                            });
+
+                            if (!independentlyFailing) continue;
+
+                            findings.push(buildFinding(entry.time, { intraPeriodEntry: true }));
+                        }
+                    }
                 });
                 
                 return findings;
@@ -6487,7 +6531,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.40',
+                            version: '3.5.42',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6631,6 +6675,7 @@
                         ...(bundle.consecutiveCrashAlert ? { consecutiveCrashAlert: true } : {}),
                         ...(bundle.periodHoldApplicable === false ? { periodHoldApplicable: false } : {}),
                         ...(bundle.pre_change_context ? { pre_change_context: true } : {}),
+                        ...(bundle.agpPersistent ? { agpPersistent: true } : {}),
                         detector: (() => {
                             const f = bundle.findings || [];
                             if (f.some(x => x.type === FindingType.DIRECT_MEAL_HIGH))
@@ -6729,7 +6774,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.40',
+                        version: '3.5.42',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9409,8 +9454,23 @@
                     ));
                     
                     // Detector 4: Basal Signals
+                    // AGP stats needed for intra-period entry evaluation — computed here
+                    // so they're available inside detectBasalSignals.
+                    let hourlyAgpStats7d  = null;
+                    let hourlyAgpStats48h = null;
+                    if (nightscoutData?.glucose) {
+                        const mapStats = (agpResult) => agpResult?.hourlyStats?.map(stats => stats ? {
+                            lowPct:  (stats.tir.low  || 0) + (stats.tir.veryLow  || 0),
+                            highPct: (stats.tir.high || 0) + (stats.tir.veryHigh || 0),
+                            tir:     stats.tir.inRange || 0,
+                            mean:    stats.mean || 0
+                        } : null) ?? null;
+                        hourlyAgpStats7d  = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 7));
+                        hourlyAgpStats48h = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 2));
+                    }
+
                     allFindings.push(...PatternDetectors.detectBasalSignals(
-                        signalAnalysis, activeSchedules.basal, effectiveBasalTarget, basalSignalWindow
+                        signalAnalysis, activeSchedules.basal, effectiveBasalTarget, basalSignalWindow, hourlyAgpStats7d
                     ));
                     
                     // Detector 5: Unexplained Lows
@@ -9635,24 +9695,6 @@
                     }
                     console.log('Final % for basal optimization:', finalPercent.toFixed(2), safetyOverrideActive ? '(SAFETY OVERRIDE)' : '');
                     
-                    // Generate proposed basal schedule
-                    // Compute dual-window AGP data:
-                    //   7-day: structural high% assessment for AGP_HIGH detection
-                    //   48h:   recent low% for the per-hour safety exclusion gate
-                    // OutputFormatter.calculateAGP is defined later in this scope — call inline.
-                    let hourlyAgpStats7d  = null;
-                    let hourlyAgpStats48h = null;
-                    if (nightscoutData?.glucose) {
-                        const mapStats = (agpResult) => agpResult?.hourlyStats?.map(stats => stats ? {
-                            lowPct:  (stats.tir.low  || 0) + (stats.tir.veryLow  || 0),
-                            highPct: (stats.tir.high || 0) + (stats.tir.veryHigh || 0),
-                            tir:     stats.tir.inRange || 0,
-                            mean:    stats.mean || 0
-                        } : null) ?? null;
-                        hourlyAgpStats7d  = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 7));
-                        hourlyAgpStats48h = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 2));
-                    }
-
                     // Part C: generateProposedSchedule retained but no longer called.
                     const basalOptimization = null;
 
@@ -9667,7 +9709,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.40: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.42: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -9809,6 +9851,48 @@
                             };
                             bundle.blockedBy = bimodalReason;
                             bundle.signalConflict = bimodalReason;
+                        });
+                    }
+
+                    // AGP persistence override for STALE correction_ineffective bundles.
+                    // When a basal_insufficiency finding is demoted STALE (no recent discrete
+                    // events), the structural AGP failure can persist without generating
+                    // detectable correction events. Check hourlyAgpStats7d before accepting
+                    // the STALE demotion.
+                    const AGP_PERSIST_TIR_THRESHOLD = 65;
+                    const AGP_PERSIST_LOW_THRESHOLD = 4;
+
+                    if (hourlyAgpStats7d) {
+                        processedBundles.forEach(bundle => {
+                            if (!bundle.isStale) return;
+
+                            const hasBasalInsufficiency = (bundle.findings || []).some(f =>
+                                f.type === FindingType.CORRECTION_INEFFECTIVE &&
+                                f.diagnosticContext?.patternType === 'basal_insufficiency'
+                            );
+                            if (!hasBasalInsufficiency) return;
+
+                            const rec = (bundle.recommendations || [])[0];
+                            if (!rec || rec.param !== 'basal' || !rec.scheduleTime) return;
+
+                            const schedHour = parseInt(rec.scheduleTime.split(':')[0]);
+                            if (isNaN(schedHour)) return;
+
+                            // Check the 2-hour segment covered by this schedule entry
+                            const segmentHours = [schedHour, (schedHour + 1) % 24];
+
+                            const agpPersistent = segmentHours.some(h => {
+                                const hourData = hourlyAgpStats7d[h];
+                                return hourData != null &&
+                                       hourData.tir < AGP_PERSIST_TIR_THRESHOLD &&
+                                       hourData.lowPct <= AGP_PERSIST_LOW_THRESHOLD;
+                            });
+
+                            if (agpPersistent) {
+                                bundle.isStale = false;
+                                bundle.blockedBy = null;
+                                bundle.agpPersistent = true;
+                            }
                         });
                     }
 
@@ -10755,7 +10839,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.40 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.42 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
