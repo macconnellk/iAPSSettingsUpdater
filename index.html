@@ -1923,6 +1923,21 @@
                     // basal_insufficiency correction_ineffective bundle — those are kept
                     // alive so AGPPERSIST can evaluate the AGP and inject a recommendation.
                     if (bundle.recommendations.length === 0) {
+                        // DIAG-PRIORITIZE: Print full finding for any CI finding at null-rec guard
+                        (bundle.findings || []).forEach(f => {
+                            if (f.type === FindingType.CORRECTION_INEFFECTIVE) {
+                                console.log('[PRIORITIZE DIAG] CI finding at null-rec guard:', JSON.stringify({
+                                    type: f.type,
+                                    scheduleTime: f.scheduleTime,
+                                    diagnosticContext: f.diagnosticContext,
+                                    contributingFactors: f.contributingFactors,
+                                    overnightPattern: f.overnightPattern,
+                                    patternType: f.patternType,
+                                    segmentAnalysis: f.segmentAnalysis
+                                }));
+                            }
+                        });
+
                         const isBasalInsufficiencyCI = (bundle.findings || []).some(f =>
                             f.type === FindingType.CORRECTION_INEFFECTIVE &&
                             f.diagnosticContext?.patternType === 'basal_insufficiency'
