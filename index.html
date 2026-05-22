@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.46</title>
+    <title>Daily Insulin Settings Review v3.5.48</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -1271,7 +1271,12 @@
                 
                 Object.entries(byWindow).forEach(([window, windowFindings]) => {
                     const tier = this.determineTier(windowFindings);
-                    const name = this.generateBundleName(windowFindings, window);
+                    // Use the finding's scheduleTime as the display portion, not the bucket key.
+                    // CI/basal_insufficiency bundles use a type-scoped key (e.g.,
+                    // 'correction_ineffective_22:00') to prevent co-grouping — but the
+                    // display name and delta persistence keys must use the plain time ('22:00').
+                    const displayWindow = windowFindings[0]?.scheduleTime || windowFindings[0]?.period || window;
+                    const name = this.generateBundleName(windowFindings, displayWindow);
                     
                     // Check for signal conflicts in non-safety findings too
                     windowFindings.forEach(f => {
@@ -1375,7 +1380,16 @@
                 const windows = {};
                 
                 findings.forEach(finding => {
-                    const window = finding.scheduleTime || finding.period || 'general';
+                    // CI/basal_insufficiency findings use a type-scoped key to prevent
+                    // co-grouping with structural basal_signal_high findings at the same
+                    // scheduleTime — co-grouping sets hasStructuralFinding=true on the
+                    // CI bundle, blocking isStale assignment and silencing AGPPERSIST.
+                    const isBasalInsufficiencyCI =
+                        finding.type === FindingType.CORRECTION_INEFFECTIVE &&
+                        finding.diagnosticContext?.patternType === 'basal_insufficiency';
+                    const window = isBasalInsufficiencyCI
+                        ? `${finding.type}_${finding.scheduleTime || finding.period || 'general'}`
+                        : (finding.scheduleTime || finding.period || 'general');
                     if (!windows[window]) windows[window] = [];
                     windows[window].push(finding);
                 });
@@ -1933,13 +1947,6 @@
                     // basal_insufficiency correction_ineffective bundle — those are kept
                     // alive so AGPPERSIST can evaluate the AGP and inject a recommendation.
                     if (bundle.recommendations.length === 0) {
-                            type: bundle.findings?.[0]?.type,
-                            diagnosticContext: bundle.findings?.[0]?.diagnosticContext,
-                            contributingFactors: bundle.findings?.[0]?.contributingFactors,
-                            overnightPattern: bundle.findings?.[0]?.overnightPattern,
-                            patternType: bundle.findings?.[0]?.patternType
-                        }));
-
                         const isBasalInsufficiencyCI = (bundle.findings || []).some(f =>
                             f.type === FindingType.CORRECTION_INEFFECTIVE &&
                             f.diagnosticContext?.patternType === 'basal_insufficiency'
@@ -4932,7 +4939,7 @@
                         driftThresholdMg: DRIFT_THRESHOLD_MG
                     };
 
-                    // v3.5.46 Fix 1: basal_insufficiency findings route to basal,
+                    // v3.5.48 Fix 1: basal_insufficiency findings route to basal,
                     // not ISF. Correct primaryParameter now so detectSlotConflicts
                     // groups them under 'basal' slots — prevents false conflicts
                     // with ISF_INDUCED_LOW findings at the same scheduleTime.
@@ -6571,7 +6578,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.46',
+                            version: '3.5.48',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6814,7 +6821,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.46',
+                        version: '3.5.48',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9463,7 +9470,7 @@
                         claimedEvents, analysisWindow, signalAnalysis
                     ));
 
-                    // v3.5.46: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
+                    // v3.5.48: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
                     // Detector 3 has no dependency on CAE output — it reads only nightscoutData,
                     // crSchedule, claimedEvents, and analysisWindow. Running it first ensures
                     // REBOUND_HIGH meals have their post-meal highs claimed in claimedEvents.highs
@@ -9758,7 +9765,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.46: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.48: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10938,7 +10945,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.46 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.48 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
