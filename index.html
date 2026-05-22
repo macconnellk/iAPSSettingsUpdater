@@ -9875,13 +9875,38 @@
                         processedBundles.forEach(bundle => {
                             if (!bundle.isStale) return;
 
+                            // DIAG-AGPPERSIST-1: Log all STALE bundles reaching this check
+                            const ciFindings = (bundle.findings || []).filter(f =>
+                                f.type === FindingType.CORRECTION_INEFFECTIVE
+                            );
+                            if (ciFindings.length > 0) {
+                                console.log(`[AGPPERSIST DIAG] STALE CI bundle: ${bundle.name}`);
+                                ciFindings.forEach((f, i) => {
+                                    console.log(`  finding[${i}].type: ${f.type}`);
+                                    console.log(`  finding[${i}].diagnosticContext: ${JSON.stringify(f.diagnosticContext)}`);
+                                    console.log(`  finding[${i}].contributingFactors: ${JSON.stringify(f.contributingFactors)}`);
+                                    console.log(`  finding[${i}].scheduleTime: ${f.scheduleTime}`);
+                                    console.log(`  finding[${i}].segmentAnalysis: ${JSON.stringify(f.segmentAnalysis)}`);
+                                });
+                            }
+
                             const hasBasalInsufficiency = (bundle.findings || []).some(f =>
                                 f.type === FindingType.CORRECTION_INEFFECTIVE &&
                                 f.diagnosticContext?.patternType === 'basal_insufficiency'
                             );
+
+                            // DIAG-AGPPERSIST-2: Log hasBasalInsufficiency result
+                            if (ciFindings.length > 0) {
+                                console.log(`  hasBasalInsufficiency: ${hasBasalInsufficiency}`);
+                            }
+
                             if (!hasBasalInsufficiency) return;
 
                             const rec = (bundle.recommendations || [])[0];
+
+                            // DIAG-AGPPERSIST-3: Log rec state before segmentHours derivation
+                            console.log(`[AGPPERSIST DIAG] Past hasBasalInsufficiency. rec: ${JSON.stringify(rec)}`);
+
                             let segmentHours;
 
                             if (rec && rec.scheduleTime) {
@@ -9909,7 +9934,16 @@
                                 segmentHours = [segStart, (segStart + 1) % 24];
                             }
 
-                            if (!segmentHours || segmentHours.length === 0) return;
+                            if (!segmentHours || segmentHours.length === 0) {
+                                console.log(`[AGPPERSIST DIAG] EXIT: segmentHours empty or null`);
+                                return;
+                            }
+
+                            // DIAG-AGPPERSIST-4: Log segmentHours and AGP data for those hours
+                            console.log(`[AGPPERSIST DIAG] segmentHours: ${JSON.stringify(segmentHours)}`);
+                            segmentHours.forEach(h => {
+                                console.log(`  AGP h${h}: ${JSON.stringify(hourlyAgpStats7d[h])}`);
+                            });
 
                             const agpPersistent = segmentHours.some(h => {
                                 const hourData = hourlyAgpStats7d[h];
@@ -9917,6 +9951,9 @@
                                        hourData.tir < AGP_PERSIST_TIR_THRESHOLD &&
                                        hourData.lowPct <= AGP_PERSIST_LOW_THRESHOLD;
                             });
+
+                            // DIAG-AGPPERSIST-5: Log final decision
+                            console.log(`[AGPPERSIST DIAG] agpPersistent: ${agpPersistent}`);
 
                             if (agpPersistent) {
                                 bundle.isStale = false;
