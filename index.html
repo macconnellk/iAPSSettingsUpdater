@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.53</title>
+    <title>Daily Insulin Settings Review v3.5.54</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -1616,6 +1616,11 @@
                     return 'Corrections causing lows - ISF too strong';
                 }
                 if (types.includes(FindingType.CORRECTION_INEFFECTIVE)) {
+                    const isBasalInsuff = findings.some(f =>
+                        f.type === FindingType.CORRECTION_INEFFECTIVE &&
+                        f.diagnosticContext?.patternType === 'basal_insufficiency'
+                    );
+                    if (isBasalInsuff) return 'Overnight BG rising despite corrections — basal insufficient for this period';
                     return 'Corrections not reaching target - ISF too weak';
                 }
                 if (types.includes(FindingType.BASAL_SIGNAL_HIGH)) {
@@ -4491,7 +4496,7 @@
                     // No governing meal → fasting context; not in engine scope
                     if (!governingMeal) continue;
 
-                    const mealTime = new Date(governingMeal.created_at);
+                    let mealTime = new Date(governingMeal.created_at); // let — updated by consolidation when earlier entry exists
 
                     // Governing meal consolidation — high path
                     const GOVERNING_MEAL_CONSOLIDATION_WINDOW_MS_H = 15 * 60 * 1000;
@@ -4504,6 +4509,10 @@
                         Math.min(...clusterEntriesHigh.map(t => new Date(t.created_at).getTime()))
                     );
                     const splitMealConsolidated = clusterEntriesHigh.length > 1;
+                    // DEF-001 fix: apply consolidatedMealTimeHigh when earlier than governing meal
+                    if (consolidatedMealTimeHigh < mealTime) {
+                        mealTime = consolidatedMealTimeHigh;
+                    }
                     const minsFromMealToPeak = (highTime - mealTime) / 60000;
 
                     // Minimum causal latency: peak < 30 min after meal predates meal causally
@@ -4959,7 +4968,7 @@
                         driftThresholdMg: DRIFT_THRESHOLD_MG
                     };
 
-                    // v3.5.53 Fix 1: basal_insufficiency findings route to basal,
+                    // v3.5.54 Fix 1: basal_insufficiency findings route to basal,
                     // not ISF. Correct primaryParameter now so detectSlotConflicts
                     // groups them under 'basal' slots — prevents false conflicts
                     // with ISF_INDUCED_LOW findings at the same scheduleTime.
@@ -6598,7 +6607,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.53',
+                            version: '3.5.54',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6841,7 +6850,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.53',
+                        version: '3.5.54',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -7292,12 +7301,9 @@
                     new Date(c.date) >= cutoff3d
                 );
                 for (const change of autoApplied.slice(0, 3)) {
-                    const daysAgo = Math.floor((new Date() - new Date(change.date)) / (24 * 60 * 60 * 1000));
-                    if (daysAgo >= 1) {
-                        prompts.sessionContinuity.manualLogged.push(
-                            `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} detected ${change.date}: Confirm effect visible in today's data.`
-                        );
-                    }
+                    prompts.sessionContinuity.manualLogged.push(
+                        `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} detected ${change.date}: Confirm effect visible in today's data.`
+                    );
                 }
                 
                 // Period TIR trends
@@ -8177,8 +8183,9 @@
                     const yVal = (yPd[yKey] !== null && yPd[yKey] !== '' && yPd[yKey] !== undefined) ? parseFloat(yPd[yKey]) : null;
                     const tVal = p.medianDeviation;
                     if (yVal !== null && tVal !== null) {
-                        const diff = tVal - yVal;
-                        const arrow = diff < -3 ? '↓ worsening' : diff > 3 ? '↑ improving' : '→ stable';
+                        const prevAbs = Math.abs(yVal);
+                        const currAbs = Math.abs(tVal);
+                        const arrow = currAbs < prevAbs - 3 ? '↓ improving' : currAbs > prevAbs + 3 ? '↑ worsening' : '→ stable';
                         metrics.push({ label: `${p.name} dev`, prev: yVal.toFixed(0), curr: tVal.toFixed(0), delta: arrow });
                     }
                 }
@@ -9493,7 +9500,7 @@
                         claimedEvents, analysisWindow, signalAnalysis
                     ));
 
-                    // v3.5.53: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
+                    // v3.5.54: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
                     // Detector 3 has no dependency on CAE output — it reads only nightscoutData,
                     // crSchedule, claimedEvents, and analysisWindow. Running it first ensures
                     // REBOUND_HIGH meals have their post-meal highs claimed in claimedEvents.highs
@@ -9788,7 +9795,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.53: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.54: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10968,7 +10975,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.53 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.54 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
