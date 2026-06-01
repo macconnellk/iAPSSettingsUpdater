@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.54</title>
+    <title>Daily Insulin Settings Review v3.5.55</title>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -4968,7 +4968,7 @@
                         driftThresholdMg: DRIFT_THRESHOLD_MG
                     };
 
-                    // v3.5.54 Fix 1: basal_insufficiency findings route to basal,
+                    // v3.5.55 Fix 1: basal_insufficiency findings route to basal,
                     // not ISF. Correct primaryParameter now so detectSlotConflicts
                     // groups them under 'basal' slots — prevents false conflicts
                     // with ISF_INDUCED_LOW findings at the same scheduleTime.
@@ -6607,7 +6607,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.54',
+                            version: '3.5.55',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6850,7 +6850,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.54',
+                        version: '3.5.55',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -6989,7 +6989,14 @@
                                 return t2 >= dayStart && t2 < dayEnd && (t.carbs > 0 || t.insulin > 0);
                             })
                             .map(t => {
-                                const obj = { time: Math.round((new Date(t.created_at) - dayStart) / 60000) };
+                                const eventDate = new Date(t.created_at);
+                                const obj = {
+                                    time: Math.round((eventDate - dayStart) / 60000),
+                                    localTime: eventDate.toLocaleString('en-US', {
+                                        month: 'short', day: 'numeric',
+                                        hour: 'numeric', minute: '2-digit', hour12: true
+                                    })
+                                };
                                 if (t.carbs > 0) obj.carbs = t.carbs;
                                 if (t.insulin > 0) obj.insulin = Math.round(t.insulin * 100) / 100;
                                 return obj;
@@ -9500,7 +9507,7 @@
                         claimedEvents, analysisWindow, signalAnalysis
                     ));
 
-                    // v3.5.54: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
+                    // v3.5.55: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
                     // Detector 3 has no dependency on CAE output — it reads only nightscoutData,
                     // crSchedule, claimedEvents, and analysisWindow. Running it first ensures
                     // REBOUND_HIGH meals have their post-meal highs claimed in claimedEvents.highs
@@ -9795,7 +9802,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.54: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.55: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10975,7 +10982,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.54 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.55 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
