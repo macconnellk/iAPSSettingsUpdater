@@ -3,10 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.55</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <title>Daily Insulin Settings Review v3.5.56</title>
+    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.29.5/babel.min.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
@@ -4968,7 +4968,7 @@
                         driftThresholdMg: DRIFT_THRESHOLD_MG
                     };
 
-                    // v3.5.55 Fix 1: basal_insufficiency findings route to basal,
+                    // v3.5.56 Fix 1: basal_insufficiency findings route to basal,
                     // not ISF. Correct primaryParameter now so detectSlotConflicts
                     // groups them under 'basal' slots — prevents false conflicts
                     // with ISF_INDUCED_LOW findings at the same scheduleTime.
@@ -6607,7 +6607,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.55',
+                            version: '3.5.56',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -6850,7 +6850,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.55',
+                        version: '3.5.56',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9507,7 +9507,7 @@
                         claimedEvents, analysisWindow, signalAnalysis
                     ));
 
-                    // v3.5.55: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
+                    // v3.5.56: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
                     // Detector 3 has no dependency on CAE output — it reads only nightscoutData,
                     // crSchedule, claimedEvents, and analysisWindow. Running it first ensures
                     // REBOUND_HIGH meals have their post-meal highs claimed in claimedEvents.highs
@@ -9802,7 +9802,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.55: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.56: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -10982,7 +10982,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.55 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.56 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
