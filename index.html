@@ -3866,7 +3866,7 @@
              */
             runCausalAttributionEngine(
                 lowProblems, nightscoutData, crSchedule, isfSchedule,
-                claimedEvents, analysisWindow, signalAnalysis
+                claimedEvents, analysisWindow, signalAnalysis, basalSchedule = null
             ) {
                 const findings = [];
                 const analysisStart = new Date(
@@ -4005,7 +4005,9 @@
                         || (typeof effectiveMinsFromMealToLow === 'number' && effectiveMinsFromMealToLow > 90);
                     // Causal basal block: 75 min before the nadir (60–90 min lag midpoint)
                     const causalBlockTime = new Date(lowTime.getTime() - 75 * 60 * 1000);
-                    const causalBasalBlock = getBasalForTime(causalBlockTime.toISOString(), basalSchedule)?.time ?? null;
+                    const causalBasalBlock = (basalSchedule && basalSchedule.length)
+                        ? (getBasalForTime(causalBlockTime.toISOString(), basalSchedule)?.time ?? null)
+                        : null;
                     const basalSuspectFlag = negIOBAtLow && fastingContext && (causalBasalBlock != null);
 
                     const correctionToEvent = decomp.corrections.length > 0
@@ -9561,7 +9563,7 @@
                     // are claimed before detectDirectMealLows / detectISFInducedLows see them.
                     allFindings.push(...PatternDetectors.runCausalAttributionEngine(
                         lowProblems, nightscoutData, activeSchedules.cr, activeSchedules.isf,
-                        claimedEvents, analysisWindow, signalAnalysis
+                        claimedEvents, analysisWindow, signalAnalysis, activeSchedules.basal
                     ));
 
                     // v3.5.57: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
