@@ -3309,6 +3309,27 @@
                 return findings;
             },
             
+            findClosestDeviceStatus(deviceStatus, targetTime) {
+                // Shared deviceStatus matcher — returns the full record or null (v3.5.57).
+                // Method form so all PatternDetectors methods can call via this.findClosestDeviceStatus.
+                if (!deviceStatus || !deviceStatus.length) return null;
+                const targetMs = targetTime instanceof Date
+                    ? targetTime.getTime()
+                    : new Date(targetTime).getTime();
+                const WINDOW_MS = 15 * 60 * 1000;
+                let closest = null;
+                let closestDelta = Infinity;
+                deviceStatus.forEach(status => {
+                    if (!status.created_at) return;
+                    const delta = Math.abs(new Date(status.created_at).getTime() - targetMs);
+                    if (delta <= WINDOW_MS && delta < closestDelta) {
+                        closest = status;
+                        closestDelta = delta;
+                    }
+                });
+                return closest;
+            },
+
             getIOBAtTime(deviceStatus, targetTime) {
                 // Behavior-preserving wrapper around findClosestDeviceStatus (v3.5.57 refactor).
                 // findClosestDeviceStatus is defined in the module-level scope accessible here.
@@ -3962,7 +3983,7 @@
                     const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
 
                     // Negative-IOB-at-low basal signal (v3.5.57)
-                    const iobRecordAtLow = findClosestDeviceStatus(nightscoutData.deviceStatus, lowTime);
+                    const iobRecordAtLow = this.findClosestDeviceStatus(nightscoutData.deviceStatus, lowTime);
                     let netIobAtNadir = null;
                     let basalIobAtNadir = null;
                     let negBasalMode = false;
