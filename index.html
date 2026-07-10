@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.61</title>
+    <title>Daily Insulin Settings Review v3.5.63</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -1510,7 +1510,7 @@
                 if (finding.type === FindingType.MIXED_ATTRIBUTION) return null;
                 if (finding.type === FindingType.RESISTANT_HIGH) return null;
                 if (finding.type === FindingType.PRESSURE_ARTIFACT) return null;
-                // v3.5.61: DAWN_CORRECTION_PATTERN is detect-and-quantify-only — it informs the
+                // v3.5.63: DAWN_CORRECTION_PATTERN is detect-and-quantify-only — it informs the
                 // review that basal is under-provisioned across the dawn window but does not itself
                 // recommend a change (that's a clinical decision on the basal schedule). Excluded
                 // here so it never generates an unintended basal recommendation.
@@ -2792,7 +2792,7 @@
                 const findings = [];
                 const analysisStart = new Date(Date.now() - analysisWindow * 24 * 60 * 60 * 1000);
                 
-                // Shared deviceStatus matcher — returns the full record or null (v3.5.61)
+                // Shared deviceStatus matcher — returns the full record or null (v3.5.63)
                 const findClosestDeviceStatus = (deviceStatus, targetTime) => {
                     if (!deviceStatus || !deviceStatus.length) return null;
                     const targetMs = targetTime instanceof Date
@@ -3316,7 +3316,7 @@
             },
             
             findClosestDeviceStatus(deviceStatus, targetTime) {
-                // Shared deviceStatus matcher — returns the full record or null (v3.5.61).
+                // Shared deviceStatus matcher — returns the full record or null (v3.5.63).
                 // Method form so all PatternDetectors methods can call via this.findClosestDeviceStatus.
                 if (!deviceStatus || !deviceStatus.length) return null;
                 const targetMs = targetTime instanceof Date
@@ -3337,7 +3337,7 @@
             },
 
             getIOBAtTime(deviceStatus, targetTime) {
-                // Behavior-preserving wrapper around findClosestDeviceStatus (v3.5.61 refactor).
+                // Behavior-preserving wrapper around findClosestDeviceStatus (v3.5.63 refactor).
                 // findClosestDeviceStatus is defined in the module-level scope accessible here.
                 if (!deviceStatus || deviceStatus.length === 0) return null;
                 const targetMs = targetTime instanceof Date
@@ -3988,7 +3988,7 @@
 
                     const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
 
-                    // Negative-IOB-at-low basal signal (v3.5.61)
+                    // Negative-IOB-at-low basal signal (v3.5.63)
                     const iobRecordAtLow = this.findClosestDeviceStatus(nightscoutData.deviceStatus, lowTime);
                     let netIobAtNadir = null;
                     let basalIobAtNadir = null;
@@ -4285,7 +4285,7 @@
                     }
 
                     if (finding) {
-                        // Attach negative-IOB basal signal fields (v3.5.61)
+                        // Attach negative-IOB basal signal fields (v3.5.63)
                         finding.netIobAtNadir = netIobAtNadir;
                         finding.basalIobAtNadir = basalIobAtNadir;
                         finding.negIOBAtLow = negIOBAtLow;
@@ -4840,7 +4840,7 @@
             },
 
             // ─────────────────────────────────────────────────────────────────
-            // v3.5.61: Dawn Correction Pattern Detector
+            // v3.5.63: Dawn Correction Pattern Detector
             // Scans the fasted 4:30 AM → breakfast-anchor window for reactive dawn
             // corrections (SMBs handling a fasted circadian rise instead of basal),
             // quantifies the IOB deposited at breakfast and the resulting bolus
@@ -4883,28 +4883,22 @@
                         })
                         .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
-                    const breakfastMeal = dayCarbs[0];
-                    if (!breakfastMeal) {
-                        return; // no breakfast anchor → cannot close window → skip day
-                    }
-
-                    const breakfastAnchorTime = new Date(breakfastMeal.created_at);
-
-                    // 4:00–4:30 asymmetry: if the anchor falls before the 4:30 scan opens,
-                    // the window would close before it opens → no valid dawn window, skip.
-                    if (breakfastAnchorTime <= fourThirtyAM) {
-                        return;
-                    }
-
-                    // v3.5.61: Dawn window ceiling. The dawn phenomenon is a pre-waking rise;
-                    // an unbounded [4:30, breakfast) window balloons on late-breakfast days and
-                    // sweeps midday corrections in as "dawn." Cap the window end at the earlier of
-                    // the breakfast anchor OR a 9:00 AM ceiling. breakfastWithinWindow gates the
-                    // suppression link — on a late-breakfast day (anchor > ceiling), 5 AM correction
-                    // IOB is long gone by breakfast, so the suppression story does not apply.
+                    // v3.5.63: The 9:00 AM ceiling defines the dawn window end — not the breakfast
+                    // anchor. The dawn/cortisol phenomenon is a bounded pre-wake event ending ~9:00 AM;
+                    // a rise past 9:00 is later-morning basal/ISF insufficiency that other detectors own.
+                    // The anchor only (1) closes the window EARLY if breakfast is before 9:00, and
+                    // (2) provides the suppression link. It no longer gates whether the day runs —
+                    // no-breakfast and late-breakfast (weekend) days now fire on the dawn gates.
                     const nineAM = new Date(yy, mm, dd, 9, 0, 0);
-                    const breakfastWithinWindow = breakfastAnchorTime <= nineAM;
-                    const windowEnd = breakfastWithinWindow ? breakfastAnchorTime : nineAM;
+                    const breakfastMeal = dayCarbs[0]; // may be undefined (no carb after 4 AM)
+                    const breakfastAnchorTime = breakfastMeal ? new Date(breakfastMeal.created_at) : null;
+                    // Anchor closes the window early only if it exists, is after the 4:30 scan opens,
+                    // AND is before the 9:00 ceiling. Otherwise the ceiling is the window end.
+                    const anchorClosesWindow = breakfastAnchorTime != null
+                        && breakfastAnchorTime > fourThirtyAM
+                        && breakfastAnchorTime <= nineAM;
+                    const breakfastWithinWindow = anchorClosesWindow;
+                    const windowEnd = anchorClosesWindow ? breakfastAnchorTime : nineAM;
 
                     // Dawn-window correction SMBs: [4:30 AM, windowEnd)
                     const dawnSMBs = nightscoutData.treatments
@@ -4943,9 +4937,29 @@
                     const exitBG = windowGlucose[windowGlucose.length - 1].sgv;
                     const bgDelta = exitBG - entryBG;
 
-                    // IOB at window end (the deposit the corrections left on board at breakfast/ceiling)
-                    const iobAtBreakfast = this.getIOBAtTime(nightscoutData.deviceStatus, windowEnd);
-                    // v3.5.61: distinguish "unmeasured" (no deviceStatus in the 15-min window)
+                    // IOB at breakfast — only meaningful when a real breakfast anchor closes the
+                    // window (breakfastWithinWindow). On no-anchor / late-anchor days there is no
+                    // breakfast to look up IOB at; report null/unavailable rather than a meaningless
+                    // reading at the 9:00 ceiling. (v3.5.63)
+                    const iobAtBreakfast = breakfastWithinWindow
+                        ? this.getIOBAtTime(nightscoutData.deviceStatus, windowEnd)
+                        : null;
+                    // v3.5.63 DIAG-IOB: characterize the null-IOB-at-anchor case (only when a real
+                    // breakfast anchor exists but the lookup missed — the genuine gap-vs-bug question).
+                    if (breakfastWithinWindow && iobAtBreakfast == null && nightscoutData.deviceStatus && nightscoutData.deviceStatus.length) {
+                        const targetMs = windowEnd.getTime();
+                        let nearest = null, nearestDelta = Infinity;
+                        nightscoutData.deviceStatus.forEach(s => {
+                            if (!s.created_at) return;
+                            const d = Math.abs(new Date(s.created_at).getTime() - targetMs);
+                            if (d < nearestDelta) { nearest = s; nearestDelta = d; }
+                        });
+                        console.log('[DIAG-IOB]', dk, 'windowEnd:', windowEnd.toISOString(),
+                            '| nearest deviceStatus:', nearest ? nearest.created_at : 'none',
+                            '| delta min:', nearest ? (nearestDelta / 60000).toFixed(1) : 'n/a',
+                            '| nearest.iob:', nearest ? JSON.stringify(nearest.iob) : 'n/a');
+                    }
+                    // v3.5.63: distinguish "unmeasured" (no deviceStatus in the 15-min window)
                     // from a genuine zero. Null misread as 0 would understate the dawn IOB deposit.
                     const iobAtBreakfastAvailable = iobAtBreakfast != null;
 
@@ -4967,28 +4981,70 @@
                     });
                 });
 
-                // Persistence threshold: 3+ days with the dawn pattern
-                if (sessions.length < 3) return findings;
+                if (sessions.length === 0) return findings;
 
-                // Representative (most recent) session drives the emitted finding's anchor fields
-                // v3.5.61: representative = strongest dawn session (most SMBs, tie-break largest
-                // bgRise), not most recent. The representative drives the emitted quantified fields;
-                // the richest day tells the clearer story and is less likely to have a null anchor IOB.
-                const repr = sessions.sort((a, b) =>
-                    (b.dawnSMBs.length - a.dawnSMBs.length) || (b.bgDelta - a.bgDelta)
-                )[0];
+                // v3.5.63: Fire on TODAY, not a representative day. This is a daily-adjustment
+                // tool — it acts on the most recent outcome. Order sessions most-recent-first;
+                // the headline finding comes from the most recent dawn window. Prior days are
+                // persistence annotation only. Sort by windowEnd (always present — the 9:00 ceiling
+                // on no-anchor days) rather than breakfastAnchorTime (null on no-anchor days).
+                sessions.sort((a, b) => b.windowEnd - a.windowEnd);
+                const repr = sessions[0]; // most recent dawn window
 
-                // Causal basal block: the block covering the dawn rise (use 4:30 AM window start).
-                // getBasalForTime reads local hours via getHours() — timezone-safe (v3.5.61).
-                const causalBasalBlock = getBasalForTime(repr.breakfastAnchorTime.toISOString(), basalSchedule)?.time
-                    ?? (basalSchedule && basalSchedule.length
-                        ? getBasalForTime(new Date(repr.breakfastAnchorTime.getFullYear(), repr.breakfastAnchorTime.getMonth(), repr.breakfastAnchorTime.getDate(), 4, 30, 0).toISOString(), basalSchedule)?.time
-                        : null)
-                    ?? null;
+                // Firing gate: the most recent dawn window must show the pattern —
+                // meaningful correction volume AND a BG rise across the window. Both required.
+                //   - Volume ≥ 0.5U: B's dawn pattern is a stream of small SMBs, so the gate is
+                //     cumulative volume, not SMB count.
+                //   - bgDelta > 0: corrections that flattened BG (delta ≤ 0) are not the actionable
+                //     pattern; basal may be adequate. Rise-without-volume is the plain basal-signal
+                //     case that basal_signal_high already catches. The dawn detector's unique value
+                //     is the corrections-chasing-the-rise conjunction.
+                const DAWN_VOLUME_FLOOR_U = 0.5;
+                const todayShowsPattern = repr.dawnSMBVolume >= DAWN_VOLUME_FLOOR_U && repr.bgDelta > 0;
+                if (!todayShowsPattern) return findings; // quiet today = hold, do not fall back to a prior day
+
+                // Persistence is now annotation, not a firing gate. Count days that showed the
+                // pattern (volume floor + rise) for the review instance to weight structural-vs-emerging.
+                const persistenceDays = sessions.filter(s =>
+                    s.dawnSMBVolume >= DAWN_VOLUME_FLOOR_U && s.bgDelta > 0
+                ).length;
+
+                // v3.5.63 addendum: dawnWindowBlocks — the basal schedule blocks the dawn window
+                // [4:30 AM, windowEnd) spans. Block-selection for an adjustment is the review
+                // instance's clinical call; the tool identifies the window, not a single "raise this"
+                // block. Timezone-safe: compare minutes-since-midnight (local), same basis as
+                // getBasalForTime's getHours()/getMinutes().
+                const dawnWindowBlocks = (() => {
+                    if (!basalSchedule || !basalSchedule.length) return [];
+                    const windowStartMin = 4 * 60 + 30; // 4:30 AM
+                    const we = repr.windowEnd;
+                    const windowEndMin = we.getHours() * 60 + we.getMinutes();
+                    const sched = basalSchedule
+                        .map(e => {
+                            const [h, m] = e.time.split(':').map(Number);
+                            return { minutes: h * 60 + m, time: e.time };
+                        })
+                        .sort((a, b) => a.minutes - b.minutes);
+                    // Block active at 4:30 AM = last entry whose start ≤ windowStartMin
+                    let activeAtStart = sched[0];
+                    for (const e of sched) {
+                        if (e.minutes <= windowStartMin) activeAtStart = e;
+                        else break;
+                    }
+                    const blocks = [];
+                    if (activeAtStart) blocks.push(activeAtStart.time);
+                    // Plus every block whose start falls within (windowStartMin, windowEndMin)
+                    sched.forEach(e => {
+                        if (e.minutes > windowStartMin && e.minutes < windowEndMin && !blocks.includes(e.time)) {
+                            blocks.push(e.time);
+                        }
+                    });
+                    return blocks;
+                })();
 
                 // Breakfast-spike link: find a breakfast-adjacent POST_MEAL_HIGH / DIRECT_MEAL_HIGH
                 // in allFindings whose meal time matches the representative breakfast anchor.
-                // v3.5.61: only computed when the representative day's breakfast was within the
+                // v3.5.63: only computed when the representative day's breakfast was within the
                 // dawn window (anchor ≤ 9:00 AM). On late-breakfast days the 5 AM correction IOB
                 // is gone by breakfast, so there is no suppression story to tell → link stays null.
                 const MATCH_TOLERANCE_MS = 30 * 60 * 1000;
@@ -5009,20 +5065,22 @@
                     }
                 }
 
-                const isfEntry = getISFForTime(repr.breakfastAnchorTime.toISOString(), isfSchedule);
-                const avgDelta = sessions.reduce((sum, s) => sum + s.bgDelta, 0) / sessions.length;
+                // Anchor-based lookups fall back to windowEnd when there is no breakfast anchor
+                // (no-anchor day). windowEnd is always present (the 9:00 ceiling).
+                const reprAnchorISO = (repr.breakfastAnchorTime || repr.windowEnd).toISOString();
+                const isfEntry = getISFForTime(reprAnchorISO, isfSchedule);
 
                 findings.push({
                     id: `finding_dawn_corr_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                     type: FindingType.DAWN_CORRECTION_PATTERN,
                     detectedAt: new Date().toISOString(),
-                    eventTime: repr.breakfastAnchorTime.toISOString(),
-                    scheduleTime: causalBasalBlock || (isfEntry ? isfEntry.time : '04:30'),
+                    eventTime: reprAnchorISO,
+                    scheduleTime: (dawnWindowBlocks[0]) || (isfEntry ? isfEntry.time : '04:30'),
                     primaryParameter: 'basal',
                     severity: 0.6,
                     dawnWindow: {
                         start: '04:30',
-                        anchor: formatTimeForDisplay(repr.breakfastAnchorTime.toISOString()),
+                        anchor: repr.breakfastAnchorTime ? formatTimeForDisplay(repr.breakfastAnchorTime.toISOString()) : null,
                         windowEnd: formatTimeForDisplay(repr.windowEnd.toISOString())
                     },
                     dawnSMBVolume: Math.round(repr.dawnSMBVolume * 100) / 100,
@@ -5038,12 +5096,12 @@
                         estimatedBolusReduction
                     },
                     breakfastWithinWindow: repr.breakfastWithinWindow,
-                    causalBasalBlock,
-                    persistenceDays: sessions.length,
-                    similarEventsCount: sessions.length,
-                    daysWithPattern: sessions.length,
+                    dawnWindowBlocks,
+                    persistenceDays: persistenceDays,
+                    similarEventsCount: persistenceDays,
+                    daysWithPattern: persistenceDays,
                     events: sessions.map(s => ({
-                        time: formatTimeForDisplay(s.breakfastAnchorTime.toISOString()),
+                        time: formatTimeForDisplay((s.breakfastAnchorTime || s.windowEnd).toISOString()),
                         windowEnd: formatTimeForDisplay(s.windowEnd.toISOString()),
                         breakfastWithinWindow: s.breakfastWithinWindow,
                         dawnSMBVolume: Math.round(s.dawnSMBVolume * 100) / 100,
@@ -5054,7 +5112,7 @@
                     contributingFactors: ['dawn_correction_pattern', 'fasted_dawn_rise', 'basal_underprovisioned'],
                     conflictsWith: [],
                     recencyWeight: 1.0,
-                    details: `${sessions.length} days: fasted dawn rise (avg +${avgDelta.toFixed(0)} mg/dL across 4:30 AM → breakfast) handled by correction SMBs instead of basal. Representative day deposited ${repr.iobAtBreakfast != null ? repr.iobAtBreakfast.toFixed(2) + 'U' : 'unknown'} IOB at breakfast${linkedFindingId ? ', linked to a breakfast high (bolus suppressed ~' + (estimatedBolusReduction != null ? estimatedBolusReduction.toFixed(2) + 'U' : 'n/a') + ')' : ' (breakfast in range this day)'}. Causal basal block: ${causalBasalBlock || 'n/a'}. Basal likely under-provisioned across the dawn window.`,
+                    details: `Today: fasted dawn rise (+${repr.bgDelta.toFixed(0)} mg/dL across 4:30 AM → ${repr.breakfastWithinWindow ? 'breakfast' : '9:00 AM'}) handled by ${repr.dawnSMBVolume.toFixed(2)}U of correction SMBs instead of basal. ${repr.breakfastWithinWindow ? ('Deposited ' + (repr.iobAtBreakfast != null ? repr.iobAtBreakfast.toFixed(2) + 'U' : 'unavailable') + ' IOB at breakfast' + (linkedFindingId ? ', linked to a breakfast high (bolus suppressed ~' + (estimatedBolusReduction != null ? estimatedBolusReduction.toFixed(2) + 'U' : 'n/a') + ')' : ' (breakfast in range today)')) : 'No breakfast within the dawn window (late/no breakfast) — suppression n/a'}. Dawn window spans basal blocks: ${dawnWindowBlocks.length ? dawnWindowBlocks.join(', ') : 'n/a'}. Persistence: ${persistenceDays} day(s) showing the pattern${persistenceDays === 1 ? ' (first occurrence — emerging)' : ''}. Basal likely under-provisioned across the dawn window; block selection is a clinical call.`,
                     safetyNote: null
                 });
 
@@ -5262,7 +5320,7 @@
                         driftThresholdMg: DRIFT_THRESHOLD_MG
                     };
 
-                    // v3.5.61 Fix 1: basal_insufficiency findings route to basal,
+                    // v3.5.63 Fix 1: basal_insufficiency findings route to basal,
                     // not ISF. Correct primaryParameter now so detectSlotConflicts
                     // groups them under 'basal' slots — prevents false conflicts
                     // with ISF_INDUCED_LOW findings at the same scheduleTime.
@@ -6901,7 +6959,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.61',
+                            version: '3.5.63',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7144,7 +7202,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.61',
+                        version: '3.5.63',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -7187,7 +7245,7 @@
                         mapped.blockedBy = b.blockedBy || null;
                         return mapped;
                     }),
-                    // v3.5.61: Structured-JSON path for detect-only findings. These return null
+                    // v3.5.63: Structured-JSON path for detect-only findings. These return null
                     // from findingToRecommendation (no bundle), so they never reach actions/watchList.
                     // Populated directly from analysisResults.findings (aggregatedFindings). The filter
                     // is a detect-only type set — currently DAWN_CORRECTION_PATTERN only; other
@@ -7207,7 +7265,7 @@
                             iobAtBreakfast: f.iobAtBreakfast,
                             iobAtBreakfastAvailable: f.iobAtBreakfastAvailable,
                             breakfastSuppression: f.breakfastSuppression,
-                            causalBasalBlock: f.causalBasalBlock,
+                            dawnWindowBlocks: f.dawnWindowBlocks,
                             persistenceDays: f.persistenceDays,
                             events: f.events || [],
                             details: f.details
@@ -9827,7 +9885,7 @@
                         claimedEvents, analysisWindow, signalAnalysis, activeSchedules.basal
                     ));
 
-                    // v3.5.61: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
+                    // v3.5.63: detectPostMealHighs runs BEFORE runHighCausalAttributionEngine.
                     // Detector 3 has no dependency on CAE output — it reads only nightscoutData,
                     // crSchedule, claimedEvents, and analysisWindow. Running it first ensures
                     // REBOUND_HIGH meals have their post-meal highs claimed in claimedEvents.highs
@@ -9899,7 +9957,7 @@
                         allFindings, nightscoutData, analysisWindow
                     );
 
-                    // v3.5.61: Dawn Correction Pattern — runs BEFORE the waking detector
+                    // v3.5.63: Dawn Correction Pattern — runs BEFORE the waking detector
                     // so its claim on dawn SMBs suppresses the waking detector's overlapping emission.
                     // Uses basalSignalWindow (7d, the AGP/review cadence) rather than the 3-day
                     // detector window — the 3-occurrence persistence threshold needs the wider
@@ -9910,9 +9968,9 @@
                     ));
 
                     // ENH-CAE-003: Waking-Hour Correction Ineffectiveness (daytime Cat3 SMBs)
-                    // v3.5.61 (DEF-007): uses basalSignalWindow (7d) not analysisWindow (3d) — the
+                    // v3.5.63 (DEF-007): uses basalSignalWindow (7d) not analysisWindow (3d) — the
                     // 3-occurrence persistence threshold was near-unsatisfiable in a 3-day window
-                    // measured from mid-session. Same fix pattern as the v3.5.61 dawn detector.
+                    // measured from mid-session. Same fix pattern as the v3.5.63 dawn detector.
                     allFindings.push(...PatternDetectors.detectWakingCorrectionIneffectiveness(
                         nightscoutData, activeSchedules.isf, targetBG, claimedEvents, basalSignalWindow
                     ));
@@ -10135,7 +10193,7 @@
                         sensitivityHistoryLocal
                     );
                     
-                    // Spec 2A / v3.5.61: Stamp sessionSensitivity on findings using
+                    // Spec 2A / v3.5.63: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
                     // the sensitivity from the session when their event occurred;
                     // today's findings (or those with no history entry) get the current
@@ -11315,7 +11373,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.61 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.63 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
