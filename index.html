@@ -4863,6 +4863,9 @@
 
                 const sessions = [];
 
+                // DIAG-DAWN-2: which days are iterated
+                console.log('[DIAG-DAWN-2] days iterated:', [...days].join(', '));
+
                 days.forEach(dk => {
                     // Reconstruct the calendar day's 4:00 AM and 4:30 AM local boundaries
                     const [yy, mm, dd] = dk.split('-').map(Number);
@@ -4879,13 +4882,41 @@
                         .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
                     const breakfastMeal = dayCarbs[0];
-                    if (!breakfastMeal) return; // no breakfast anchor → cannot close window → skip day
+                    if (!breakfastMeal) {
+                        console.log('[DIAG-DAWN-2]', dk, '→ no breakfast anchor (no carb after 4 AM) → skip');
+                        return; // no breakfast anchor → cannot close window → skip day
+                    }
 
                     const breakfastAnchorTime = new Date(breakfastMeal.created_at);
+                    console.log('[DIAG-DAWN-2]', dk, '→ anchor:', breakfastMeal.created_at, '(' + breakfastMeal.carbs + 'g)');
 
                     // 4:00–4:30 asymmetry: if the anchor falls before the 4:30 scan opens,
                     // the window would close before it opens → no valid dawn window, skip.
-                    if (breakfastAnchorTime <= fourThirtyAM) return;
+                    if (breakfastAnchorTime <= fourThirtyAM) {
+                        console.log('[DIAG-DAWN-2]', dk, '→ anchor ≤ 4:30 AM → skip (window closes before opening)');
+                        return;
+                    }
+
+                    // DIAG-DAWN-2: SMB filtering breakdown for this day's window
+                    const rawWindowSMBs = nightscoutData.treatments.filter(t => {
+                        if (!t.eventType || !t.eventType.includes('SMB')) return false;
+                        if (!t.insulin || t.insulin <= 0 || !t.created_at) return false;
+                        const tt = new Date(t.created_at);
+                        return tt >= fourThirtyAM && tt < breakfastAnchorTime;
+                    });
+                    console.log('[DIAG-DAWN-2]', dk, '→ raw SMBs in [4:30, anchor):', rawWindowSMBs.length);
+                    rawWindowSMBs.forEach(t => {
+                        const tt = new Date(t.created_at);
+                        const alreadyClaimed = claimedEvents.corrections.has(getEventId(t));
+                        const lookbackStart = new Date(tt.getTime() - 3 * 60 * 60 * 1000);
+                        const priorMeal = nightscoutData.treatments.find(m => {
+                            if (!m.carbs || m.carbs < CONFIG.minMealCarbsForAttribution || !m.created_at) return false;
+                            const mt = new Date(m.created_at);
+                            return mt >= lookbackStart && mt <= tt;
+                        });
+                        console.log('     SMB', t.created_at, 'ins', t.insulin,
+                            '| claimed:', alreadyClaimed, '| fastedBlockedBy:', priorMeal ? priorMeal.created_at + '(' + priorMeal.carbs + 'g)' : 'none(passes)');
+                    });
 
                     // Dawn-window correction SMBs: [4:30 AM, breakfast anchor)
                     const dawnSMBs = nightscoutData.treatments
@@ -4906,6 +4937,8 @@
                             return !priorMeal;
                         })
                         .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+                    console.log('[DIAG-DAWN-2]', dk, '→ dawnSMBs after all filters:', dawnSMBs.length);
 
                     if (dawnSMBs.length === 0) return; // no reactive dawn corrections this day
 
@@ -4942,6 +4975,7 @@
                 });
 
                 // Persistence threshold: 3+ days with the dawn pattern
+                console.log('[DIAG-DAWN-2] total dawn sessions collected:', sessions.length, '(threshold: 3)');
                 if (sessions.length < 3) return findings;
 
                 // Representative (most recent) session drives the emitted finding's anchor fields
@@ -8731,6 +8765,56 @@
                     });
                     
                     console.log('=== fetchNightscoutData complete ===');
+
+                    // ===== DIAG-DAWN-1: Raw fetch completeness (v3.5.59 dawn diagnostic) =====
+                    try {
+                        const gTimes = glucose.map(r => new Date(r.dateString).getTime()).filter(n => !isNaN(n));
+                        const gMin = gTimes.length ? new Date(Math.min(...gTimes)).toISOString() : 'none';
+                        const gMax = gTimes.length ? new Date(Math.max(...gTimes)).toISOString() : 'none';
+                        console.log('[DIAG-DAWN-1] glucose.length:', glucose.length, '| span:', gMin, '→', gMax);
+                        const now = Date.now();
+                        const smb48 = treatments.filter(t => {
+                            if (!t.eventType || !t.eventType.includes('SMB')) return false;
+                            if (!t.created_at) return false;
+                            return (now - new Date(t.created_at).getTime()) <= 48 * 3600 * 1000;
+                        });
+                        console.log('[DIAG-DAWN-1] treatments.length:', treatments.length, '| SMBs last 48h:', smb48.length);
+                        // Dawn-window SMBs: most recent calendar day, 4:30–8:00 AM local
+                        const d = new Date();
+                        const y = d.getFullYear(), mo = d.getMonth(), da = d.getDate();
+                        const dawnStart = new Date(y, mo, da, 4, 30, 0);
+                        const dawnEnd = new Date(y, mo, da, 8, 0, 0);
+                        const todayDawnSMBs = treatments.filter(t => {
+                            if (!t.created_at) return false;
+                            const tt = new Date(t.created_at);
+                            return tt >= dawnStart && tt <= dawnEnd;
+                        }).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+                        console.log('[DIAG-DAWN-1] today 4:30–8:00 AM treatments (' + todayDawnSMBs.length + '):');
+                        todayDawnSMBs.forEach(t => {
+                            console.log('   ', t.created_at, '| eventType:', t.eventType, '| insulin:', t.insulin, '| carbs:', t.carbs);
+                        });
+                        // Also check yesterday's dawn window (in case "today" hasn't reached dawn yet)
+                        const yStart = new Date(y, mo, da - 1, 4, 30, 0);
+                        const yEnd = new Date(y, mo, da - 1, 8, 0, 0);
+                        const yDawnSMBs = treatments.filter(t => {
+                            if (!t.created_at) return false;
+                            const tt = new Date(t.created_at);
+                            return tt >= yStart && tt <= yEnd;
+                        }).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+                        console.log('[DIAG-DAWN-1] yesterday 4:30–8:00 AM treatments (' + yDawnSMBs.length + '):');
+                        yDawnSMBs.forEach(t => {
+                            console.log('   ', t.created_at, '| eventType:', t.eventType, '| insulin:', t.insulin, '| carbs:', t.carbs);
+                        });
+                        // Min BG in last 24h raw (to check the missing afternoon lows)
+                        const dayStart24 = now - 24 * 3600 * 1000;
+                        const last24 = glucose.filter(r => new Date(r.dateString).getTime() >= dayStart24 && r.sgv > 20 && r.sgv < 500);
+                        const minBG = last24.length ? Math.min(...last24.map(r => r.sgv)) : 'none';
+                        console.log('[DIAG-DAWN-1] raw last-24h glucose count:', last24.length, '| min BG:', minBG);
+                    } catch (e) {
+                        console.log('[DIAG-DAWN-1] logging error:', e.message);
+                    }
+                    // ===== end DIAG-DAWN-1 =====
+
                     return { glucose, treatments, deviceStatus, profile };
                     
                 } catch (err) {
