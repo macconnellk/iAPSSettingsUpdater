@@ -4916,7 +4916,7 @@
             // only — no basal recommendation. Runs BEFORE detectWakingCorrectionIneffectiveness
             // so its claim on dawn SMBs suppresses that detector's overlapping emission.
             // ─────────────────────────────────────────────────────────────────
-            detectDawnCorrectionPattern(nightscoutData, isfSchedule, basalSchedule, claimedEvents, analysisWindow, allFindings) {
+            detectDawnCorrectionPattern(nightscoutData, isfSchedule, basalSchedule, claimedEvents, analysisWindow, allFindings, isNativeToday = true, dawnRequirementOut = null) {
                 const findings = [];
                 const analysisStart = new Date(Date.now() - analysisWindow * 24 * 60 * 60 * 1000);
 
@@ -4925,6 +4925,80 @@
                     const dt = new Date(d);
                     return `${dt.getFullYear()}-${dt.getMonth()}-${dt.getDate()}`;
                 };
+
+                // [DAWN-REQ-START] v3.5.74: additive today-requirement computation.
+                // Runs before the session loop so no early return can skip it, and never
+                // depends on sessions/repr — the finding path stays pristine. Reads the
+                // same claim state the loop's first iteration sees (only reads, never
+                // claims). No-op when the caller does not provide a sink (harness old-way
+                // calls). Window/filter rules are byte-mirrored from the loop below.
+                if (dawnRequirementOut) {
+                    try {
+                        const reqNow = new Date();
+                        const todayKey = dayKey(reqNow);
+                        // Persisted date is ISO local (getLocalDateString), matching the Date
+                        // column and every other persisted date. todayKey (dayKey format,
+                        // month 0-indexed) is internal window logic only and never persisted.
+                        const todayISO = getLocalDateString(reqNow);
+                        const [ty, tm, td] = todayKey.split('-').map(Number);
+                        const tFourAM = new Date(ty, tm, td, 4, 0, 0);
+                        const tFourThirtyAM = new Date(ty, tm, td, 4, 30, 0);
+                        const tNineAM = new Date(ty, tm, td, 9, 0, 0);
+                        const tDayCarbs = nightscoutData.treatments
+                            .filter(t => {
+                                if (!t.carbs || t.carbs <= 0 || !t.created_at) return false;
+                                const tt = new Date(t.created_at);
+                                return tt >= tFourAM && dayKey(tt) === todayKey;
+                            })
+                            .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+                        const tAnchor = tDayCarbs[0] ? new Date(tDayCarbs[0].created_at) : null;
+                        const tAnchorCloses = tAnchor != null
+                            && tAnchor > tFourThirtyAM
+                            && tAnchor <= tNineAM;
+                        const tWindowEnd = tAnchorCloses ? tAnchor : tNineAM;
+                        if (tWindowEnd > reqNow) {
+                            // Window not yet closed (pre-dawn run) — not measurable, do not persist
+                            dawnRequirementOut.today = { date: todayISO, available: false, native: isNativeToday };
+                        } else {
+                            const tSMBs = nightscoutData.treatments.filter(t => {
+                                if (!t.eventType || !t.eventType.includes('SMB')) return false;
+                                if (!t.insulin || t.insulin <= 0 || !t.created_at) return false;
+                                const tt = new Date(t.created_at);
+                                if (!(tt >= tFourThirtyAM && tt < tWindowEnd)) return false;
+                                if (claimedEvents.corrections.has(getEventId(t))) return false;
+                                const lookbackStart = new Date(tt.getTime() - 3 * 60 * 60 * 1000);
+                                const priorMeal = nightscoutData.treatments.find(m => {
+                                    if (!m.carbs || m.carbs < CONFIG.minMealCarbsForAttribution || !m.created_at) return false;
+                                    const mt = new Date(m.created_at);
+                                    return mt >= lookbackStart && mt <= tt;
+                                });
+                                return !priorMeal;
+                            });
+                            const todayVolume = tSMBs.reduce((sum, t) => sum + (t.insulin || 0), 0);
+                            const tGlucose = nightscoutData.glucose
+                                .filter(r => {
+                                    const rt = new Date(r.dateString);
+                                    return rt >= tFourThirtyAM && rt <= tWindowEnd;
+                                })
+                                .sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
+                            const tBgDelta = tGlucose.length >= 2
+                                ? tGlucose[tGlucose.length - 1].sgv - tGlucose[0].sgv
+                                : null;
+                            dawnRequirementOut.today = {
+                                date: todayISO,
+                                volume: Math.round(todayVolume * 100) / 100,
+                                bgDelta: tBgDelta == null ? null : Math.round(tBgDelta),
+                                native: isNativeToday,
+                                available: true
+                            };
+                        }
+                    } catch (reqErr) {
+                        // The sink must never break the finding path; a missing today value
+                        // fails safe (payload emits [], nothing contaminated) — but not silently.
+                        console.log('[DAWN-REQ] today computation error', reqErr && reqErr.message);
+                    }
+                }
+                // [DAWN-REQ-END]
 
                 // Collect the set of days present in the analysis window
                 const days = new Set();
@@ -7054,7 +7128,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.72',
+                            version: '3.5.75',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7297,7 +7371,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.72',
+                        version: '3.5.75',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -8331,7 +8405,40 @@
                     }
                     output += '\n';
                 }
-                
+
+                // [DAWN-REQ-TREND-START] v3.5.75: native-day fasted dawn requirement series.
+                // One-element arrays per row (AN Dawn_Correction_Slots), flattened, deduped
+                // one-per-day (last wins), ascending by date. Dates are ISO local
+                // (getLocalDateString, 'YYYY-MM-DD') — parse via Date(y, m-1, d).
+                {
+                    const dawnByDate = {};
+                    for (const e of entries) {
+                        const slots = Array.isArray(e.dawnCorrectionSlots) ? e.dawnCorrectionSlots : [];
+                        for (const s of slots) {
+                            if (s && s.date != null && s.volume != null) dawnByDate[s.date] = s;
+                        }
+                    }
+                    const parseDawnDate = (d) => {
+                        const p = String(d).split('-').map(Number);
+                        return new Date(p[0], p[1] - 1, p[2]);
+                    };
+                    const dawnSorted = Object.values(dawnByDate).sort(
+                        (a, b) => parseDawnDate(a.date) - parseDawnDate(b.date)
+                    );
+                    if (dawnSorted.length > 0) {
+                        output += '## Dawn Requirement Trend (native days — fasted dawn correction volume)\n\n';
+                        output += '| Date | Volume (U) | BG Δ |\n';
+                        output += '|------|-----------|------|\n';
+                        for (const s of dawnSorted) {
+                            const label = parseDawnDate(s.date).toLocaleDateString('en-US', {month:'short', day:'numeric'});
+                            const delta = (s.bgDelta == null) ? '-' : String(s.bgDelta);
+                            output += `| ${label} | ${Number(s.volume).toFixed(2)} | ${delta} |\n`;
+                        }
+                        output += '\n';
+                    }
+                }
+                // [DAWN-REQ-TREND-END]
+
                 // === Persistent Item Tracking ===
                 const recentWithActions = entries.filter(e => e.primaryActions);
                 const recentWithWatch = entries.filter(e => e.watchItems);
@@ -9302,7 +9409,7 @@
             };
             
             // Auto-log to Google Sheets after analysis
-            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules, processedBundles = [], carbAdjSensitivity = null) => {
+            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules, processedBundles = [], carbAdjSensitivity = null, dawnRequirement = null) => {
                 console.log('=== attemptAutoLog called ===');
                 console.log('Sheets URL:', sheetsWebAppUrl);
                 console.log('State:', state.state);
@@ -9508,6 +9615,19 @@
                                     .filter(Boolean)
                             )];
                         } catch(e) { return []; }
+                    })(),
+                    dawnCorrectionSlots: (() => {
+                        try {
+                            const t = dawnRequirement.today;
+                            // Native, measured day → one-element array matching the Log Script AN shape.
+                            // Override day or unmeasured (pre-dawn) → empty array: nothing to trend,
+                            // row still written. Never write a zero on an override day — a scaled
+                            // night's zero would falsely read as "basal adequate."
+                            if (t && t.available && t.native) {
+                                return [{ date: t.date, volume: t.volume, bgDelta: t.bgDelta }];
+                            }
+                            return [];
+                        } catch (e) { return []; }
                     })()
                 };
                 
@@ -9602,53 +9722,6 @@
                     console.log('Fetching Nightscout data...');
                     const nightscoutData = await fetchNightscoutData();
                     console.log('Nightscout data fetched successfully');
-
-                    // [DIAG-SCALAR-START] v3.5.72 override scalar source diagnostic
-                    try {
-                        const diagKeyPattern = /percent|override|profile|ratio|scale/i;
-                        const diagSubObjects = ['openaps', 'pump', 'profile', 'override'];
-                        const diagDS = Array.isArray(nightscoutData.deviceStatus) ? nightscoutData.deviceStatus : [];
-                        const diagRecent = [...diagDS]
-                            .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
-                            .slice(0, 5);
-                        diagRecent.forEach((rec, i) => {
-                            if (!rec || typeof rec !== 'object') return;
-                            const info = { created_at: rec.created_at, topLevelKeys: Object.keys(rec) };
-                            diagSubObjects.forEach(sub => {
-                                if (rec[sub] && typeof rec[sub] === 'object') {
-                                    info[sub + 'Keys'] = Object.keys(rec[sub]);
-                                }
-                            });
-                            const matched = {};
-                            const diagCollect = (obj, prefix) => {
-                                if (!obj || typeof obj !== 'object') return;
-                                Object.keys(obj).forEach(k => {
-                                    if (diagKeyPattern.test(k)) matched[prefix + k] = obj[k];
-                                });
-                            };
-                            diagCollect(rec, '');
-                            diagSubObjects.forEach(sub => diagCollect(rec[sub], sub + '.'));
-                            info.matchedValues = matched;
-                            console.log('[DIAG-SCALAR] deviceStatus[' + i + ']', JSON.stringify(info));
-                        });
-                        const diagTr = Array.isArray(nightscoutData.treatments) ? nightscoutData.treatments : [];
-                        const diagEvCounts = {};
-                        diagTr.forEach(t => {
-                            const ev = (t && t.eventType) || '(none)';
-                            diagEvCounts[ev] = (diagEvCounts[ev] || 0) + 1;
-                        });
-                        console.log('[DIAG-SCALAR] treatments eventType counts', JSON.stringify(diagEvCounts));
-                        const diagEvPattern = /override|temporary|profile|temp target/i;
-                        diagTr.forEach(t => {
-                            if (t && t.eventType && diagEvPattern.test(t.eventType)) {
-                                console.log('[DIAG-SCALAR] treatment record', JSON.stringify(t));
-                            }
-                        });
-                        console.log('[DIAG-SCALAR] userOverride', JSON.stringify(userOverride));
-                    } catch (diagErr) {
-                        console.log('[DIAG-SCALAR] dump error', diagErr && diagErr.message);
-                    }
-                    // [DIAG-SCALAR-END]
 
                     // Parse and apply profile data (BUG-001 fix)
                     let activeSchedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule };
@@ -10102,9 +10175,15 @@
                     // Uses basalSignalWindow (7d, the AGP/review cadence) rather than the 3-day
                     // detector window — the 3-occurrence persistence threshold needs the wider
                     // lookback to fire, and the 7 days of data are already fetched.
+                    // v3.5.74: requirement sink + per-today native gate. userOverride.active is
+                    // today's state, and the sink measures today's window only — gating today's
+                    // measurement on today's override state is exact (design decision Jul 21).
+                    const dawnRequirement = {};
+                    const isNativeToday = !(userOverride && userOverride.active);
                     allFindings.push(...PatternDetectors.detectDawnCorrectionPattern(
                         nightscoutData, activeSchedules.isf, activeSchedules.basal,
-                        claimedEvents, basalSignalWindow, allFindings
+                        claimedEvents, basalSignalWindow, allFindings,
+                        isNativeToday, dawnRequirement
                     ));
 
                     // ENH-CAE-003: Waking-Hour Correction Ineffectiveness (daytime Cat3 SMBs)
@@ -10676,7 +10755,7 @@
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
-                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity);
+                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity, dawnRequirement);
                     
                 } catch (err) {
                     console.error('Analysis error:', err);
