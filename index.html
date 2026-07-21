@@ -176,6 +176,9 @@
 
             // BUG-CAE-001: iAPS upfront bolus fraction — adjust if SMB settings change
             IAPS_UPFRONT_BOLUS_FRACTION: 0.70,
+            // CR coherence floor: below the upfront share, a meal cannot have been
+            // over-covered, so a CR-too-strong conclusion is unsupportable.
+            crCoherenceMinRatio: 0.70,
         };
         
         // Helper to get local date in YYYY-MM-DD format
@@ -2110,7 +2113,32 @@
             if (status.openaps?.iob?.basaliob != null) return status.openaps.iob.basaliob;
             return null;
         };
-        
+
+        // Single source of truth for bundle status resolution. Every serialization
+        // path (structured export watchList, Sheets watchItems, trend currentData)
+        // and the markdown formatter resolve through this ladder so the JSON, the
+        // log history, and the human-readable report can never disagree.
+        // Precedence: demoted > blocked (safety) > staged (compound ceiling) >
+        // conflict > deferred (ordering only).
+        const getBundleStatus = (bundle) => {
+            if (bundle.demotedReason) {
+                return { status: bundle.demotedReason, statusReason: 'demoted' };
+            }
+            if (bundle.blockedBy) {
+                return { status: bundle.blockedBy, statusReason: 'blocked' };
+            }
+            if (bundle.compoundEffect?.warning === 'HIGH') {
+                return {
+                    status: `Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`,
+                    statusReason: 'staged'
+                };
+            }
+            if (bundle.isSlotConflict) {
+                return { status: 'Hold - conflicting patterns', statusReason: 'conflict' };
+            }
+            return { status: 'Deferred', statusReason: 'deferred' };
+        };
+
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
             const eventTime = new Date(timestamp);
@@ -3783,6 +3811,16 @@
 
             /** §5.7 CR axis — low direction */
             _scoreCRAxisLow(decomp, minsFromMealToLow, glucose, mealTime, lowTime) {
+                // Coherence guard: an under-delivered meal (below the upfront share)
+                // cannot support a CR-too-strong conclusion. expectedBudget > 0 must
+                // short-circuit first — a zero/unknown budget is unknown, not
+                // under-delivered, and null < N is true in JS.
+                if (decomp.expectedBudget > 0 &&
+                    decomp.budgetRatio != null &&
+                    decomp.budgetRatio < CONFIG.crCoherenceMinRatio) {
+                    return 0;
+                }
+
                 let score = 0;
 
                 if (decomp.budgetRatio > 1.40) {
@@ -6386,20 +6424,15 @@
                                            bundle.hasLast3DayEvents ? '[OLD]' : '[STALE]';
                         output += `### ${recencyIcon} ${bundle.name} (Tier ${bundle.tier})\n`;
                         
-                        // Generate appropriate status message
-                        let status;
-                        if (bundle.demotedReason) {
-                            status = `${bundle.demotedReason} - monitoring`;
-                        } else if (bundle.blockedBy) {
-                            status = bundle.blockedBy;
-                        } else if (bundle.compoundEffect?.warning === 'HIGH') {
-                            status = `⚠️ Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`;
-                        } else if (bundle.isSlotConflict) {
-                            status = 'Hold - conflicting patterns detected';
-                        } else if (bundle.isBasalRatioWarning) {
+                        // Status resolves through the shared ladder; presentation-only
+                        // wraps stay here (emoji prefix, basal-ratio rung — a markdown-only
+                        // rung that sits below conflict and above the deferred default).
+                        const bundleStatusResult = getBundleStatus(bundle);
+                        let status = bundleStatusResult.status;
+                        if (bundleStatusResult.statusReason === 'staged') {
+                            status = `⚠️ ${status}`;
+                        } else if (bundleStatusResult.statusReason === 'deferred' && bundle.isBasalRatioWarning) {
                             status = 'Address before CR/ISF optimizations';
-                        } else {
-                            status = 'Deferred - apply primary first';
                         }
                         
                         output += `- **Status:** ${status}\n`;
@@ -7021,7 +7054,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.68',
+                            version: '3.5.72',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7264,7 +7297,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.68',
+                        version: '3.5.72',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -7299,11 +7332,9 @@
                     actions: primaryBundles.map(mapBundle),
                     watchList: referenceBundles.map(b => {
                         const mapped = mapBundle(b);
-                        mapped.status = b.demotedReason || b.blockedBy || 
-                            (b.isSlotConflict ? 'Hold - conflicting patterns' : 'Deferred');
-                        mapped.statusReason = b.demotedReason ? 'demoted' : 
-                            b.blockedBy ? 'blocked' : 
-                            b.isSlotConflict ? 'conflict' : 'deferred';
+                        const bundleStatus = getBundleStatus(b);
+                        mapped.status = bundleStatus.status;
+                        mapped.statusReason = bundleStatus.statusReason;
                         mapped.blockedBy = b.blockedBy || null;
                         return mapped;
                     }),
@@ -9462,7 +9493,7 @@
                             const watch = (processedBundles || []).filter(b => b.priority === 'REFERENCE');
                             return JSON.stringify(watch.map(b => ({
                                 name: b.name,
-                                status: b.demotedReason || b.blockedBy || 'deferred',
+                                status: getBundleStatus(b).status,
                                 confidence: b.confidence ? b.confidence.toFixed(2) : '0'
                             })));
                         } catch(e) { return '[]'; }
@@ -9571,7 +9602,54 @@
                     console.log('Fetching Nightscout data...');
                     const nightscoutData = await fetchNightscoutData();
                     console.log('Nightscout data fetched successfully');
-                    
+
+                    // [DIAG-SCALAR-START] v3.5.72 override scalar source diagnostic
+                    try {
+                        const diagKeyPattern = /percent|override|profile|ratio|scale/i;
+                        const diagSubObjects = ['openaps', 'pump', 'profile', 'override'];
+                        const diagDS = Array.isArray(nightscoutData.deviceStatus) ? nightscoutData.deviceStatus : [];
+                        const diagRecent = [...diagDS]
+                            .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+                            .slice(0, 5);
+                        diagRecent.forEach((rec, i) => {
+                            if (!rec || typeof rec !== 'object') return;
+                            const info = { created_at: rec.created_at, topLevelKeys: Object.keys(rec) };
+                            diagSubObjects.forEach(sub => {
+                                if (rec[sub] && typeof rec[sub] === 'object') {
+                                    info[sub + 'Keys'] = Object.keys(rec[sub]);
+                                }
+                            });
+                            const matched = {};
+                            const diagCollect = (obj, prefix) => {
+                                if (!obj || typeof obj !== 'object') return;
+                                Object.keys(obj).forEach(k => {
+                                    if (diagKeyPattern.test(k)) matched[prefix + k] = obj[k];
+                                });
+                            };
+                            diagCollect(rec, '');
+                            diagSubObjects.forEach(sub => diagCollect(rec[sub], sub + '.'));
+                            info.matchedValues = matched;
+                            console.log('[DIAG-SCALAR] deviceStatus[' + i + ']', JSON.stringify(info));
+                        });
+                        const diagTr = Array.isArray(nightscoutData.treatments) ? nightscoutData.treatments : [];
+                        const diagEvCounts = {};
+                        diagTr.forEach(t => {
+                            const ev = (t && t.eventType) || '(none)';
+                            diagEvCounts[ev] = (diagEvCounts[ev] || 0) + 1;
+                        });
+                        console.log('[DIAG-SCALAR] treatments eventType counts', JSON.stringify(diagEvCounts));
+                        const diagEvPattern = /override|temporary|profile|temp target/i;
+                        diagTr.forEach(t => {
+                            if (t && t.eventType && diagEvPattern.test(t.eventType)) {
+                                console.log('[DIAG-SCALAR] treatment record', JSON.stringify(t));
+                            }
+                        });
+                        console.log('[DIAG-SCALAR] userOverride', JSON.stringify(userOverride));
+                    } catch (diagErr) {
+                        console.log('[DIAG-SCALAR] dump error', diagErr && diagErr.message);
+                    }
+                    // [DIAG-SCALAR-END]
+
                     // Parse and apply profile data (BUG-001 fix)
                     let activeSchedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule };
                     let basalRatioInfo = null;
@@ -10344,13 +10422,14 @@
 
                     // Bimodal period divergence detection.
                     // Period average AGP may read HIGH while individual hours have safety lows.
-                    // Demote basal_signal_high bundles to Watch List when any hour in the target
-                    // period has AGP lowPct > 4% — Safety Rule #1 overrides the aggregate signal.
+                    // Label every basal-strengthen basal_signal_high bundle whose period has an
+                    // hour with AGP lowPct > 4% — Safety Rule #1 overrides the aggregate signal.
+                    // All qualifying bundles receive the safety reason regardless of priority
+                    // (blocked is a safety semantic, not an ordering one); demotion to
+                    // REFERENCE applies only to the period PRIMARY.
                     const BIMODAL_LOW_HOUR_THRESHOLD = 4;
                     if (hourlyAgpStats7d) {
                         processedBundles.forEach(bundle => {
-                            // Only applies to basal_signal_high bundles already promoted
-                            if (bundle.priority !== 'PRIMARY') return;
                             const hasBasalSignalHigh = (bundle.findings || []).some(
                                 f => f.type === FindingType.BASAL_SIGNAL_HIGH
                             );
@@ -10389,7 +10468,9 @@
                                 `(worst: ${worstHour}:00 at ${hourlyAgpStats7d[worstHour]?.lowPct?.toFixed(0)}% low). ` +
                                 `Safety Rule #1: do not strengthen basal into hours with documented lows.`;
 
-                            bundle.priority = 'REFERENCE';
+                            if (bundle.priority === 'PRIMARY') {
+                                bundle.priority = 'REFERENCE';
+                            }
                             bundle.bimodalDivergence = {
                                 type: 'SIGNAL_HIGH_AGP_BIMODAL',
                                 hoursWithLows,
@@ -10998,7 +11079,7 @@
                                 })),
                                 watchItems: (bundles || []).filter(b => b.priority === 'REFERENCE').map(b => ({
                                     name: b.name,
-                                    status: b.demotedReason || b.blockedBy || 'deferred'
+                                    status: getBundleStatus(b).status
                                 }))
                             };
                             
@@ -11021,7 +11102,7 @@
                                     })),
                                     watchItems: (bundles || []).filter(b => b.priority === 'REFERENCE').map(b => ({
                                         name: b.name,
-                                        status: b.demotedReason || b.blockedBy || 'deferred'
+                                        status: getBundleStatus(b).status
                                     }))
                                 };
                                 trendSection = OutputFormatter.generateTrendSection(historyData.entries, currentData);
@@ -11338,7 +11419,7 @@
                             const watch = (bundles || []).filter(b => b.priority === 'REFERENCE');
                             return JSON.stringify(watch.map(b => ({
                                 name: b.name,
-                                status: b.demotedReason || b.blockedBy || 'deferred',
+                                status: getBundleStatus(b).status,
                                 confidence: b.confidence ? b.confidence.toFixed(2) : '0'
                             })));
                         } catch(e) { return '[]'; }
