@@ -6318,7 +6318,34 @@
                 const avgTIR = periodStats.reduce((sum, s) => sum + s.tir.inRange, 0) / periodStats.length;
                 return Math.round(avgTIR);
             },
-            
+
+            // INSTR-1: period low fraction (SGV < 70, veryLow-inclusive), readings-weighted.
+            // Aggregates each hour's sub-70 counts (reconstructed from the hourly tir
+            // percentages × count) over total readings in the period — per spec, unlike
+            // calculatePeriodTIR's unweighted average of hourly percentages.
+            calculatePeriodLow(agp7day, periodName) {
+                if (!agp7day || !agp7day.hourlyStats) return null;
+                const hours = this.PERIOD_HOURS[periodName];
+                if (!hours) return null;
+
+                const periodStats = hours
+                    .map(h => agp7day.hourlyStats[h])
+                    .filter(s => s !== null);
+
+                if (periodStats.length === 0) return null;
+
+                let sub70 = 0, total = 0;
+                periodStats.forEach(s => {
+                    const c = s.count || 0;
+                    sub70 += ((s.tir.low + s.tir.veryLow) / 100) * c;
+                    total += c;
+                });
+                if (total === 0) return null;
+                // One decimal (PM ruling Jul 22) — lows sit near the 2% constraint;
+                // integer rounding would erase the signal.
+                return Math.round((sub70 / total) * 1000) / 10;
+            },
+
             formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], cachedHistory = []) {
                 const now = new Date();
                 const dateStr = now.toLocaleDateString('en-US', { 
@@ -7128,7 +7155,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.75',
+                            version: '3.5.77',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7371,7 +7398,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.75',
+                        version: '3.5.77',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9566,6 +9593,10 @@
                     // and all 6 period TIR fields share a single calculateAGP() call (was 7 calls).
                     // agp7d_auto is declared just before the logEntry object literal below.
                     tir7d: agp7d_auto ? agp7d_auto.tir.inRange.toFixed(1) : '',
+                    // INSTR-1 (PM ruling Jul 22): lows = TBR<70. lowPct is ALL SGV <70
+                    // (tir.low + tir.veryLow); veryLowPct (<54) is a subset, not a complement.
+                    lowPct: agp7d_auto ? (agp7d_auto.tir.low + agp7d_auto.tir.veryLow).toFixed(1) : '',
+                    veryLowPct: agp7d_auto ? agp7d_auto.tir.veryLow.toFixed(1) : '',
                     basalRatio: basalRatioInfo?.ratio ? basalRatioInfo.ratio.toFixed(1) : '',
                     // SPEC 2+: Period TIR tracking — all share agp7d_auto, zero additional AGP calls
                     ...(() => {
@@ -9575,6 +9606,13 @@
                                 return tir !== null ? tir.toString() : '';
                             } catch(e) { return ''; }
                         };
+                        // INSTR-1: per-period lows (sub-70 inclusive), one decimal (PM ruling Jul 22)
+                        const getLow = (period) => {
+                            try {
+                                const low = OutputFormatter.calculatePeriodLow(agp7d_auto, period);
+                                return low !== null ? low.toFixed(1) : '';
+                            } catch(e) { return ''; }
+                        };
                         return {
                             tirDeepSleep:  getTIR('Deep Sleep'),
                             tirDawn:       getTIR('Dawn'),
@@ -9582,6 +9620,12 @@
                             tirAfternoon:  getTIR('Afternoon'),
                             tirEvening:    getTIR('Evening'),
                             tirSleepOnset: getTIR('Sleep Onset'),
+                            lowDeepSleep:  getLow('Deep Sleep'),
+                            lowDawn:       getLow('Dawn'),
+                            lowMorning:    getLow('Morning'),
+                            lowAfternoon:  getLow('Afternoon'),
+                            lowEvening:    getLow('Evening'),
+                            lowSleepOnset: getLow('Sleep Onset'),
                         };
                     })(),
                     primaryActions: (() => {
