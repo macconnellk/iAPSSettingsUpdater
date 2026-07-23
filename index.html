@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.78</title>
+    <title>Daily Insulin Settings Review v3.5.79</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -7276,7 +7276,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.78',
+                            version: '3.5.79',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7523,7 +7523,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.78',
+                        version: '3.5.79',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9209,9 +9209,31 @@
                         }
                     });
                     
+                    // [GLUCOSE-DEDUP-START] v3.5.79: per-minute keep-first dedup —
+                    // the exact semantics calculateAGP has always applied internally,
+                    // lifted to the fetch so the clean-window builder and detectors
+                    // (which read the raw array) see the same deduped data AGP saw.
+                    // Root cause was dual SGV upload (Share bridge + iAPS), fixed at
+                    // config Jul 23; this cleans in-window residue and closes the
+                    // bypass permanently. Glucose only — treatments are single-source,
+                    // and legitimate SMBs can fire multiple times per minute.
+                    const seenGlucoseMinutes = new Set();
+                    const dedupedGlucose = glucose.filter(r => {
+                        if (!r || !r.dateString) return true; // unkeyable — pass through
+                        const minuteKey = r.dateString.substring(0, 16); // YYYY-MM-DDTHH:MM
+                        if (seenGlucoseMinutes.has(minuteKey)) return false;
+                        seenGlucoseMinutes.add(minuteKey);
+                        return true;
+                    });
+                    if (dedupedGlucose.length !== glucose.length) {
+                        console.log('Glucose dedup: ' + glucose.length + ' → ' + dedupedGlucose.length +
+                            ' (' + (glucose.length - dedupedGlucose.length) + ' same-minute duplicates dropped)');
+                    }
+                    // [GLUCOSE-DEDUP-END]
+
                     console.log('=== fetchNightscoutData complete ===');
 
-                    return { glucose, treatments, deviceStatus, profile };
+                    return { glucose: dedupedGlucose, treatments, deviceStatus, profile };
                     
                 } catch (err) {
                     console.error('Nightscout fetch error:', err);
@@ -11787,7 +11809,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.78 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.79 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
