@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.80</title>
+    <title>Daily Insulin Settings Review v3.5.81</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2265,6 +2265,124 @@
             });
         };
         // [INSTR3-HELPERS-END]
+
+        // [INSTR2-OSC-START] INSTR-2: Schedule Oscillation Index. Pure derived
+        // trend over the stored basal/cr/isf snapshots — no detector, no gating,
+        // no schedule mutation, no stored column (recomputes from history every
+        // run, so backfill is automatic). Path efficiency per block:
+        // oscillation = 1 − net/gross → 0 = converging, 1 = thrashing.
+        // net is |Σ signed Δ| over the counted consecutive-pair deltas — on
+        // gap-free histories this telescopes to |last − first| exactly, and under
+        // structural gaps it stays consistent with gross (net ≤ gross always, so
+        // the identity and the [0,1] range hold unconditionally).
+        const OSC_BLOCK_WINDOW = 14;  // sessions, per-block stats
+        const OSC_ROLL_WINDOW = 7;    // sessions, pooled rolling aggregate
+        const OSC_EPS = 1e-9;         // float-representation guard only — set-points are exact
+        const computeScheduleOscillation = (history) => {
+            const parseSched = (v) => {
+                if (!v) return null;
+                if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { return null; } }
+                return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+            };
+            const sessions = (Array.isArray(history) ? history : [])
+                .filter(e => e && e.date)
+                .sort((a, b) => new Date(a.date) - new Date(b.date))
+                .map(e => ({
+                    date: e.date,
+                    scheds: {
+                        basal: parseSched(e.basalSchedule),
+                        cr: parseSched(e.crSchedule),
+                        isf: parseSched(e.isfSchedule)
+                    }
+                }));
+
+            // Deltas per consecutive-session pair. Only keys present (numeric) in
+            // BOTH members contribute; key-level add/remove is a structural tally.
+            // A wholly missing snapshot on either side = no data, skipped silently.
+            const pairDeltas = []; // index i-1 → deltas between sessions[i-1] and sessions[i]
+            const pairStructural = [];
+            for (let i = 1; i < sessions.length; i++) {
+                const deltas = [];
+                let structural = 0;
+                ['basal', 'cr', 'isf'].forEach(param => {
+                    const a = sessions[i - 1].scheds[param];
+                    const b = sessions[i].scheds[param];
+                    if (!a || !b) return;
+                    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+                    keys.forEach(k => {
+                        const va = a[k], vb = b[k];
+                        const hasA = typeof va === 'number' && isFinite(va);
+                        const hasB = typeof vb === 'number' && isFinite(vb);
+                        if (hasA !== hasB) { structural++; return; }
+                        if (!hasA) return;
+                        const d = vb - va;
+                        if (Math.abs(d) >= OSC_EPS) deltas.push({ param, block: k, delta: d });
+                    });
+                });
+                pairDeltas.push(deltas);
+                pairStructural.push(structural);
+            }
+
+            // Pooled block stats over the pairs between sessions[from..to] inclusive.
+            const blockStats = (fromSession, toSession) => {
+                const byBlock = {};
+                for (let p = fromSession; p < toSession; p++) {
+                    (pairDeltas[p] || []).forEach(({ param, block, delta }) => {
+                        const key = param + '@' + block;
+                        if (!byBlock[key]) byBlock[key] = { param, block, touches: 0, gross: 0, signedNet: 0, reversals: 0, lastSign: 0 };
+                        const s = byBlock[key];
+                        s.touches++;
+                        s.gross += Math.abs(delta);
+                        s.signedNet += delta;
+                        const sign = delta > 0 ? 1 : -1;
+                        if (s.lastSign !== 0 && sign !== s.lastSign) s.reversals++;
+                        s.lastSign = sign;
+                    });
+                }
+                return Object.values(byBlock).map(s => ({
+                    param: s.param, block: s.block, touches: s.touches,
+                    gross: s.gross, net: Math.abs(s.signedNet), reversals: s.reversals,
+                    oscillation: s.gross >= OSC_EPS ? 1 - Math.abs(s.signedNet) / s.gross : null
+                }));
+            };
+
+            // Per-block, trailing OSC_BLOCK_WINDOW sessions
+            const blockFrom = Math.max(0, sessions.length - OSC_BLOCK_WINDOW);
+            const perBlock = blockStats(blockFrom, sessions.length - 1 >= 0 ? sessions.length - 1 : 0)
+                .filter(b => b.gross >= OSC_EPS)
+                .sort((x, y) => (y.oscillation - x.oscillation) || (y.gross - x.gross))
+                .slice(0, 10);
+            let structuralChanges = 0;
+            for (let p = blockFrom; p < sessions.length - 1; p++) structuralChanges += pairStructural[p] || 0;
+
+            // Per-session series (last OSC_BLOCK_WINDOW rows)
+            const perSession = [];
+            for (let i = 1; i < sessions.length; i++) {
+                const deltas = pairDeltas[i - 1] || [];
+                const dailyGross = deltas.reduce((sum, d) => sum + Math.abs(d.delta), 0);
+                const dailyTouches = deltas.length;
+                const rollFrom = Math.max(0, i - (OSC_ROLL_WINDOW - 1));
+                const rollBlocks = blockStats(rollFrom, i);
+                const sumGross = rollBlocks.reduce((s, b) => s + b.gross, 0);
+                const sumNet = rollBlocks.reduce((s, b) => s + b.net, 0);
+                perSession.push({
+                    date: sessions[i].date,
+                    dailyGross,
+                    dailyTouches,
+                    rollingOscillation: sumGross >= OSC_EPS ? 1 - sumNet / sumGross : null,
+                    rollingGross: sumGross
+                });
+            }
+
+            return {
+                blockWindowSessions: OSC_BLOCK_WINDOW,
+                rollingWindowSessions: OSC_ROLL_WINDOW,
+                perBlock,
+                structuralChanges,
+                perSession: perSession.slice(-OSC_BLOCK_WINDOW)
+            };
+        };
+        // [INSTR2-OSC-END]
 
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
@@ -7250,7 +7368,7 @@
             },
             
             // Generate structured JSON export for Claude analysis
-            generateStructuredExport(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], yesterdayEntry = null) {
+            generateStructuredExport(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], yesterdayEntry = null, cachedHistory = []) {
                 // Calculate AGP (same as formatForClaude)
                 const agp7day = analysisResults.nightscoutData?.glucose 
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7) 
@@ -7282,7 +7400,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.80',
+                            version: '3.5.81',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7313,7 +7431,8 @@
                         // INSTR-3: visible on the fast path too — a 10-generated /
                         // 10-blocked / 0-actionable night IS a potential fast-path night.
                         gateCost: analysisResults?.gateCost || null,
-                        shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock)
+                        shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
+                        oscillation: computeScheduleOscillation(cachedHistory)
                     };
                 }
                 
@@ -7529,7 +7648,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.80',
+                        version: '3.5.81',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -7579,6 +7698,8 @@
                     // the real bimodal gate is unchanged and still blocks as reported).
                     gateCost: analysisResults?.gateCost || null,
                     shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
+                    // INSTR-2: derived from history snapshots every run (auto-backfilling)
+                    oscillation: computeScheduleOscillation(cachedHistory),
                     informationalFindings: (analysisResults.findings || [])
                         .filter(f => f.type === FindingType.DAWN_CORRECTION_PATTERN)
                         .map(f => ({
@@ -8600,6 +8721,36 @@
                     }
                 }
                 // [DAWN-REQ-TREND-END]
+
+                // [OSC-TREND-START] INSTR-2: Schedule Oscillation — derived from the
+                // same history entries, rendered beside the other trend tables.
+                {
+                    const osc = computeScheduleOscillation(entries);
+                    if (osc.perBlock.length > 0 || osc.perSession.length > 0) {
+                        output += '## Schedule Oscillation (0 = converging, 1 = thrashing)\n\n';
+                        if (osc.perBlock.length > 0) {
+                            output += `_Top blocks, trailing ${osc.blockWindowSessions}-session window` +
+                                (osc.structuralChanges > 0 ? `; ${osc.structuralChanges} structural add/remove(s) excluded_` : '_') + '\n\n';
+                            output += '| Block | Touches | Gross | Net | Reversals | Osc |\n';
+                            output += '|-------|---------|-------|-----|-----------|-----|\n';
+                            for (const b of osc.perBlock) {
+                                output += `| ${b.param}@${b.block} | ${b.touches} | ${b.gross.toFixed(2)} | ${b.net.toFixed(2)} | ${b.reversals} | ${b.oscillation == null ? '-' : b.oscillation.toFixed(2)} |\n`;
+                            }
+                            output += '\n';
+                        }
+                        if (osc.perSession.length > 0) {
+                            output += `_Per session (rolling window ${osc.rollingWindowSessions} sessions)_\n\n`;
+                            output += '| Date | Daily Gross | Touched | Rolling Osc | Rolling Gross |\n';
+                            output += '|------|------------|---------|-------------|---------------|\n';
+                            for (const s of osc.perSession) {
+                                const date = s.date ? new Date(s.date).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '?';
+                                output += `| ${date} | ${s.dailyGross.toFixed(2)} | ${s.dailyTouches} | ${s.rollingOscillation == null ? '-' : s.rollingOscillation.toFixed(2)} | ${s.rollingGross.toFixed(2)} |\n`;
+                            }
+                            output += '\n';
+                        }
+                    }
+                }
+                // [OSC-TREND-END]
 
                 // === Persistent Item Tracking ===
                 const recentWithActions = entries.filter(e => e.primaryActions);
@@ -11332,7 +11483,8 @@
                             CONFIG,
                             dynamicTarget,
                             detectedChanges,
-                            yesterdayEntry
+                            yesterdayEntry,
+                            cachedSheetsEntries || []
                         );
                         structuredJSON = '# STRUCTURED DATA (for Claude analysis)\n\n```json\n' + 
                             JSON.stringify(structured, null, 2) + '\n```\n\n---\n\n';
@@ -11815,7 +11967,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.80 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.81 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
