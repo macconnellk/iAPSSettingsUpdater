@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.79</title>
+    <title>Daily Insulin Settings Review v3.5.80</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -1737,13 +1737,19 @@
                 
                 bundle.recommendations.forEach(rec => {
                     const change = rec.changePercent || 0;
-                    
-                    // Weight by parameter impact
-                    if (rec.param === 'basal') {
+
+                    // Weight by parameter impact. Case-normalized (v3.5.80): rec.param
+                    // is lowercase in production, so the old uppercase 'CR'/'ISF'
+                    // literals never matched — CR and ISF contributed exactly zero to
+                    // every compound total since shipping. Normalizing (not just
+                    // lowercasing the literals) keeps the match robust to either
+                    // casing on either side — the recurring silent casing/drift class.
+                    const p = (rec.param || '').toLowerCase();
+                    if (p === 'basal') {
                         effect += change * 1.0;
-                    } else if (rec.param === 'CR') {
+                    } else if (p === 'cr') {
                         effect += change * 0.45;
-                    } else if (rec.param === 'ISF') {
+                    } else if (p === 'isf') {
                         effect += change * 0.25;
                     }
                 });
@@ -7276,7 +7282,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.79',
+                            version: '3.5.80',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7523,7 +7529,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.79',
+                        version: '3.5.80',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -11809,7 +11815,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.79 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.80 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
