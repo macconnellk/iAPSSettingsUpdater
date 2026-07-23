@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.83</title>
+    <title>Daily Insulin Settings Review v3.5.84</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2609,6 +2609,120 @@
             };
         };
         // [INSTR6-LEDGER-END]
+
+        // [INSTR4-GAP-START] INSTR-4: Dawn Requirement-Gap Series. Measure-only,
+        // dawn window only (DEF-017 parks the overnight generalization; the emitted
+        // structure is window-keyed so it can slot in later). In a fasted window,
+        // correction SMB volume IS the unmet basal requirement in delivered units —
+        // this institutionalizes the decision logs' hand arithmetic ("0.92 U/hr
+        // measured vs 0.41 scheduled", "2.15U vs ~3.4U").
+        // Known context (Jul 22): the decision log flags Jul 22's 1.00U as
+        // contaminated by a sensor-fake low. The series reports stored values;
+        // contamination stays a clinical judgment in the decision log. Any future
+        // voided-requirement-day exclusion rides the VOIDS mechanism, not this code.
+        const GAP_WINDOW_HOURS = [4, 8];      // dawn window, [start, end)
+        const GAP_ENDPOINT_TARGET_U = 0.3;    // established clinical endpoint: fasted dawn SMBs < 0.3U
+        const GAP_CHANGE_BLOCK_HOURS = [4, 7]; // dawn provisioning blocks, inclusive
+        const computeRequirementGap = (history) => {
+            const parseSched = (v) => {
+                if (!v) return null;
+                if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { return null; } }
+                return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+            };
+            // Duration-weighted scheduled basal over [4:00, 8:00) — never sum rates
+            // (the computeBasalDailyTotal discipline). Pro-rata for straddling blocks;
+            // the pre-first-entry span wraps to the last entry's rate (midnight wrap).
+            const scheduledDawnU = (sched) => {
+                if (!sched) return null;
+                const entries = Object.entries(sched)
+                    .map(([t, v]) => {
+                        const parts = String(t).split(':').map(Number);
+                        return { min: parts[0] * 60 + (parts[1] || 0), rate: v };
+                    })
+                    .filter(e => isFinite(e.min) && typeof e.rate === 'number' && isFinite(e.rate))
+                    .sort((a, b) => a.min - b.min);
+                if (!entries.length) return null;
+                const wStart = GAP_WINDOW_HOURS[0] * 60, wEnd = GAP_WINDOW_HOURS[1] * 60;
+                let total = 0;
+                for (let i = 0; i < entries.length; i++) {
+                    const start = entries[i].min;
+                    const end = i + 1 < entries.length ? entries[i + 1].min : 24 * 60;
+                    const ovStart = Math.max(start, wStart), ovEnd = Math.min(end, wEnd);
+                    if (ovEnd > ovStart) total += entries[i].rate * (ovEnd - ovStart) / 60;
+                }
+                if (entries[0].min > wStart) {
+                    const ovEnd = Math.min(entries[0].min, wEnd);
+                    if (ovEnd > wStart) total += entries[entries.length - 1].rate * (ovEnd - wStart) / 60;
+                }
+                return total;
+            };
+            const rows = (Array.isArray(history) ? history : [])
+                .filter(e => e && e.date)
+                .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+            const series = [];
+            const seenDates = new Set();
+            let skippedRows = 0;
+            rows.forEach(e => {
+                const slots = Array.isArray(e.dawnCorrectionSlots) ? e.dawnCorrectionSlots : [];
+                slots.forEach(slot => {
+                    // Non-native days write [] upstream, so a slot's presence means
+                    // native+measured. Volume 0 is a REAL data point (gap closed);
+                    // absence is unknown, never fabricated.
+                    if (!slot || slot.date == null || slot.volume == null) return;
+                    if (seenDates.has(slot.date)) return; // keep-first
+                    const scheduledU = scheduledDawnU(parseSched(e.basalSchedule));
+                    if (scheduledU == null) { skippedRows++; return; } // never fabricate provision
+                    seenDates.add(slot.date);
+                    const smbU = slot.volume;
+                    const requirementU = scheduledU + smbU;
+                    series.push({
+                        date: slot.date,
+                        scheduledU: Math.round(scheduledU * 1000) / 1000,
+                        smbU,
+                        requirementU: Math.round(requirementU * 1000) / 1000,
+                        closurePct: requirementU > 1e-9 ? Math.round(scheduledU / requirementU * 1000) / 10 : null,
+                        bgDelta: slot.bgDelta ?? null
+                    });
+                });
+            });
+            series.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+            // Change overlay: consecutive-snapshot basal diffs on dawn blocks 04:00–07:00
+            const changes = [];
+            for (let i = 1; i < rows.length; i++) {
+                const a = parseSched(rows[i - 1].basalSchedule);
+                const b = parseSched(rows[i].basalSchedule);
+                if (!a || !b) continue;
+                Object.keys(b).forEach(k => {
+                    const va = a[k], vb = b[k];
+                    if (typeof va !== 'number' || typeof vb !== 'number' || !isFinite(va) || !isFinite(vb)) return;
+                    if (Math.abs(vb - va) < 1e-9) return;
+                    const hour = parseInt(String(k).split(':')[0], 10);
+                    if (hour < GAP_CHANGE_BLOCK_HOURS[0] || hour > GAP_CHANGE_BLOCK_HOURS[1]) return;
+                    changes.push({ date: rows[i].date, block: k, oldValue: va, newValue: vb });
+                });
+            }
+
+            const latest = series.length ? series[series.length - 1] : null;
+            const reqVals = series.map(s => s.requirementU);
+            return {
+                window: 'dawn',
+                windowHours: GAP_WINDOW_HOURS.slice(),
+                endpointTargetU: GAP_ENDPOINT_TARGET_U,
+                series,
+                changes,
+                summary: {
+                    latest,
+                    endpointMet: latest ? latest.smbU < GAP_ENDPOINT_TARGET_U : null,
+                    requirementStability: reqVals.length
+                        ? { min: Math.min(...reqVals), max: Math.max(...reqVals), n: reqVals.length }
+                        : null,
+                    skippedRows
+                }
+            };
+        };
+        // [INSTR4-GAP-END]
 
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
@@ -7634,7 +7748,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.83',
+                            version: '3.5.84',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7667,7 +7781,8 @@
                         gateCost: analysisResults?.gateCost || null,
                         shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
                         oscillation: computeScheduleOscillation(cachedHistory),
-                        changeEffectiveness: computeChangeEffectiveness(cachedHistory)
+                        changeEffectiveness: computeChangeEffectiveness(cachedHistory),
+                        requirementGap: computeRequirementGap(cachedHistory)
                     };
                 }
                 
@@ -7891,7 +8006,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.83',
+                        version: '3.5.84',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -7958,6 +8073,8 @@
                     oscillation: computeScheduleOscillation(cachedHistory),
                     // INSTR-6: honest per-change verdicts, derived + auto-backfilling
                     changeEffectiveness: computeChangeEffectiveness(cachedHistory),
+                    // INSTR-4: dawn provision vs measured requirement, derived
+                    requirementGap: computeRequirementGap(cachedHistory),
                     informationalFindings: (analysisResults.findings || [])
                         .filter(f => f.type === FindingType.DAWN_CORRECTION_PATTERN)
                         .map(f => ({
@@ -8947,35 +9064,51 @@
                     output += '\n';
                 }
 
-                // [DAWN-REQ-TREND-START] v3.5.75: native-day fasted dawn requirement series.
-                // One-element arrays per row (AN Dawn_Correction_Slots), flattened, deduped
-                // one-per-day (last wins), ascending by date. Dates are ISO local
-                // (getLocalDateString, 'YYYY-MM-DD') — parse via Date(y, m-1, d).
+                // [DAWN-REQ-TREND-START] INSTR-4 (extends the v3.5.75 table — one
+                // table, not a competitor): per native dawn day, scheduled 04:00–08:00
+                // provision vs measured requirement, with dawn-block basal changes
+                // overlaid inline so each provisioning step's response is readable.
                 {
-                    const dawnByDate = {};
-                    for (const e of entries) {
-                        const slots = Array.isArray(e.dawnCorrectionSlots) ? e.dawnCorrectionSlots : [];
-                        for (const s of slots) {
-                            if (s && s.date != null && s.volume != null) dawnByDate[s.date] = s;
+                    const gap = computeRequirementGap(fullHistoryForOsc || historyEntries);
+                    if (gap.series.length > 0 || gap.changes.length > 0) {
+                        output += '## Dawn Requirement Trend (native days — scheduled provision vs measured requirement)\n\n';
+                        output += '| Date | Scheduled (U) | SMB (U) | Requirement (U) | Closure % | BG Δ |\n';
+                        output += '|------|--------------|---------|-----------------|-----------|------|\n';
+                        const parseD = (d) => {
+                            const pp = String(d).split('-').map(Number);
+                            return pp.length === 3 && isFinite(pp[1]) ? new Date(pp[0], pp[1] - 1, pp[2]) : new Date(d);
+                        };
+                        const label = (d) => parseD(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                        // Interleave change-overlay rows before the first series row at/after their date
+                        const changesByDate = {};
+                        gap.changes.forEach(c => {
+                            const key = String(c.date);
+                            (changesByDate[key] = changesByDate[key] || []).push(c);
+                        });
+                        const changeDates = Object.keys(changesByDate).sort((a, b) => parseD(a) - parseD(b));
+                        let ci = 0;
+                        const emitChangesThrough = (untilDate) => {
+                            while (ci < changeDates.length &&
+                                   (untilDate == null || parseD(changeDates[ci]) <= parseD(untilDate))) {
+                                const list = changesByDate[changeDates[ci]];
+                                const txt = list.map(c => `${c.block} ${c.oldValue}→${c.newValue}`).join(', ');
+                                output += `| — ${label(changeDates[ci])}: ${txt} — | | | | | |\n`;
+                                ci++;
+                            }
+                        };
+                        for (const s of gap.series) {
+                            emitChangesThrough(s.date);
+                            output += `| ${label(s.date)} | ${s.scheduledU.toFixed(2)} | ${s.smbU.toFixed(2)} | ${s.requirementU.toFixed(2)} | ${s.closurePct == null ? '-' : s.closurePct.toFixed(1)} | ${s.bgDelta == null ? '-' : s.bgDelta} |\n`;
                         }
-                    }
-                    const parseDawnDate = (d) => {
-                        const p = String(d).split('-').map(Number);
-                        return new Date(p[0], p[1] - 1, p[2]);
-                    };
-                    const dawnSorted = Object.values(dawnByDate).sort(
-                        (a, b) => parseDawnDate(a.date) - parseDawnDate(b.date)
-                    );
-                    if (dawnSorted.length > 0) {
-                        output += '## Dawn Requirement Trend (native days — fasted dawn correction volume)\n\n';
-                        output += '| Date | Volume (U) | BG Δ |\n';
-                        output += '|------|-----------|------|\n';
-                        for (const s of dawnSorted) {
-                            const label = parseDawnDate(s.date).toLocaleDateString('en-US', {month:'short', day:'numeric'});
-                            const delta = (s.bgDelta == null) ? '-' : String(s.bgDelta);
-                            output += `| ${label} | ${Number(s.volume).toFixed(2)} | ${delta} |\n`;
-                        }
+                        emitChangesThrough(null);
                         output += '\n';
+                        if (gap.summary.latest) {
+                            const met = gap.summary.endpointMet;
+                            const rs = gap.summary.requirementStability;
+                            output += `_Endpoint: SMB < ${gap.endpointTargetU}U — ${met ? 'MET' : 'NOT MET'} (latest: ${gap.summary.latest.smbU.toFixed(2)}U). ` +
+                                `Requirement range across native days: ${rs.min.toFixed(2)}–${rs.max.toFixed(2)}U (n=${rs.n}).` +
+                                (gap.summary.skippedRows ? ` ${gap.summary.skippedRows} row(s) skipped (no parsable snapshot).` : '') + '_\n\n';
+                        }
                     }
                 }
                 // [DAWN-REQ-TREND-END]
@@ -12251,7 +12384,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.83 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.84 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
