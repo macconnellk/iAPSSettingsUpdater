@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.82</title>
+    <title>Daily Insulin Settings Review v3.5.83</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -104,6 +104,7 @@
         
         const OutcomeType = {
             PENDING: 'pending',
+            APPLIED: 'applied',    // confirmed on pump — what auto-detection actually verifies
             EFFECTIVE: 'effective',
             CAUSED_LOW: 'caused_low',
             CAUSED_HIGH: 'caused_high',
@@ -283,7 +284,19 @@
             getHistory() {
                 try {
                     const stored = localStorage.getItem(this.STORAGE_KEY);
-                    return stored ? JSON.parse(stored) : { changes: [], overrides: [] };
+                    const history = stored ? JSON.parse(stored) : { changes: [], overrides: [] };
+                    // INSTR-6 migration: auto_detected entries were stamped EFFECTIVE at
+                    // birth with no assessment. Rewrite to APPLIED. Idempotent — once no
+                    // matches remain, this never writes again.
+                    let migrated = 0;
+                    (history.changes || []).forEach(c => {
+                        if (c.source === 'auto_detected' && c.outcome === OutcomeType.EFFECTIVE) {
+                            c.outcome = OutcomeType.APPLIED;
+                            migrated++;
+                        }
+                    });
+                    if (migrated > 0) this.saveHistory(history);
+                    return history;
                 } catch (e) {
                     console.error('Failed to load change history:', e);
                     return { changes: [], overrides: [] };
@@ -315,9 +328,10 @@
             },
 
             // Register a change detected by schedule comparison (not manually queued).
-            // Uses outcome EFFECTIVE since the pump already has the new value.
-            // Deduplicates: skips if an auto_detected entry for this slot already
-            // exists with today's date.
+            // Stamps APPLIED — the pump has the new value; that is ALL this verified.
+            // Effectiveness verdicts come from the change-effectiveness ledger
+            // (INSTR-6), never stamped at birth. Deduplicates: skips if an
+            // auto_detected entry for this slot already exists with today's date.
             registerAutoDetected(change) {
                 const today = getLocalDateString();
                 const existing = this.getChangesForSlot(change.param, change.scheduleTime);
@@ -332,7 +346,7 @@
                     date: today,
                     timestamp: new Date().toISOString(),
                     source: 'auto_detected',
-                    outcome: OutcomeType.EFFECTIVE,
+                    outcome: OutcomeType.APPLIED,
                     outcomeDate: null,
                     outcomeNotes: null,
                     ...change
@@ -2408,6 +2422,193 @@
             };
         };
         // [INSTR2-OSC-END]
+
+        // [INSTR6-LEDGER-START] INSTR-6: Change-Effectiveness Ledger. Derived from
+        // the sheet snapshots + per-period deviation/Low_Pct history every run —
+        // survives browser wipes, backfills automatically. localStorage/ChangeTracker
+        // is NOT the effectiveness source (it keeps lockouts + session continuity).
+        // Measure-only: no gating, no confidence change, no suppression. The VOIDS:
+        // hook only annotates (Phase 1 / DEF-018 builds on the field).
+        // Deliberately self-contained (pairing logic duplicated from the oscillation
+        // walker rather than factored) — zero blast radius on INSTR-2b.
+        const LEDGER_PRE = 3;              // baseline sessions before the change
+        const LEDGER_POST = 3;             // evaluation sessions after (incl. first day under it)
+        const LEDGER_HORIZON = 21;         // sessions within which an opposite touch = REVERTED
+        const LEDGER_DEV_THRESHOLD = 5;    // mg/dL deviation move for strengthen verdicts
+        const LEDGER_LOWPCT_THRESHOLD = 0.5; // pp Low_Pct fall for weaken IMPROVED
+        const LEDGER_LOW_GUARD = 1.0;      // pp Low_Pct rise → CAUSED_LOW on a strengthen
+        const LEDGER_EPS = 1e-9;
+        const LEDGER_PERIOD_KEYS = {
+            'Deep Sleep': { dev: 'deepSleep', low: 'lowDeepSleep' },
+            'Dawn': { dev: 'dawn', low: 'lowDawn' },
+            'Morning': { dev: 'morning', low: 'lowMorning' },
+            'Afternoon': { dev: 'afternoon', low: 'lowAfternoon' },
+            'Evening': { dev: 'evening', low: 'lowEvening' },
+            'Sleep Onset': { dev: 'sleepOnset', low: 'lowSleepOnset' }
+        };
+        // Strict VOIDS: line parser — `VOIDS: isf@03:00, cr@12:00`. Malformed tokens
+        // skipped, never thrown. Free-text "VOID ..." prose is NOT parsed.
+        const parseVoidsTokens = (text) => {
+            const out = [];
+            String(text || '').split(/\n/).forEach(line => {
+                const m = line.match(/^\s*VOIDS:\s*(.+)$/);
+                if (!m) return;
+                m[1].split(',').forEach(tok => {
+                    const t = tok.trim().match(/^(basal|cr|isf)@(\d{1,2}:\d{2})$/i);
+                    if (t) out.push({ param: t[1].toLowerCase(), block: t[2].padStart(5, '0') });
+                });
+            });
+            return out;
+        };
+        const computeChangeEffectiveness = (history) => {
+            const parseSched = (v) => {
+                if (!v) return null;
+                if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { return null; } }
+                return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+            };
+            const num = (v) => {
+                if (v === null || v === undefined || v === '') return null;
+                const n = parseFloat(v);
+                return isFinite(n) ? n : null; // DEF-016 NaN rows fail the validity rule here
+            };
+            const sessions = (Array.isArray(history) ? history : [])
+                .filter(e => e && e.date)
+                .sort((a, b) => new Date(a.date) - new Date(b.date))
+                .map(e => ({
+                    date: e.date,
+                    scheds: {
+                        basal: parseSched(e.basalSchedule),
+                        cr: parseSched(e.crSchedule),
+                        isf: parseSched(e.isfSchedule)
+                    },
+                    dev: (period) => num(e.periodDeviations ? e.periodDeviations[LEDGER_PERIOD_KEYS[period]?.dev] : null),
+                    low: (period) => num(e[LEDGER_PERIOD_KEYS[period]?.low]),
+                    isOverride: !!e.isOverride,
+                    voids: parseVoidsTokens(e.decisionLog)
+                }));
+
+            // Change extraction: consecutive-snapshot diffs, keys numeric in both.
+            const changes = [];
+            for (let i = 1; i < sessions.length; i++) {
+                ['basal', 'cr', 'isf'].forEach(param => {
+                    const a = sessions[i - 1].scheds[param];
+                    const b = sessions[i].scheds[param];
+                    if (!a || !b) return;
+                    Object.keys(b).forEach(k => {
+                        const va = a[k], vb = b[k];
+                        if (typeof va !== 'number' || !isFinite(va) || typeof vb !== 'number' || !isFinite(vb)) return;
+                        if (Math.abs(vb - va) < LEDGER_EPS || Math.abs(va) < LEDGER_EPS) return;
+                        const hour = parseInt(String(k).split(':')[0], 10);
+                        const period = CIRCADIAN_PERIODS.find(p => hour >= p.startHour && hour < p.endHour);
+                        changes.push({
+                            sessionIndex: i,
+                            date: sessions[i].date,
+                            param, block: k,
+                            oldValue: va, newValue: vb,
+                            changePercent: (vb - va) / va * 100,
+                            // Direction inversion is load-bearing: for CR and ISF a
+                            // numeric INCREASE delivers LESS insulin (weaken).
+                            direction: param === 'basal'
+                                ? (vb > va ? 'strengthen' : 'weaken')
+                                : (vb > va ? 'weaken' : 'strengthen'),
+                            period: period ? period.name : null
+                        });
+                    });
+                });
+            }
+
+            const meanOf = (vals) => {
+                const v = vals.filter(x => x !== null);
+                return v.length ? v.reduce((s, x) => s + x, 0) / v.length : null;
+            };
+            const verdictOf = (ch) => {
+                const i = ch.sessionIndex;
+                // 1. REVERTED — later opposite-direction touch on the same block
+                const reverted = changes.some(o =>
+                    o !== ch && o.param === ch.param && o.block === ch.block &&
+                    o.sessionIndex > i && o.sessionIndex - i <= LEDGER_HORIZON &&
+                    o.direction !== ch.direction);
+                if (reverted) return { verdict: 'REVERTED' };
+                // 2. VOIDED — strict VOIDS: token within ±3 sessions
+                for (let j = Math.max(0, i - 3); j <= Math.min(sessions.length - 1, i + 3); j++) {
+                    if (sessions[j].voids.some(v => v.param === ch.param && v.block === ch.block)) {
+                        return { verdict: 'VOIDED' };
+                    }
+                }
+                // 3. CONFOUNDED — same-period sibling change in the post window, or override post-row
+                const postEnd = i + LEDGER_POST - 1;
+                const confounder = changes.find(o =>
+                    o !== ch && o.period === ch.period && ch.period != null &&
+                    o.sessionIndex >= i && o.sessionIndex <= postEnd);
+                if (confounder) {
+                    return { verdict: 'CONFOUNDED', confounder: `${confounder.param}@${confounder.block} (${confounder.date})` };
+                }
+                for (let j = i; j <= Math.min(sessions.length - 1, postEnd); j++) {
+                    if (sessions[j].isOverride) return { verdict: 'CONFOUNDED', confounder: `override session ${sessions[j].date}` };
+                }
+                // Windows. Post includes session i — the first day under the change.
+                const preRows = sessions.slice(Math.max(0, i - LEDGER_PRE), i);
+                const postRows = sessions.slice(i, i + LEDGER_POST);
+                const preDevs = preRows.map(s => ch.period ? s.dev(ch.period) : null).filter(v => v !== null);
+                const postDevs = postRows.map(s => ch.period ? s.dev(ch.period) : null).filter(v => v !== null);
+                const preLow = meanOf(preRows.map(s => ch.period ? s.low(ch.period) : null));
+                const postLow = meanOf(postRows.map(s => ch.period ? s.low(ch.period) : null));
+                const metrics = {
+                    preDeviation: meanOf(preDevs), postDeviation: meanOf(postDevs),
+                    preLowPct: preLow, postLowPct: postLow
+                };
+                // 4. PENDING — validity: ≥2 valid pre rows, all LEDGER_POST post rows valid
+                if (postEnd > sessions.length - 1 || preDevs.length < 2 || postDevs.length < LEDGER_POST) {
+                    return { verdict: 'PENDING', ...metrics };
+                }
+                const devDelta = metrics.postDeviation - metrics.preDeviation;
+                // 5. CAUSED_LOW — safety outranks success, strengthen only
+                if (ch.direction === 'strengthen' && preLow !== null && postLow !== null &&
+                    postLow - preLow > LEDGER_LOW_GUARD) {
+                    return { verdict: 'CAUSED_LOW', ...metrics };
+                }
+                // 6. Direction ladders
+                if (ch.direction === 'strengthen') {
+                    if (devDelta <= -LEDGER_DEV_THRESHOLD) return { verdict: 'IMPROVED', ...metrics };
+                    if (devDelta >= LEDGER_DEV_THRESHOLD) return { verdict: 'WORSENED', ...metrics };
+                    return { verdict: 'NEUTRAL', ...metrics };
+                }
+                // Weaken targets lows. Low_Pct is 7-day rolling, so these verdicts LAG —
+                // NEUTRAL early is expected and correct, not a bug. Missing Low_Pct
+                // means a fall cannot be demonstrated ("did not fall").
+                const lowFell = preLow !== null && postLow !== null && preLow - postLow >= LEDGER_LOWPCT_THRESHOLD;
+                if (lowFell) return { verdict: 'IMPROVED', ...metrics };
+                if (devDelta >= 15) return { verdict: 'WORSENED', ...metrics };
+                return { verdict: 'NEUTRAL', ...metrics };
+            };
+
+            const windowStart = Math.max(0, sessions.length - LEDGER_HORIZON);
+            const ledger = changes
+                .filter(ch => ch.sessionIndex >= windowStart)
+                .map(ch => {
+                    const v = verdictOf(ch);
+                    return {
+                        date: ch.date, param: ch.param, block: ch.block,
+                        oldValue: ch.oldValue, newValue: ch.newValue,
+                        changePercent: Math.round(ch.changePercent * 10) / 10,
+                        direction: ch.direction, period: ch.period,
+                        verdict: v.verdict,
+                        preDeviation: v.preDeviation ?? null, postDeviation: v.postDeviation ?? null,
+                        preLowPct: v.preLowPct ?? null, postLowPct: v.postLowPct ?? null,
+                        confounder: v.confounder || null
+                    };
+                })
+                .sort((a, b) => new Date(b.date) - new Date(a.date));
+            const summary = { improved: 0, worsened: 0, neutral: 0, causedLow: 0, reverted: 0, voided: 0, confounded: 0, pending: 0 };
+            const summaryKey = { IMPROVED: 'improved', WORSENED: 'worsened', NEUTRAL: 'neutral', CAUSED_LOW: 'causedLow', REVERTED: 'reverted', VOIDED: 'voided', CONFOUNDED: 'confounded', PENDING: 'pending' };
+            ledger.forEach(l => { summary[summaryKey[l.verdict]]++; });
+
+            return {
+                preSessions: LEDGER_PRE, postSessions: LEDGER_POST, horizon: LEDGER_HORIZON,
+                ledger, summary
+            };
+        };
+        // [INSTR6-LEDGER-END]
 
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
@@ -6868,21 +7069,29 @@
                 const recentChanges = ChangeTracker.getRecentChanges(7);
                 
                 if (recentChanges.length > 0) {
+                    // INSTR-6: the Outcome column renders the LEDGER verdict, never a
+                    // birth-stamped "✓". Rows the ledger can't see fall back to ⏳.
+                    const ledgerData = computeChangeEffectiveness(cachedHistory);
+                    const ledgerVerdictFor = (change) => {
+                        const changeDate = change.date;
+                        const hit = (ledgerData.ledger || []).find(l =>
+                            l.param === change.param && l.block === change.scheduleTime &&
+                            getLocalDateString(new Date(l.date)) === changeDate);
+                        return hit ? hit.verdict : null;
+                    };
+                    const verdictEmoji = {
+                        IMPROVED: '✓ Improved', WORSENED: '✗ Worsened', NEUTRAL: '− Neutral',
+                        CAUSED_LOW: '⚠️ Caused low', REVERTED: '↩️ Reverted', VOIDED: '∅ Voided',
+                        CONFOUNDED: '✳ Confounded', PENDING: '⏳ Pending'
+                    };
                     output += `### Recent Changes\n\n`;
                     output += `| Date | Source | Change | Outcome |\n`;
                     output += `|------|--------|--------|--------|\n`;
                     
                     recentChanges.forEach(change => {
-                        const outcomeEmoji = {
-                            [OutcomeType.EFFECTIVE]: '✓',
-                            [OutcomeType.CAUSED_LOW]: '⚠️ Low',
-                            [OutcomeType.CAUSED_HIGH]: '⚠️ High',
-                            [OutcomeType.REVERTED]: '↩️',
-                            [OutcomeType.PENDING]: '⏳',
-                            [OutcomeType.INDETERMINATE]: '?'
-                        };
                         const source = change.source === 'auto_detected' ? 'Auto' : 'Manual';
-                        output += `| ${change.date} | ${source} | ${change.scheduleTime} ${change.param}: ${change.oldValue}→${change.newValue} | ${outcomeEmoji[change.outcome] || '?'} |\n`;
+                        const verdict = ledgerVerdictFor(change);
+                        output += `| ${change.date} | ${source} | ${change.scheduleTime} ${change.param}: ${change.oldValue}→${change.newValue} | ${verdict ? verdictEmoji[verdict] : '⏳'} |\n`;
                     });
                     output += `\n`;
                 }
@@ -7425,7 +7634,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.82',
+                            version: '3.5.83',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7457,7 +7666,8 @@
                         // 10-blocked / 0-actionable night IS a potential fast-path night.
                         gateCost: analysisResults?.gateCost || null,
                         shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
-                        oscillation: computeScheduleOscillation(cachedHistory)
+                        oscillation: computeScheduleOscillation(cachedHistory),
+                        changeEffectiveness: computeChangeEffectiveness(cachedHistory)
                     };
                 }
                 
@@ -7670,10 +7880,18 @@
                     problemHoursDelta = ph48h - ph7d;
                 }
                 
+                // INSTR-6: VOIDS: tokens from the last 3 sessions' decision logs —
+                // used only to annotate exported entries (voided: true). No gating.
+                const recentVoidTokens = (Array.isArray(cachedHistory) ? cachedHistory : [])
+                    .slice()
+                    .sort((a, b) => new Date(a.date) - new Date(b.date))
+                    .slice(-3)
+                    .flatMap(e => parseVoidsTokens(e && e.decisionLog));
+
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.82',
+                        version: '3.5.83',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -7705,13 +7923,26 @@
                             blockedRecommendations: bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio')).length
                         } : null
                     },
-                    actions: primaryBundles.map(mapBundle),
+                    actions: primaryBundles.map(b => {
+                        const mapped = mapBundle(b);
+                        // INSTR-6: VOIDS: annotation — export-only metadata, no suppression
+                        if (recentVoidTokens.some(v => (mapped.recommendations || []).some(r =>
+                            r.parameter === v.param && r.scheduleTime === v.block))) {
+                            mapped.voided = true;
+                        }
+                        return mapped;
+                    }),
                     watchList: referenceBundles.map(b => {
                         const mapped = mapBundle(b);
                         const bundleStatus = getBundleStatus(b);
                         mapped.status = bundleStatus.status;
                         mapped.statusReason = bundleStatus.statusReason;
                         mapped.blockedBy = b.blockedBy || null;
+                        // INSTR-6: VOIDS: annotation — export-only metadata, no suppression
+                        if (recentVoidTokens.some(v => (mapped.recommendations || []).some(r =>
+                            r.parameter === v.param && r.scheduleTime === v.block))) {
+                            mapped.voided = true;
+                        }
                         return mapped;
                     }),
                     // v3.5.68: Structured-JSON path for detect-only findings. These return null
@@ -7725,6 +7956,8 @@
                     shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
                     // INSTR-2: derived from history snapshots every run (auto-backfilling)
                     oscillation: computeScheduleOscillation(cachedHistory),
+                    // INSTR-6: honest per-change verdicts, derived + auto-backfilling
+                    changeEffectiveness: computeChangeEffectiveness(cachedHistory),
                     informationalFindings: (analysisResults.findings || [])
                         .filter(f => f.type === FindingType.DAWN_CORRECTION_PATTERN)
                         .map(f => ({
@@ -8156,7 +8389,7 @@
                 cutoff3d.setDate(cutoff3d.getDate() - 3);
                 const autoApplied = history.changes.filter(c =>
                     c.source === 'auto_detected' &&
-                    c.outcome === OutcomeType.EFFECTIVE &&
+                    c.outcome === OutcomeType.APPLIED &&
                     new Date(c.date) >= cutoff3d
                 );
                 for (const change of autoApplied.slice(0, 3)) {
@@ -8779,6 +9012,29 @@
                     }
                 }
                 // [OSC-TREND-END]
+
+                // [LEDGER-TREND-START] INSTR-6: Change Effectiveness — same full
+                // history as the JSON (parity by construction).
+                {
+                    const eff = computeChangeEffectiveness(fullHistoryForOsc || historyEntries);
+                    if (eff.ledger.length > 0) {
+                        const s = eff.summary;
+                        output += '## Change Effectiveness\n\n';
+                        output += `_${eff.ledger.length} change(s), trailing ${eff.horizon} sessions — ` +
+                            `improved ${s.improved} · worsened ${s.worsened} · neutral ${s.neutral} · ` +
+                            `caused-low ${s.causedLow} · reverted ${s.reverted} · voided ${s.voided} · ` +
+                            `confounded ${s.confounded} · pending ${s.pending}_\n\n`;
+                        output += '| Date | Change | Dir | Period | Verdict | Dev pre→post | Low% pre→post |\n';
+                        output += '|------|--------|-----|--------|---------|--------------|---------------|\n';
+                        const fmtV = (v) => (v == null ? '-' : (Math.round(v * 10) / 10).toString());
+                        for (const l of eff.ledger) {
+                            const date = l.date ? new Date(l.date).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '?';
+                            output += `| ${date} | ${l.param}@${l.block} ${l.oldValue}→${l.newValue} | ${l.direction} | ${l.period || '-'} | ${l.verdict}${l.confounder ? ' (' + l.confounder + ')' : ''} | ${fmtV(l.preDeviation)}→${fmtV(l.postDeviation)} | ${fmtV(l.preLowPct)}→${fmtV(l.postLowPct)} |\n`;
+                        }
+                        output += '\n';
+                    }
+                }
+                // [LEDGER-TREND-END]
 
                 // === Persistent Item Tracking ===
                 const recentWithActions = entries.filter(e => e.primaryActions);
@@ -11995,7 +12251,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.82 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.83 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
