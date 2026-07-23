@@ -2139,6 +2139,127 @@
             return { status: 'Deferred', statusReason: 'deferred' };
         };
 
+        // [INSTR3-HELPERS-START] INSTR-3: gate-cost accounting + R2 shadow emit.
+        // Read-only instrumentation — these helpers never mutate a bundle, a
+        // finding, or any pipeline state. Module scope (getBundleStatus tier) so
+        // both the serialization surface and the auto-log persistence call them.
+        const GATE_LOW_FINDING_TYPES = new Set([
+            'direct_meal_low', 'transient_high_low', 'isf_induced_low',
+            'unexplained_low', 'resistant_low'
+        ]);
+        const resolveLowMechanism = (f) => {
+            if (f.negIOBAtLow === true || f.basalSuspectFlag === true) return 'negative_iob';
+            const factors = f.contributingFactors || [];
+            if (factors.includes('probable_meal_completion')) return 'meal_completion';
+            if (factors.includes('fast_overcorrection') || factors.includes('correction_stacking')) return 'correction_stacking';
+            if (f.type === 'isf_induced_low') return 'isf_overcorrection';
+            if (f.type === 'unexplained_low') return 'unexplained';
+            if (f.type === 'resistant_low') return 'external_or_basal';
+            return f.primaryParameter || 'unattributed';
+        };
+        // Bucket a non-PRIMARY generated bundle's status to the stable gate enum.
+        // Precedence mirrors getBundleStatus (safety strings outrank staging).
+        const gateCostBucket = (status, statusReason) => {
+            const s = String(status || '');
+            if (s.includes('Safety Rule #1')) return 'bimodal';
+            if (statusReason === 'staged' || s.includes('Compound effect')) return 'compound';
+            if (s.includes('No recent events')) return 'staleness';
+            if (statusReason === 'demoted') return 'recency';
+            if (/recovery|sensitivity/i.test(s)) return 'stateFilter';
+            if (statusReason === 'conflict') return 'slotConflict';
+            if (statusReason === 'deferred') return 'onePerBlock';
+            return 'other';
+        };
+        const computeGateCost = (bundles) => {
+            const withRecs = (Array.isArray(bundles) ? bundles : [])
+                .filter(b => b && Array.isArray(b.recommendations) && b.recommendations.length > 0);
+            const blocked = {};
+            const otherReasons = [];
+            let actionable = 0;
+            withRecs.forEach(b => {
+                if (b.priority === 'PRIMARY') { actionable++; return; }
+                const st = getBundleStatus(b);
+                const bucket = gateCostBucket(st.status, st.statusReason);
+                blocked[bucket] = (blocked[bucket] || 0) + 1;
+                if (bucket === 'other') otherReasons.push(String(st.status || ''));
+            });
+            const out = { generated: withRecs.length, actionable, blocked };
+            if (otherReasons.length > 0) out.otherReasons = otherReasons;
+            return out;
+        };
+        // R2 shadow: for each bimodal-blocked basal_signal_high bundle, what a
+        // hour-granular gate keyed to the bundle's own scheduleTime H would
+        // conclude. Detect-only: the real gate's verdict is not consulted,
+        // altered, or re-derived — this reads the same AGP stats in parallel.
+        // Raw offsets H-1..H+4 are logged so Phase 2 can re-window without
+        // re-collection; wouldUnblock over [H, H+3) is a convenience flag.
+        const computeShadowUnblock = (bundles, hourlyAgpStats7d, findings, isNativeToday, lowHourThreshold = 4) => {
+            if (!Array.isArray(bundles) || !hourlyAgpStats7d) return [];
+            const lowFindingsAtHour = (h) => (findings || [])
+                .filter(f => {
+                    if (!f || !f.scheduleTime) return false;
+                    const isLow = GATE_LOW_FINDING_TYPES.has(f.type) ||
+                        (f.type === 'mixed_attribution' && (f.events || []).some(e => ((e.lowBG ?? e.bg) < 70)));
+                    if (!isLow) return false;
+                    const fh = parseInt(String(f.scheduleTime).split(':')[0], 10);
+                    return fh === h;
+                })
+                .map(f => ({ type: f.type, mechanism: resolveLowMechanism(f) }));
+            const out = [];
+            bundles.forEach(b => {
+                if (!b) return;
+                const hasBSH = (b.findings || []).some(f => f.type === 'basal_signal_high');
+                if (!hasBSH) return;
+                const st = getBundleStatus(b);
+                if (st.statusReason !== 'blocked' || !String(st.status).includes('Safety Rule #1')) return;
+                const rec = (b.recommendations || [])[0];
+                if (!rec || !rec.scheduleTime) return;
+                const H = parseInt(String(rec.scheduleTime).split(':')[0], 10);
+                if (isNaN(H)) return;
+                const period = CIRCADIAN_PERIODS.find(p => H >= p.startHour && H < p.endHour);
+                const windowLows = [];
+                for (let off = -1; off <= 4; off++) {
+                    const hr = ((H + off) % 24 + 24) % 24;
+                    const stats = hourlyAgpStats7d[hr];
+                    windowLows.push({
+                        offset: off,
+                        hour: hr,
+                        lowPct: (stats && stats.lowPct != null) ? stats.lowPct : null,
+                        caeLows: lowFindingsAtHour(hr)
+                    });
+                }
+                // Missing hour data counts as clean — same semantics as the real
+                // gate's `hourData && hourData.lowPct > threshold` check.
+                const wouldUnblock = windowLows
+                    .filter(w => w.offset >= 0 && w.offset < 3)
+                    .every(w => !(w.lowPct != null && w.lowPct > lowHourThreshold));
+                out.push({
+                    scheduleTime: rec.scheduleTime,
+                    period: period ? period.name : null,
+                    wouldUnblock,
+                    windowLows,
+                    native: isNativeToday
+                });
+            });
+            return out;
+        };
+        // Review-JSON surface for the shadow: adds the human-readable unlock
+        // condition per entry. Visibility only — the tool acts on nothing here.
+        const formatShadowSurface = (shadowUnblock, lowHourThreshold = 4) => {
+            return (Array.isArray(shadowUnblock) ? shadowUnblock : []).map(s => {
+                const blockingHours = (s.windowLows || [])
+                    .filter(w => w.offset >= 0 && w.offset < 3 && w.lowPct != null && w.lowPct > lowHourThreshold)
+                    .map(w => `${String(w.hour).padStart(2, '0')}:00 (${Number(w.lowPct).toFixed(0)}% low)`);
+                return {
+                    ...s,
+                    unlockCondition: s.wouldUnblock
+                        ? 'hour-granular gate would unblock now (effect window clean); real bimodal gate still blocks'
+                        : `unblocks when ${blockingHours.join(', ') || 'the blocking low-hour'} stays <${lowHourThreshold}% or is basal-attributed`
+                };
+            });
+        };
+        // [INSTR3-HELPERS-END]
+
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
             const eventTime = new Date(timestamp);
@@ -7155,7 +7276,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.77',
+                            version: '3.5.78',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7182,7 +7303,11 @@
                                 const tirDelta = tir48h - tir;
                                 return Math.abs(tirDelta) < 2 ? 'stable' : (tirDelta > 0 ? 'improving' : 'declining');
                             })()
-                        }
+                        },
+                        // INSTR-3: visible on the fast path too — a 10-generated /
+                        // 10-blocked / 0-actionable night IS a potential fast-path night.
+                        gateCost: analysisResults?.gateCost || null,
+                        shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock)
                     };
                 }
                 
@@ -7398,7 +7523,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.77',
+                        version: '3.5.78',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -7444,6 +7569,10 @@
                     // Populated directly from analysisResults.findings (aggregatedFindings). The filter
                     // is a detect-only type set — currently DAWN_CORRECTION_PATTERN only; other
                     // detect-only types can join with no new plumbing.
+                    // INSTR-3: tonight's block economics + R2 shadow (detect-only info;
+                    // the real bimodal gate is unchanged and still blocks as reported).
+                    gateCost: analysisResults?.gateCost || null,
+                    shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
                     informationalFindings: (analysisResults.findings || [])
                         .filter(f => f.type === FindingType.DAWN_CORRECTION_PATTERN)
                         .map(f => ({
@@ -9436,7 +9565,7 @@
             };
             
             // Auto-log to Google Sheets after analysis
-            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules, processedBundles = [], carbAdjSensitivity = null, dawnRequirement = null) => {
+            const attemptAutoLog = async (signalAnalysis, state, findings, basalRatioInfo, nightscoutData, effectiveTarget, yesterdayFinal, activeSchedules, processedBundles = [], carbAdjSensitivity = null, dawnRequirement = null, instrMetrics = null) => {
                 console.log('=== attemptAutoLog called ===');
                 console.log('Sheets URL:', sheetsWebAppUrl);
                 console.log('State:', state.state);
@@ -9660,6 +9789,15 @@
                             )];
                         } catch(e) { return []; }
                     })(),
+                    // INSTR-3: gate-cost + R2 shadow. Fields always present (the Log
+                    // Script write guard keys on !== undefined); null metrics fail
+                    // safe to empty tallies, never omitted.
+                    gateCost: (instrMetrics && instrMetrics.gateCost)
+                        ? instrMetrics.gateCost
+                        : { generated: 0, actionable: 0, blocked: {} },
+                    shadowUnblock: (instrMetrics && Array.isArray(instrMetrics.shadowUnblock))
+                        ? instrMetrics.shadowUnblock
+                        : [],
                     dawnCorrectionSlots: (() => {
                         try {
                             const t = dawnRequirement.today;
@@ -10773,6 +10911,14 @@
                     );
 
                     // Set results
+                    // INSTR-3: read-only snapshot AFTER every post-bundle mutation
+                    // (bimodal → AGPPERSIST → Part C) so the tally prices the final
+                    // statuses. Never mutates bundles.
+                    const gateCost = computeGateCost(processedBundles);
+                    const shadowUnblock = computeShadowUnblock(
+                        processedBundles, hourlyAgpStats7d, aggregatedFindings, isNativeToday
+                    );
+
                     setAnalysisResults({
                         findings: aggregatedFindings,
                         signalAnalysis,
@@ -10792,14 +10938,16 @@
                         estimatedTreatmentCarbs: estimatedTreatmentCarbs > 0 ? estimatedTreatmentCarbs : null,
                         hypoTreatmentEvents: hypoTreatmentEvents.length > 0 ? hypoTreatmentEvents : null,
                         insulinPerCarb: (tdd24h && totalCarbs24h > 0) ? (tdd24h / totalCarbs24h).toFixed(3) : null,
-                        carbAdjSensitivity: carbAdjSensitivity ? carbAdjSensitivity.toFixed(2) : null
+                        carbAdjSensitivity: carbAdjSensitivity ? carbAdjSensitivity.toFixed(2) : null,
+                        gateCost,
+                        shadowUnblock
                     });
                     setBodyState(detectedState);
                     setBundles(processedBundles);
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
-                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity, dawnRequirement);
+                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity, dawnRequirement, { gateCost, shadowUnblock });
                     
                 } catch (err) {
                     console.error('Analysis error:', err);
