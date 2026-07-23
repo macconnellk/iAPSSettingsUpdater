@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.84</title>
+    <title>Daily Insulin Settings Review v3.5.85</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2623,6 +2623,16 @@
         const GAP_WINDOW_HOURS = [4, 8];      // dawn window, [start, end)
         const GAP_ENDPOINT_TARGET_U = 0.3;    // established clinical endpoint: fasted dawn SMBs < 0.3U
         const GAP_CHANGE_BLOCK_HOURS = [4, 7]; // dawn provisioning blocks, inclusive
+        const OVERLAY_LOOKBACK_DAYS = 7;      // rendered-table overlay horizon before first series row
+        // Local YYYY-MM-DD key. Already-plain dates pass through untouched (a plain
+        // date reparsed as UTC midnight would shift a day in negative-offset zones —
+        // the v3.5.75 class); ISO timestamps normalize via getLocalDateString.
+        const gapLocalDateKey = (d) => {
+            const s = String(d);
+            if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+            const dt = new Date(s);
+            return isNaN(dt.getTime()) ? null : getLocalDateString(dt);
+        };
         const computeRequirementGap = (history) => {
             const parseSched = (v) => {
                 if (!v) return null;
@@ -2700,7 +2710,11 @@
                     if (Math.abs(vb - va) < 1e-9) return;
                     const hour = parseInt(String(k).split(':')[0], 10);
                     if (hour < GAP_CHANGE_BLOCK_HOURS[0] || hour > GAP_CHANGE_BLOCK_HOURS[1]) return;
-                    changes.push({ date: rows[i].date, block: k, oldValue: va, newValue: vb });
+                    // DEF-024: normalize to the series' local YYYY-MM-DD key at emission —
+                    // series and changes must share one date format; the renderer never reparses.
+                    const dateKey = gapLocalDateKey(rows[i].date);
+                    if (dateKey == null) return; // unkeyable session date — skip, never emit Invalid Date
+                    changes.push({ date: dateKey, block: k, oldValue: va, newValue: vb });
                 });
             }
 
@@ -7748,7 +7762,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.84',
+                            version: '3.5.85',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8006,7 +8020,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.84',
+                        version: '3.5.85',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9064,32 +9078,44 @@
                     output += '\n';
                 }
 
-                // [DAWN-REQ-TREND-START] INSTR-4 (extends the v3.5.75 table — one
-                // table, not a competitor): per native dawn day, scheduled 04:00–08:00
-                // provision vs measured requirement, with dawn-block basal changes
-                // overlaid inline so each provisioning step's response is readable.
+                // [DAWN-REQ-TREND-START] INSTR-4b: series and overlay share local
+                // YYYY-MM-DD keys (normalized at emission, never reparsed here).
+                // Table overlay bounded to first-series-date − OVERLAY_LOOKBACK_DAYS;
+                // JSON keeps full change history (the raise-then-cut archaeology).
                 {
                     const gap = computeRequirementGap(fullHistoryForOsc || historyEntries);
                     if (gap.series.length > 0 || gap.changes.length > 0) {
                         output += '## Dawn Requirement Trend (native days — scheduled provision vs measured requirement)\n\n';
+                        // Plain YYYY-MM-DD keys compare lexically; parse only for labels.
+                        const label = (key) => {
+                            const pp = String(key).split('-').map(Number);
+                            return new Date(pp[0], pp[1] - 1, pp[2]).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                        };
+                        let visibleChanges = [];
+                        let earlierCount = gap.changes.length;
+                        if (gap.series.length > 0) {
+                            const firstKey = String(gap.series[0].date);
+                            const fp = firstKey.split('-').map(Number);
+                            const cutoff = new Date(fp[0], fp[1] - 1, fp[2] - OVERLAY_LOOKBACK_DAYS);
+                            const cutoffKey = cutoff.getFullYear() + '-' +
+                                String(cutoff.getMonth() + 1).padStart(2, '0') + '-' +
+                                String(cutoff.getDate()).padStart(2, '0');
+                            visibleChanges = gap.changes.filter(c => String(c.date) >= cutoffKey);
+                            earlierCount = gap.changes.length - visibleChanges.length;
+                        }
                         output += '| Date | Scheduled (U) | SMB (U) | Requirement (U) | Closure % | BG Δ |\n';
                         output += '|------|--------------|---------|-----------------|-----------|------|\n';
-                        const parseD = (d) => {
-                            const pp = String(d).split('-').map(Number);
-                            return pp.length === 3 && isFinite(pp[1]) ? new Date(pp[0], pp[1] - 1, pp[2]) : new Date(d);
-                        };
-                        const label = (d) => parseD(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                        // Interleave change-overlay rows before the first series row at/after their date
                         const changesByDate = {};
-                        gap.changes.forEach(c => {
-                            const key = String(c.date);
-                            (changesByDate[key] = changesByDate[key] || []).push(c);
+                        visibleChanges.forEach(c => {
+                            (changesByDate[c.date] = changesByDate[c.date] || []).push(c);
                         });
-                        const changeDates = Object.keys(changesByDate).sort((a, b) => parseD(a) - parseD(b));
+                        const changeDates = Object.keys(changesByDate).sort();
                         let ci = 0;
-                        const emitChangesThrough = (untilDate) => {
+                        const emitChangesThrough = (untilKey) => {
+                            // A change dated D was applied the prior evening (INSTR-6
+                            // convention) — it renders BEFORE day D's series row.
                             while (ci < changeDates.length &&
-                                   (untilDate == null || parseD(changeDates[ci]) <= parseD(untilDate))) {
+                                   (untilKey == null || changeDates[ci] <= untilKey)) {
                                 const list = changesByDate[changeDates[ci]];
                                 const txt = list.map(c => `${c.block} ${c.oldValue}→${c.newValue}`).join(', ');
                                 output += `| — ${label(changeDates[ci])}: ${txt} — | | | | | |\n`;
@@ -9097,11 +9123,14 @@
                             }
                         };
                         for (const s of gap.series) {
-                            emitChangesThrough(s.date);
+                            emitChangesThrough(String(s.date));
                             output += `| ${label(s.date)} | ${s.scheduledU.toFixed(2)} | ${s.smbU.toFixed(2)} | ${s.requirementU.toFixed(2)} | ${s.closurePct == null ? '-' : s.closurePct.toFixed(1)} | ${s.bgDelta == null ? '-' : s.bgDelta} |\n`;
                         }
                         emitChangesThrough(null);
                         output += '\n';
+                        if (earlierCount > 0) {
+                            output += `_(+${earlierCount} earlier dawn-block change(s) in JSON)_\n\n`;
+                        }
                         if (gap.summary.latest) {
                             const met = gap.summary.endpointMet;
                             const rs = gap.summary.requirementStability;
@@ -12384,7 +12413,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.84 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.85 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
