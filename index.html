@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.81</title>
+    <title>Daily Insulin Settings Review v3.5.82</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2266,18 +2266,22 @@
         };
         // [INSTR3-HELPERS-END]
 
-        // [INSTR2-OSC-START] INSTR-2: Schedule Oscillation Index. Pure derived
-        // trend over the stored basal/cr/isf snapshots — no detector, no gating,
-        // no schedule mutation, no stored column (recomputes from history every
-        // run, so backfill is automatic). Path efficiency per block:
-        // oscillation = 1 − net/gross → 0 = converging, 1 = thrashing.
-        // net is |Σ signed Δ| over the counted consecutive-pair deltas — on
-        // gap-free histories this telescopes to |last − first| exactly, and under
-        // structural gaps it stays consistent with gross (net ≤ gross always, so
-        // the identity and the [0,1] range hold unconditionally).
+        // [INSTR2-OSC-START] INSTR-2b: Schedule Oscillation Index, percent basis.
+        // Pure derived trend over the stored basal/cr/isf snapshots — no detector,
+        // no gating, no schedule mutation, no stored column. Path efficiency per
+        // block: oscillation = 1 − net/gross → 0 = converging, 1 = thrashing.
+        // v3.5.82 (INSTR-2b): deltas are PERCENT-CHANGE per step (the tool's
+        // changePercent basis) so basal/cr/isf are comparable — raw units differ
+        // ~100× and buried basal cuts under ISF magnitude (DEF-020).
+        // net = |Σ signed pctΔ| (≤ gross by triangle inequality, so [0,1] holds).
+        // Percent-basis caveat, by design: a raw VALUE round-trip does not sum to
+        // zero in percent space (+33.3% then −25% returns the value, not the sum),
+        // so pure value-thrash reads ~0.86, not 1.0; exactly 1.0 requires
+        // pct-symmetric motion. Monotone still reads exactly 0.
         const OSC_BLOCK_WINDOW = 14;  // sessions, per-block stats
-        const OSC_ROLL_WINDOW = 7;    // sessions, pooled rolling aggregate
+        const OSC_ROLL_WINDOW = 7;    // sessions, rolling aggregates
         const OSC_EPS = 1e-9;         // float-representation guard only — set-points are exact
+        const OSC_PARAMS = ['basal', 'cr', 'isf'];
         const computeScheduleOscillation = (history) => {
             const parseSched = (v) => {
                 if (!v) return null;
@@ -2296,15 +2300,15 @@
                     }
                 }));
 
-            // Deltas per consecutive-session pair. Only keys present (numeric) in
-            // BOTH members contribute; key-level add/remove is a structural tally.
-            // A wholly missing snapshot on either side = no data, skipped silently.
-            const pairDeltas = []; // index i-1 → deltas between sessions[i-1] and sessions[i]
+            // Percent deltas per consecutive-session pair. Only keys numeric in BOTH
+            // members contribute; key-level add/remove AND zero/invalid priors are a
+            // structural tally (never NaN/Infinity). Missing whole snapshot = no data.
+            const pairDeltas = [];
             const pairStructural = [];
             for (let i = 1; i < sessions.length; i++) {
                 const deltas = [];
                 let structural = 0;
-                ['basal', 'cr', 'isf'].forEach(param => {
+                OSC_PARAMS.forEach(param => {
                     const a = sessions[i - 1].scheds[param];
                     const b = sessions[i].scheds[param];
                     if (!a || !b) return;
@@ -2315,24 +2319,27 @@
                         const hasB = typeof vb === 'number' && isFinite(vb);
                         if (hasA !== hasB) { structural++; return; }
                         if (!hasA) return;
-                        const d = vb - va;
-                        if (Math.abs(d) >= OSC_EPS) deltas.push({ param, block: k, delta: d });
+                        if (Math.abs(va) < OSC_EPS) { structural++; return; } // div-zero guard
+                        const pct = (vb - va) / va * 100;
+                        if (Math.abs(pct) >= OSC_EPS) deltas.push({ param, block: k, delta: pct });
                     });
                 });
                 pairDeltas.push(deltas);
                 pairStructural.push(structural);
             }
 
-            // Pooled block stats over the pairs between sessions[from..to] inclusive.
-            const blockStats = (fromSession, toSession) => {
+            // Pooled per-block stats over pairs covering sessions[from..to] inclusive,
+            // optionally filtered to one parameter. Units: percentage points.
+            const blockStats = (fromSession, toSession, paramFilter = null) => {
                 const byBlock = {};
                 for (let p = fromSession; p < toSession; p++) {
                     (pairDeltas[p] || []).forEach(({ param, block, delta }) => {
+                        if (paramFilter && param !== paramFilter) return;
                         const key = param + '@' + block;
-                        if (!byBlock[key]) byBlock[key] = { param, block, touches: 0, gross: 0, signedNet: 0, reversals: 0, lastSign: 0 };
+                        if (!byBlock[key]) byBlock[key] = { param, block, touches: 0, grossPct: 0, signedNet: 0, reversals: 0, lastSign: 0 };
                         const s = byBlock[key];
                         s.touches++;
-                        s.gross += Math.abs(delta);
+                        s.grossPct += Math.abs(delta);
                         s.signedNet += delta;
                         const sign = delta > 0 ? 1 : -1;
                         if (s.lastSign !== 0 && sign !== s.lastSign) s.reversals++;
@@ -2341,42 +2348,60 @@
                 }
                 return Object.values(byBlock).map(s => ({
                     param: s.param, block: s.block, touches: s.touches,
-                    gross: s.gross, net: Math.abs(s.signedNet), reversals: s.reversals,
-                    oscillation: s.gross >= OSC_EPS ? 1 - Math.abs(s.signedNet) / s.gross : null
+                    grossPct: s.grossPct, netPct: Math.abs(s.signedNet), reversals: s.reversals,
+                    oscillation: s.grossPct >= OSC_EPS ? 1 - Math.abs(s.signedNet) / s.grossPct : null
                 }));
+            };
+            const pooled = (blocks) => {
+                const sumGross = blocks.reduce((s, b) => s + b.grossPct, 0);
+                const sumNet = blocks.reduce((s, b) => s + b.netPct, 0);
+                return {
+                    rollingOscillation: sumGross >= OSC_EPS ? 1 - sumNet / sumGross : null,
+                    rollingGross: sumGross
+                };
             };
 
             // Per-block, trailing OSC_BLOCK_WINDOW sessions
             const blockFrom = Math.max(0, sessions.length - OSC_BLOCK_WINDOW);
-            const perBlock = blockStats(blockFrom, sessions.length - 1 >= 0 ? sessions.length - 1 : 0)
-                .filter(b => b.gross >= OSC_EPS)
-                .sort((x, y) => (y.oscillation - x.oscillation) || (y.gross - x.gross))
+            const blockTo = Math.max(0, sessions.length - 1);
+            const perBlock = blockStats(blockFrom, blockTo)
+                .filter(b => b.grossPct >= OSC_EPS)
+                .sort((x, y) => (y.oscillation - x.oscillation) || (y.grossPct - x.grossPct))
                 .slice(0, 10);
             let structuralChanges = 0;
             for (let p = blockFrom; p < sessions.length - 1; p++) structuralChanges += pairStructural[p] || 0;
 
-            // Per-session series (last OSC_BLOCK_WINDOW rows)
+            // Per-session series: per-parameter sub-aggregates + pooled overall.
+            // overall is the gross-weighted pooled figure across ALL blocks — it is
+            // NOT the arithmetic mean of the three per-param values (different gross
+            // weights). Both are correct; they answer different questions.
             const perSession = [];
             for (let i = 1; i < sessions.length; i++) {
                 const deltas = pairDeltas[i - 1] || [];
-                const dailyGross = deltas.reduce((sum, d) => sum + Math.abs(d.delta), 0);
-                const dailyTouches = deltas.length;
                 const rollFrom = Math.max(0, i - (OSC_ROLL_WINDOW - 1));
-                const rollBlocks = blockStats(rollFrom, i);
-                const sumGross = rollBlocks.reduce((s, b) => s + b.gross, 0);
-                const sumNet = rollBlocks.reduce((s, b) => s + b.net, 0);
+                const statFor = (paramFilter) => {
+                    const dayDeltas = paramFilter ? deltas.filter(d => d.param === paramFilter) : deltas;
+                    return {
+                        dailyGross: dayDeltas.reduce((sum, d) => sum + Math.abs(d.delta), 0),
+                        dailyTouches: dayDeltas.length,
+                        ...pooled(blockStats(rollFrom, i, paramFilter))
+                    };
+                };
                 perSession.push({
                     date: sessions[i].date,
-                    dailyGross,
-                    dailyTouches,
-                    rollingOscillation: sumGross >= OSC_EPS ? 1 - sumNet / sumGross : null,
-                    rollingGross: sumGross
+                    byParam: {
+                        basal: statFor('basal'),
+                        cr: statFor('cr'),
+                        isf: statFor('isf')
+                    },
+                    overall: statFor(null)
                 });
             }
 
             return {
                 blockWindowSessions: OSC_BLOCK_WINDOW,
                 rollingWindowSessions: OSC_ROLL_WINDOW,
+                basis: 'percent',
                 perBlock,
                 structuralChanges,
                 perSession: perSession.slice(-OSC_BLOCK_WINDOW)
@@ -7400,7 +7425,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.81',
+                            version: '3.5.82',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7648,7 +7673,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.81',
+                        version: '3.5.82',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -8627,7 +8652,7 @@
             },
             
             // SPEC 2: Generate trend section from Sheets history
-            generateTrendSection(historyEntries, currentData) {
+            generateTrendSection(historyEntries, currentData, fullHistoryForOsc = null) {
                 if (!historyEntries || historyEntries.length === 0) {
                     return '# TREND CONTEXT (14-day history)\n\n_No history available. Trends will populate after 2+ logged sessions._\n\n---\n\n';
                 }
@@ -8722,29 +8747,32 @@
                 }
                 // [DAWN-REQ-TREND-END]
 
-                // [OSC-TREND-START] INSTR-2: Schedule Oscillation — derived from the
-                // same history entries, rendered beside the other trend tables.
+                // [OSC-TREND-START] INSTR-2b: Schedule Oscillation — rendered from the
+                // SAME full-history computation as the structured JSON (DEF-021 parity:
+                // v3.5.81 computed from the 14-day-filtered table entries, so early
+                // rows' rolling windows lacked pre-filter history and diverged).
                 {
-                    const osc = computeScheduleOscillation(entries);
+                    const osc = computeScheduleOscillation(fullHistoryForOsc || historyEntries);
                     if (osc.perBlock.length > 0 || osc.perSession.length > 0) {
-                        output += '## Schedule Oscillation (0 = converging, 1 = thrashing)\n\n';
+                        output += '## Schedule Oscillation (0 = converging, 1 = thrashing; percent basis)\n\n';
                         if (osc.perBlock.length > 0) {
                             output += `_Top blocks, trailing ${osc.blockWindowSessions}-session window` +
-                                (osc.structuralChanges > 0 ? `; ${osc.structuralChanges} structural add/remove(s) excluded_` : '_') + '\n\n';
-                            output += '| Block | Touches | Gross | Net | Reversals | Osc |\n';
-                            output += '|-------|---------|-------|-----|-----------|-----|\n';
+                                (osc.structuralChanges > 0 ? `; ${osc.structuralChanges} structural/zero-prior step(s) excluded_` : '_') + '\n\n';
+                            output += '| Block | Touches | Gross% | Net% | Reversals | Osc |\n';
+                            output += '|-------|---------|--------|------|-----------|-----|\n';
                             for (const b of osc.perBlock) {
-                                output += `| ${b.param}@${b.block} | ${b.touches} | ${b.gross.toFixed(2)} | ${b.net.toFixed(2)} | ${b.reversals} | ${b.oscillation == null ? '-' : b.oscillation.toFixed(2)} |\n`;
+                                output += `| ${b.param}@${b.block} | ${b.touches} | ${b.grossPct.toFixed(1)} | ${b.netPct.toFixed(1)} | ${b.reversals} | ${b.oscillation == null ? '-' : b.oscillation.toFixed(2)} |\n`;
                             }
                             output += '\n';
                         }
                         if (osc.perSession.length > 0) {
-                            output += `_Per session (rolling window ${osc.rollingWindowSessions} sessions)_\n\n`;
-                            output += '| Date | Daily Gross | Touched | Rolling Osc | Rolling Gross |\n';
-                            output += '|------|------------|---------|-------------|---------------|\n';
+                            const fmtOsc = (v) => (v == null ? '-' : v.toFixed(2));
+                            output += `_Per session (rolling ${osc.rollingWindowSessions}-session windows, full-history)_\n\n`;
+                            output += '| Date | Basal Osc | CR Osc | ISF Osc | Overall Osc | Overall Gross% |\n';
+                            output += '|------|-----------|--------|---------|-------------|----------------|\n';
                             for (const s of osc.perSession) {
                                 const date = s.date ? new Date(s.date).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '?';
-                                output += `| ${date} | ${s.dailyGross.toFixed(2)} | ${s.dailyTouches} | ${s.rollingOscillation == null ? '-' : s.rollingOscillation.toFixed(2)} | ${s.rollingGross.toFixed(2)} |\n`;
+                                output += `| ${date} | ${fmtOsc(s.byParam.basal.rollingOscillation)} | ${fmtOsc(s.byParam.cr.rollingOscillation)} | ${fmtOsc(s.byParam.isf.rollingOscillation)} | ${fmtOsc(s.overall.rollingOscillation)} | ${s.overall.rollingGross.toFixed(1)} |\n`;
                             }
                             output += '\n';
                         }
@@ -11534,7 +11562,7 @@
                                 }))
                             };
                             
-                            trendSection = OutputFormatter.generateTrendSection(recentEntries, currentData);
+                            trendSection = OutputFormatter.generateTrendSection(recentEntries, currentData, cachedSheetsEntries || []);
                         } catch (trendErr) {
                             console.error('Trend section generation failed:', trendErr);
                             trendSection = '# TREND CONTEXT\n\n_Error generating trend section_\n\n---\n\n';
@@ -11556,7 +11584,7 @@
                                         status: getBundleStatus(b).status
                                     }))
                                 };
-                                trendSection = OutputFormatter.generateTrendSection(historyData.entries, currentData);
+                                trendSection = OutputFormatter.generateTrendSection(historyData.entries, currentData, historyData.entries);
                             }
                         } catch (trendErr) {
                             console.error('Trend history fetch failed (continuing without trends):', trendErr);
@@ -11967,7 +11995,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.81 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.82 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
