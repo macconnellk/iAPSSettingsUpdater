@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.85</title>
+    <title>Daily Insulin Settings Review v3.5.89</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2738,6 +2738,171 @@
         };
         // [INSTR4-GAP-END]
 
+        // [STACKING-GUARD-START] v3.5.86 (DEF-025): stacking-aware CR coherence.
+        // A correctly-dosed meal (own ratio ≤ 1.20) crashing under ≥1.0U of prior
+        // correction IOB (effective ratio ≥ 1.50) is stacking-driven — the CR
+        // conclusion is unsupportable; the lever is upstream. Deliberate gap: own
+        // ratio > 1.20 on a stack still scores CR normally (an over-dosed meal on
+        // a stack is still over-dosed). The under-delivery guard (v3.5.70) retains
+        // first position: own ratio < crCoherenceMinRatio short-circuits in the
+        // scorer before stacking is considered.
+        const STACKING_EFFECTIVE_RATIO = 1.50; // effective ratio at/above which the stack dominates
+        const STACKING_OWN_RATIO_MAX = 1.20;   // own ratio at/below which the meal itself is not the over-dose
+        const STACKING_MIN_IOB_U = 1.0;        // material prior IOB floor
+        // Dual-emission signature: one governing meal producing both a high and a
+        // low in the same session (spike-then-crash) independently marks both as
+        // stacking-suspected; neither may carry a CR recommendation. Deterministic
+        // single pass — no race between the two engines.
+        const applyStackingDualTag = (findings) => {
+            (findings || []).forEach(f => {
+                if (!f || f.type !== FindingType.DIRECT_MEAL_LOW || !f.governingMealTime) return;
+                (findings || []).forEach(g => {
+                    if (!g || g.type !== FindingType.DIRECT_MEAL_HIGH || !g.governingMealTime) return;
+                    if (String(g.governingMealTime) !== String(f.governingMealTime)) return;
+                    [f, g].forEach(x => {
+                        if (!x.iobStackingSuspected) {
+                            x.iobStackingSuspected = true;
+                            if (!(x.contributingFactors || []).includes('iob_stacking')) {
+                                x.contributingFactors = [...(x.contributingFactors || []), 'iob_stacking'];
+                            }
+                        }
+                        if (x.primaryParameter === 'cr') {
+                            x.primaryParameter = null;
+                            x.suggestedChangePercent = 0;
+                            x.details = (x.details || '') +
+                                ' Dual high+low emission from one governing meal — spike-then-crash stacking signature; CR lever withheld.';
+                        }
+                    });
+                });
+            });
+            return findings;
+        };
+        // [STACKING-GUARD-END]
+
+        // [VOID-ANCHOR-START] v3.5.87 (DEF-026): a void covers evidence that
+        // existed when the void was written — nothing after. Block+param matching
+        // alone voided the SLOT forever-forward and hit a brand-new sub-60 within
+        // 24 h. Event-backed findings: voided only if EVERY evidence event date ≤
+        // voidDate. Signal-backed: only if no contributing windowsByDate date is
+        // newer. Unknown recency ≠ old — fail toward visibility (priorVoid, an
+        // informational pointer, never a claim). Annotation-only; no gating.
+        const evaluateVoidCoverage = (bundleFindings, mappedRecs, voidTokens) => {
+            const matching = (voidTokens || []).filter(v =>
+                v && v.voidDate && (mappedRecs || []).some(r =>
+                    (r.parameter === v.param || r.param === v.param) && r.scheduleTime === v.block));
+            if (matching.length === 0) return null;
+            const evidenceDates = [];
+            let unknown = false;
+            (bundleFindings || []).forEach(f => {
+                let has = false;
+                if (f && f.eventTime) {
+                    const k = gapLocalDateKey(f.eventTime);
+                    if (k) { evidenceDates.push(k); has = true; }
+                }
+                const wbd = f && f.signalSupport && f.signalSupport.windowsByDate;
+                if (wbd && typeof wbd === 'object') {
+                    Object.keys(wbd).forEach(d => evidenceDates.push(String(d)));
+                    has = true;
+                }
+                if (!has) unknown = true;
+            });
+            const latestVoid = matching.map(v => v.voidDate).sort().pop();
+            if (unknown || evidenceDates.length === 0) {
+                return { voided: false, priorVoid: latestVoid };
+            }
+            const covered = matching.some(v => evidenceDates.every(d => d <= v.voidDate));
+            return covered ? { voided: true, priorVoid: null } : { voided: false, priorVoid: latestVoid };
+        };
+        // [VOID-ANCHOR-END]
+
+        // [EPISODE-START] v3.5.88 (DEF-027): nadir episode consolidation. One hypo
+        // excursion = one finding. Consecutive sub-70 readings with gaps ≤ 30 min
+        // and no intervening recovery ≥ 80 mg/dL collapse to their deepest nadir
+        // (the representative the routing sees — a 43 episode is severe even if
+        // the last reading was 52). Runs on lowProblems BEFORE any detector or
+        // the stacking check consumes them; members preserved as episodeReadings.
+        // Readings with unparseable timestamps pass through ungrouped (no merge
+        // across unknowns). Distinct episodes (recovery ≥ 80 between) stay distinct.
+        const EPISODE_RECOVERY_BG = 80;
+        const EPISODE_GAP_MIN = 30;
+        const consolidateLowEpisodes = (lowProblems, glucose) => {
+            const valid = [];
+            const unknown = [];
+            (lowProblems || []).forEach(lp => {
+                const t = lp && (lp.localTime || lp.time);
+                const ms = t ? new Date(t).getTime() : NaN;
+                if (isNaN(ms)) unknown.push(lp); else valid.push({ lp, ms });
+            });
+            valid.sort((a, b) => a.ms - b.ms);
+            const episodes = [];
+            let cur = null;
+            valid.forEach(({ lp, ms }) => {
+                if (cur) {
+                    const gapMin = (ms - cur.lastMs) / 60000;
+                    let recovered = false;
+                    if (gapMin <= EPISODE_GAP_MIN) {
+                        recovered = (glucose || []).some(r => {
+                            if (!r || r.sgv == null || !r.dateString) return false;
+                            const rt = new Date(r.dateString).getTime();
+                            return rt > cur.lastMs && rt < ms && r.sgv >= EPISODE_RECOVERY_BG;
+                        });
+                    }
+                    if (gapMin > EPISODE_GAP_MIN || recovered) cur = null;
+                }
+                if (!cur) { cur = { members: [], lastMs: ms }; episodes.push(cur); }
+                cur.members.push(lp);
+                cur.lastMs = ms;
+            });
+            const out = episodes.map(ep => {
+                if (ep.members.length === 1) return ep.members[0];
+                let rep = ep.members[0];
+                ep.members.forEach(m => { if (m.bg < rep.bg) rep = m; });
+                return {
+                    ...rep,
+                    episodeReadings: ep.members.map(m => ({ bg: m.bg, time: m.localTime || m.time })),
+                    episodeCount: ep.members.length
+                };
+            });
+            return [...out, ...unknown];
+        };
+        // Attach episode evidence to whatever finding the routing produced for a
+        // representative low — uniform across all low detectors, one insertion.
+        const attachEpisodeEvidence = (findings, lowProblems) => {
+            const byTime = new Map((lowProblems || [])
+                .filter(l => l && l.episodeReadings)
+                .map(l => [String(l.time), l]));
+            (findings || []).forEach(f => {
+                if (!f || !f.eventTime) return;
+                const ep = byTime.get(String(f.eventTime));
+                if (ep) {
+                    f.episodeReadings = ep.episodeReadings;
+                    f.episodeCount = ep.episodeCount;
+                }
+            });
+            return findings;
+        };
+        // [EPISODE-END]
+
+        // [PERSIST-KEY-START] v3.5.89 (DEF-028): stable persistence identity.
+        // Display names churn by design (Safety: prefixes, escalation renames,
+        // period suffixes) — the name-keyed silent-failure class, tool-side.
+        // Counting keys on detector@scheduleTime when both are stored; historical
+        // rows without them fall back to a normalized name (prefix/suffix stripped).
+        // Transition note: an old name-keyed row and a new detector-keyed row for
+        // the same item do not merge — the mismatch ages out of the 14-day window.
+        const normalizeItemName = (name) => String(name || '')
+            .replace(/^Safety:\s*/i, '')
+            .replace(/\s*\([^)]*\)\s*$/, '')
+            .trim()
+            .toLowerCase();
+        const persistenceKey = (item) => {
+            if (item && item.detector && item.scheduleTime) {
+                return item.detector + '@' + item.scheduleTime;
+            }
+            return 'name:' + normalizeItemName(item && item.name);
+        };
+        // [PERSIST-KEY-END]
+
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
             const eventTime = new Date(timestamp);
@@ -4651,6 +4816,17 @@
                         ? (decomp.actualTotal + iobAtMealEntry) / decomp.expectedBudget
                         : null;
 
+                    // v3.5.86 stacking guard (DEF-025). Every comparison null-guarded —
+                    // unknown is not stacking. Requires own ratio ≥ crCoherenceMinRatio
+                    // so the v3.5.70 under-delivery guard keeps first position.
+                    const iobStackingSuspected =
+                        effectiveBudgetRatio != null && iobAtMealEntry != null &&
+                        decomp.budgetRatio != null && decomp.expectedBudget > 0 &&
+                        decomp.budgetRatio >= CONFIG.crCoherenceMinRatio &&
+                        effectiveBudgetRatio >= STACKING_EFFECTIVE_RATIO &&
+                        decomp.budgetRatio <= STACKING_OWN_RATIO_MAX &&
+                        iobAtMealEntry >= STACKING_MIN_IOB_U;
+
                     const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
 
                     // Negative-IOB-at-low basal signal (v3.5.68)
@@ -4709,7 +4885,9 @@
                     const isfScore = postPeakCorrections.length === 0
                         ? Math.min(isfScoreRaw, 0.2)
                         : isfScoreRaw;
-                    const crScore = this._scoreCRAxisLow(
+                    // Stacking zeroes the CR axis (Part A): the crash is stack-driven,
+                    // so a CR-too-strong conclusion is unsupportable regardless of timing.
+                    const crScore = iobStackingSuspected ? 0 : this._scoreCRAxisLow(
                         decomp, effectiveMinsFromMealToLow,
                         nightscoutData.glucose, effectiveMealTime, lowTime
                     );
@@ -4770,6 +4948,36 @@
                         details: `Low ${low.bg} mg/dL — probable Cat2 SMB completion low. Governing meal ${consolidatedCarbs}g at ${formatTimeForDisplay(effectiveGoverningMeal.created_at)}, estimated completion delivery ~${estimatedCompletionU.toFixed(2)}U. ${detailSuffix}`
                     });
 
+                    // v3.5.86 stacking reclassification (Part B) — MEALCOMP pre-check
+                    // pattern. Ordering: MEALCOMP (completion = the OWN meal's insulin,
+                    // distinct mechanism) → stacking → CR scoring. The low stays visible
+                    // at full severe-low severity; only the CR lever is withheld.
+                    if (iobStackingSuspected && !probableMealCompletion) {
+                        const stackingQuestion =
+                            `Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)} — meal dosed at ` +
+                            `${decomp.budgetRatio.toFixed(2)}x its own budget, but ${iobAtMealEntry.toFixed(2)}U ` +
+                            `of prior IOB was active at entry (effective ${effectiveBudgetRatio.toFixed(2)}x). ` +
+                            `The crash is stacking-driven: trace the upstream corrections, not this meal's CR. ` +
+                            `What drove the corrections in the prior 2\u20134 h?`;
+                        finding = {
+                            id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                            type: FindingType.DIRECT_MEAL_LOW,
+                            eventTime: low.time,
+                            scheduleTime: getCRForTime(effectiveMealTime.toISOString(), crSchedule)?.time || null,
+                            period: periodName,
+                            severity: low.bg < 55 ? 0.95 : low.bg < 65 ? 0.85 : 0.7,
+                            primaryParameter: null,
+                            suggestedChangePercent: 0,
+                            contributingFactors: [
+                                ...axisFactors, 'iob_stacking',
+                                ...(splitMealConsolidated ? ['split_meal_consolidated'] : [])
+                            ],
+                            iobStackingSuspected: true,
+                            turn1Question: stackingQuestion,
+                            effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)),
+                            details: stackingQuestion
+                        };
+                    } else
                     // All axes below threshold → RESISTANT_LOW (or completion reclassification)
                     if (crScore < 0.25 && isfScore < 0.25 && basalScore < 0.25) {
                         finding = probableMealCompletion
@@ -4952,6 +5160,8 @@
                     }
 
                     if (finding) {
+                        // v3.5.86: meal identity for the dual-emission stacking signature
+                        finding.governingMealTime = effectiveGoverningMeal?.created_at || null;
                         // Attach negative-IOB basal signal fields (v3.5.68)
                         finding.netIobAtNadir = netIobAtNadir;
                         finding.basalIobAtNadir = basalIobAtNadir;
@@ -5498,6 +5708,8 @@
                     }
 
                     if (finding) {
+                        // v3.5.86: meal identity for the dual-emission stacking signature
+                        finding.governingMealTime = governingMeal?.created_at || null;
                         findings.push(finding);
                         allHighIds.forEach(id => claimedEvents.highs.add(id));
                     }
@@ -7762,7 +7974,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.85',
+                            version: '3.5.89',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -7941,6 +8153,11 @@
                         timeBlock: bundle.timeBlock || 'General',
                         rootCause: bundle.rootCause || null,
                         urgentReason: bundle.urgentReason || null,
+                        // v3.5.86: stacking tag + upstream-trace question survive serialization
+                        ...(bundle.findings?.some(f => f.iobStackingSuspected) ? {
+                            iobStackingSuspected: true,
+                            stackingQuestion: bundle.findings.find(f => f.turn1Question)?.turn1Question || null
+                        } : {}),
                         recommendations: (bundle.recommendations || []).map(rec => ({
                             parameter: rec.param,
                             scheduleTime: rec.scheduleTime,
@@ -8015,12 +8232,13 @@
                     .slice()
                     .sort((a, b) => new Date(a.date) - new Date(b.date))
                     .slice(-3)
-                    .flatMap(e => parseVoidsTokens(e && e.decisionLog));
+                    .flatMap(e => parseVoidsTokens(e && e.decisionLog)
+                        .map(t => ({ ...t, voidDate: gapLocalDateKey(e && e.date) })));
 
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.85',
+                        version: '3.5.89',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -8054,10 +8272,11 @@
                     },
                     actions: primaryBundles.map(b => {
                         const mapped = mapBundle(b);
-                        // INSTR-6: VOIDS: annotation — export-only metadata, no suppression
-                        if (recentVoidTokens.some(v => (mapped.recommendations || []).some(r =>
-                            r.parameter === v.param && r.scheduleTime === v.block))) {
-                            mapped.voided = true;
+                        // INSTR-6/v3.5.87: VOIDS: annotation, event-anchored — export-only
+                        const voidCov = evaluateVoidCoverage(b.findings, mapped.recommendations, recentVoidTokens);
+                        if (voidCov) {
+                            if (voidCov.voided) mapped.voided = true;
+                            else mapped.priorVoid = voidCov.priorVoid;
                         }
                         return mapped;
                     }),
@@ -8067,10 +8286,11 @@
                         mapped.status = bundleStatus.status;
                         mapped.statusReason = bundleStatus.statusReason;
                         mapped.blockedBy = b.blockedBy || null;
-                        // INSTR-6: VOIDS: annotation — export-only metadata, no suppression
-                        if (recentVoidTokens.some(v => (mapped.recommendations || []).some(r =>
-                            r.parameter === v.param && r.scheduleTime === v.block))) {
-                            mapped.voided = true;
+                        // INSTR-6/v3.5.87: VOIDS: annotation, event-anchored — export-only
+                        const voidCovW = evaluateVoidCoverage(b.findings, mapped.recommendations, recentVoidTokens);
+                        if (voidCovW) {
+                            if (voidCovW.voided) mapped.voided = true;
+                            else mapped.priorVoid = voidCovW.priorVoid;
                         }
                         return mapped;
                     }),
@@ -9198,116 +9418,118 @@
                 }
                 // [LEDGER-TREND-END]
 
-                // === Persistent Item Tracking ===
-                const recentWithActions = entries.filter(e => e.primaryActions);
-                const recentWithWatch = entries.filter(e => e.watchItems);
-                
-                if (recentWithActions.length >= 2 || recentWithWatch.length >= 2) {
+                // [PERSIST-START] === Persistent Item Tracking === (v3.5.89, DEF-028)
+                // Counting keys on detector@scheduleTime (normalized-name fallback for
+                // historical rows); display shows the most recent human name. Honest-
+                // empty contract: never a bare header — a safety review must tell
+                // "nothing persistent" from "instrument broken" at a glance.
+                {
                     output += '## Item Persistence\n\n';
-                    
-                    const SESSION_DECAY_FACTOR = 0.3;
-                    const SESSION_WINDOW_DAYS  = 14;
-                    const sessionRecencyWeight = (sessionDateStr) => {
-                        if (!sessionDateStr) return 0;
-                        const sessionDate = new Date(sessionDateStr + 'T00:00:00');
-                        const now = new Date();
-                        const ageDays = (now - sessionDate) / (1000 * 60 * 60 * 24);
-                        return Math.exp(-SESSION_DECAY_FACTOR * (ageDays / SESSION_WINDOW_DAYS));
-                    };
+                    const parsedRows = entries.filter(e =>
+                        Array.isArray(e.primaryActions) || Array.isArray(e.watchItems));
+                    const recentWithActions = entries.filter(e => Array.isArray(e.primaryActions));
+                    const recentWithWatch = entries.filter(e => Array.isArray(e.watchItems));
 
-                    const actionFrequency     = {};
-                    const actionWeightedScore = {};
-                    for (const e of recentWithActions) {
-                        const actions = Array.isArray(e.primaryActions) ? e.primaryActions : [];
-                        const w = sessionRecencyWeight(e.date || e.timestamp || '');
-                        for (const a of actions) {
-                            const key = a.name || 'unknown';
-                            actionFrequency[key]     = (actionFrequency[key]     || 0) + 1;
-                            actionWeightedScore[key] = (actionWeightedScore[key] || 0) + w;
-                        }
-                    }
-
-                    const watchFrequency     = {};
-                    const watchWeightedScore = {};
-                    for (const e of recentWithWatch) {
-                        const items = Array.isArray(e.watchItems) ? e.watchItems : [];
-                        const w = sessionRecencyWeight(e.date || e.timestamp || '');
-                        for (const item of items) {
-                            const key = item.name || 'unknown';
-                            watchFrequency[key]     = (watchFrequency[key]     || 0) + 1;
-                            watchWeightedScore[key] = (watchWeightedScore[key] || 0) + w;
-                        }
-                    }
-
-                    const PERSIST_RAW_THRESHOLD      = 3;
-                    const PERSIST_WEIGHTED_THRESHOLD = 1.5;
-
-                    const persistentActions = Object.entries(actionFrequency).filter(([k, v]) =>
-                        v >= PERSIST_RAW_THRESHOLD &&
-                        (actionWeightedScore[k] || 0) >= PERSIST_WEIGHTED_THRESHOLD
-                    );
-                    const persistentWatch = Object.entries(watchFrequency).filter(([k, v]) =>
-                        v >= PERSIST_RAW_THRESHOLD &&
-                        (watchWeightedScore[k] || 0) >= PERSIST_WEIGHTED_THRESHOLD
-                    );
-
-                    if (persistentActions.length > 0) {
-                        output += '**Recurring primary actions** (3+ appearances, recency-weighted):\n';
-                        for (const [name, count] of persistentActions) {
-                            const ws = (actionWeightedScore[name] || 0).toFixed(1);
-                            output += `- ${name}: ${count}/${recentWithActions.length} sessions (weighted: ${ws})\n`;
-                        }
-                        output += '\n';
-                    }
-
-                    if (persistentWatch.length > 0) {
-                        output += '**Recurring watch items** (3+ appearances, recency-weighted):\n';
-                        for (const [name, count] of persistentWatch) {
-                            const ws = (watchWeightedScore[name] || 0).toFixed(1);
-                            output += `- ${name}: ${count}/${recentWithWatch.length} sessions (weighted: ${ws})\n`;
-                        }
-                        output += '\n';
-                    }
-                    
-                    // Escalations: items in today's primary that were in yesterday's watch
-                    if (currentData?.primaryActions && recentWithWatch.length > 0) {
-                        const lastWatch = recentWithWatch[recentWithWatch.length - 1];
-                        const lastWatchNames = (Array.isArray(lastWatch.watchItems) ? lastWatch.watchItems : [])
-                            .map(w => w.name);
-                        const todayPrimaryNames = (Array.isArray(currentData.primaryActions) ? currentData.primaryActions : [])
-                            .map(a => a.name);
-                        
-                        const escalated = todayPrimaryNames.filter(n => lastWatchNames.includes(n));
-                        if (escalated.length > 0) {
-                            output += '**⬆ Escalated to primary today:**\n';
-                            for (const name of escalated) {
-                                output += `- ${name}\n`;
+                    if (parsedRows.length < 2) {
+                        output += `_Persistence check unavailable: fewer than 2 history rows with parsed action/watch arrays (${parsedRows.length} found)._\n\n`;
+                    } else {
+                        const SESSION_DECAY_FACTOR = 0.3;
+                        const SESSION_WINDOW_DAYS = 14;
+                        const sessionRecencyWeight = (sessionDateStr) => {
+                            if (!sessionDateStr) return 0;
+                            const sessionDate = new Date(sessionDateStr + 'T00:00:00');
+                            const now = new Date();
+                            const ageDays = (now - sessionDate) / (1000 * 60 * 60 * 24);
+                            return Math.exp(-SESSION_DECAY_FACTOR * (ageDays / SESSION_WINDOW_DAYS));
+                        };
+                        const tally = (rows, field) => {
+                            const freq = {}, weighted = {}, displayName = {};
+                            for (const e of rows) {
+                                const items = Array.isArray(e[field]) ? e[field] : [];
+                                const w = sessionRecencyWeight(gapLocalDateKey(e.date || e.timestamp || '') || '');
+                                for (const item of items) {
+                                    const key = persistenceKey(item);
+                                    freq[key] = (freq[key] || 0) + 1;
+                                    weighted[key] = (weighted[key] || 0) + w;
+                                    displayName[key] = item.name || key; // most recent variant wins
+                                }
                             }
-                            output += '\n';
-                        }
-                    }
-                    
-                    // Resolved: items in yesterday's primary/watch that are absent today
-                    if (recentWithActions.length > 0 && currentData) {
-                        const lastActions = recentWithActions[recentWithActions.length - 1];
-                        const lastActionNames = (Array.isArray(lastActions.primaryActions) ? lastActions.primaryActions : [])
-                            .map(a => a.name);
-                        const todayAllNames = [
-                            ...(Array.isArray(currentData.primaryActions) ? currentData.primaryActions : []).map(a => a.name),
-                            ...(Array.isArray(currentData.watchItems) ? currentData.watchItems : []).map(w => w.name)
-                        ];
-                        
-                        const resolved = lastActionNames.filter(n => !todayAllNames.includes(n));
-                        if (resolved.length > 0) {
-                            output += '**✓ Resolved (no longer appearing):**\n';
-                            for (const name of resolved) {
-                                output += `- ${name}\n`;
+                            return { freq, weighted, displayName };
+                        };
+                        const PERSIST_RAW_THRESHOLD = 3;
+                        const PERSIST_WEIGHTED_THRESHOLD = 1.5;
+                        const renderTally = (label, rows, field) => {
+                            const { freq, weighted, displayName } = tally(rows, field);
+                            const persistent = Object.entries(freq).filter(([k, v]) =>
+                                v >= PERSIST_RAW_THRESHOLD && (weighted[k] || 0) >= PERSIST_WEIGHTED_THRESHOLD);
+                            if (persistent.length > 0) {
+                                output += `**${label}** (3+ appearances, recency-weighted, keyed by detector@slot):\n`;
+                                for (const [key, count] of persistent) {
+                                    output += `- ${displayName[key]}: ${count}/${rows.length} sessions (weighted: ${(weighted[key] || 0).toFixed(1)})\n`;
+                                }
+                                output += '\n';
+                            } else {
+                                output += `_No ${label.toLowerCase()} met thresholds (${rows.length} sessions scanned, threshold ${PERSIST_RAW_THRESHOLD})._\n`;
+                            }
+                        };
+                        renderTally('Recurring primary actions', recentWithActions, 'primaryActions');
+                        renderTally('Recurring watch items', recentWithWatch, 'watchItems');
+                        output += '\n';
+
+                        // Escalation/resolution compare against the most recent row dated
+                        // BEFORE today — after the same-session auto-log, the last row can
+                        // be today's own write, and today-vs-today is structurally empty
+                        // (one of the three Jul 22–24 empty causes).
+                        const todayKey = getLocalDateString();
+                        const priorRowOf = (rows) => {
+                            for (let i = rows.length - 1; i >= 0; i--) {
+                                const k = gapLocalDateKey(rows[i].date || rows[i].timestamp || '');
+                                if (k && k < todayKey) return rows[i];
+                            }
+                            return null;
+                        };
+                        if (!currentData) {
+                            output += '_Escalation/resolution check unavailable: no current-session data at this render site._\n\n';
+                        } else {
+                            const priorWatchRow = priorRowOf(recentWithWatch);
+                            if (priorWatchRow) {
+                                const priorWatchKeys = (priorWatchRow.watchItems || []).map(persistenceKey);
+                                const escalated = (Array.isArray(currentData.primaryActions) ? currentData.primaryActions : [])
+                                    .filter(a => priorWatchKeys.includes(persistenceKey(a)));
+                                if (escalated.length > 0) {
+                                    output += '**⬆ Escalated to primary today:**\n';
+                                    for (const a of escalated) output += `- ${a.name}\n`;
+                                    output += '\n';
+                                } else {
+                                    output += '_No escalations vs. last session._\n';
+                                }
+                            } else {
+                                output += '_Escalation check unavailable: no prior-day watch row in history._\n';
+                            }
+                            const priorActionRow = priorRowOf(recentWithActions);
+                            if (priorActionRow) {
+                                const todayAllKeys = [
+                                    ...(Array.isArray(currentData.primaryActions) ? currentData.primaryActions : []),
+                                    ...(Array.isArray(currentData.watchItems) ? currentData.watchItems : [])
+                                ].map(persistenceKey);
+                                const resolved = (priorActionRow.primaryActions || [])
+                                    .filter(a => !todayAllKeys.includes(persistenceKey(a)));
+                                if (resolved.length > 0) {
+                                    output += '**✓ Resolved (no longer appearing):**\n';
+                                    for (const a of resolved) output += `- ${a.name}\n`;
+                                    output += '\n';
+                                } else {
+                                    output += '_No resolutions vs. last session._\n';
+                                }
+                            } else {
+                                output += '_Resolution check unavailable: no prior-day action row in history._\n';
                             }
                             output += '\n';
                         }
                     }
                 }
-                
+                // [PERSIST-END]
+
                 // === Decision Log History ===
                 const entriesWithLogs = entries
                     .filter(e => e.decisionLog && String(e.decisionLog).trim().length > 0)
@@ -10387,6 +10609,8 @@
                             const primary = (processedBundles || []).filter(b => b.priority === 'PRIMARY');
                             return JSON.stringify(primary.map(b => ({
                                 name: b.name,
+                                detector: b.findings?.[0]?.type || null,
+                                scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
                                 timeBlock: b.timeBlock || 'General',
                                 urgent: b.isUrgent || false,
                                 recs: (b.recommendations || []).map(r => `${r.scheduleTime} ${r.param} ${r.changePercent > 0 ? '+' : ''}${r.changePercent.toFixed(1)}%`).join('; ')
@@ -10398,6 +10622,8 @@
                             const watch = (processedBundles || []).filter(b => b.priority === 'REFERENCE');
                             return JSON.stringify(watch.map(b => ({
                                 name: b.name,
+                                detector: b.findings?.[0]?.type || null,
+                                scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
                                 status: getBundleStatus(b).status,
                                 confidence: b.confidence ? b.confidence.toFixed(2) : '0'
                             })));
@@ -10595,7 +10821,7 @@
                     
                     // Identify low problems
                     const analysisStart = new Date(Date.now() - analysisWindow * 24 * 60 * 60 * 1000);
-                    const lowProblems = nightscoutData.glucose
+                    const rawLowProblems = nightscoutData.glucose
                         .filter(r => {
                             const rTime = new Date(r.dateString);
                             return rTime >= analysisStart && r.sgv <= CONFIG.lowThreshold;
@@ -10605,6 +10831,9 @@
                             time: r.dateString,
                             localTime: r.dateString
                         }));
+                    // v3.5.88: one hypo episode = one representative low (deepest nadir),
+                    // consolidated before ANY detector or the stacking check sees them.
+                    const lowProblems = consolidateLowEpisodes(rawLowProblems, nightscoutData.glucose);
 
                     // §5.3a: highProblems — sustained waking-hour high events (BG ≥ 180, ≥2
                     // consecutive readings within a 20-min gap). Built here adjacent to
@@ -10921,6 +11150,12 @@
                         highProblems, nightscoutData, activeSchedules.cr, activeSchedules.isf,
                         claimedEvents, analysisWindow, signalAnalysis
                     ));
+
+                    // v3.5.86: dual high+low from one governing meal → both stacking-tagged,
+                    // neither carries a CR lever. Single deterministic pass, no engine race.
+                    applyStackingDualTag(allFindings);
+                    // v3.5.88: episode members ride the routed finding as evidence
+                    attachEpisodeEvidence(allFindings, lowProblems);
 
                     // Detector 1b: Transient High with Subsequent Low (retained for all hours)
                     allFindings.push(...PatternDetectors.detectTransientHighWithLow(
@@ -11972,10 +12207,14 @@
                             const currentData = {
                                 primaryActions: (bundles || []).filter(b => b.priority === 'PRIMARY').map(b => ({
                                     name: b.name,
+                                    detector: b.findings?.[0]?.type || null,
+                                    scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
                                     timeBlock: b.timeBlock || 'General'
                                 })),
                                 watchItems: (bundles || []).filter(b => b.priority === 'REFERENCE').map(b => ({
                                     name: b.name,
+                                    detector: b.findings?.[0]?.type || null,
+                                    scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
                                     status: getBundleStatus(b).status
                                 }))
                             };
@@ -11995,10 +12234,14 @@
                                 const currentData = {
                                     primaryActions: (bundles || []).filter(b => b.priority === 'PRIMARY').map(b => ({
                                         name: b.name,
+                                        detector: b.findings?.[0]?.type || null,
+                                        scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
                                         timeBlock: b.timeBlock || 'General'
                                     })),
                                     watchItems: (bundles || []).filter(b => b.priority === 'REFERENCE').map(b => ({
                                         name: b.name,
+                                        detector: b.findings?.[0]?.type || null,
+                                        scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
                                         status: getBundleStatus(b).status
                                     }))
                                 };
@@ -12305,6 +12548,8 @@
                             const primary = (bundles || []).filter(b => b.priority === 'PRIMARY');
                             return JSON.stringify(primary.map(b => ({
                                 name: b.name,
+                                detector: b.findings?.[0]?.type || null,
+                                scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
                                 timeBlock: b.timeBlock || 'General',
                                 urgent: b.isUrgent || false,
                                 recs: (b.recommendations || []).map(r => `${r.scheduleTime} ${r.param} ${r.changePercent > 0 ? '+' : ''}${r.changePercent.toFixed(1)}%`).join('; ')
@@ -12316,6 +12561,8 @@
                             const watch = (bundles || []).filter(b => b.priority === 'REFERENCE');
                             return JSON.stringify(watch.map(b => ({
                                 name: b.name,
+                                detector: b.findings?.[0]?.type || null,
+                                scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
                                 status: getBundleStatus(b).status,
                                 confidence: b.confidence ? b.confidence.toFixed(2) : '0'
                             })));
@@ -12413,7 +12660,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.85 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.89 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
