@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.91</title>
+    <title>Daily Insulin Settings Review v3.5.92</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -1527,6 +1527,12 @@
                 if (finding.type === FindingType.MIXED_ATTRIBUTION) return null;
                 if (finding.type === FindingType.RESISTANT_HIGH) return null;
                 if (finding.type === FindingType.PRESSURE_ARTIFACT) return null;
+                // v3.5.92 (DEF-034): a rebound-classified high must not contribute a
+                // CR/ISF strengthen — the classifier's own text says "physiological
+                // rebound from hypoglycemia, not weak CR". Rebound-only bundles render
+                // informationally; mixed bundles derive from non-rebound findings only
+                // (extends the existing filterByState/getBundleName special-casing).
+                if (finding.type === FindingType.REBOUND_HIGH) return null;
                 // v3.5.68: DAWN_CORRECTION_PATTERN is detect-and-quantify-only — it informs the
                 // review that basal is under-provisioned across the dawn window but does not itself
                 // recommend a change (that's a clinical decision on the basal schedule). Excluded
@@ -1894,23 +1900,56 @@
                                         'General';
                     bundle.timeBlock = getTimeBlock(scheduleTime);
                     
-                    // Check for URGENT severity (severe lows)
+                    // [URGENCY-GATE-START] v3.5.92 (DEF-018): urgency requires a RECENT,
+                    // non-self-flagged severe low. Recency comes from the event's own
+                    // timestamp (validity chain, finding.eventTime fallback) — never from
+                    // the counters (DEF-037's lesson). A genuine recent severe low still
+                    // fast-tracks exactly as before; a stale or self-disclaimed one stays
+                    // visible at its natural tier with urgencyWithheld recorded. A severe
+                    // low never disappears (the v3.5.70 lesson).
                     bundle.isUrgent = false;
                     bundle.urgentReason = null;
+                    const URGENT_RECENCY_HOURS = 24;
+                    const URGENT_FUTURE_SLACK_MS = 15 * 60 * 1000; // clock-skew tolerance
+                    const _urgNow = Date.now();
+                    let _urgWithheld = null;
                     
                     const findings = bundle.findings || [];
                     for (const finding of findings) {
-                        // Check for severe low
+                        const selfFlagged =
+                            (finding.contributingFactors || []).includes('likely_pressure_artifact') ||
+                            /pressure artifact/i.test(finding.details || '');
                         const events = finding.events || [];
                         for (const event of events) {
-                            if (event.lowBG && event.lowBG < CONFIG.urgentLowThreshold) {
-                                bundle.isUrgent = true;
-                                bundle.urgentReason = `Severe low (${event.lowBG} mg/dL)`;
-                                break;
+                            if (!(event.lowBG && event.lowBG < CONFIG.urgentLowThreshold)) continue;
+                            if (selfFlagged) {
+                                // do not fast-track an event the tool itself says to verify
+                                _urgWithheld = _urgWithheld || 'self_flagged_artifact';
+                                continue;
                             }
+                            let ts = parseEventTimestamp(event);
+                            if (ts === null && finding.eventTime) {
+                                const ft = new Date(finding.eventTime).getTime();
+                                if (!isNaN(ft)) ts = ft;
+                            }
+                            const recent = ts !== null &&
+                                (_urgNow - ts) <= URGENT_RECENCY_HOURS * 60 * 60 * 1000 &&
+                                (ts - _urgNow) <= URGENT_FUTURE_SLACK_MS;
+                            if (!recent) {
+                                // unknown is not recent; stale must not fast-track
+                                _urgWithheld = _urgWithheld || 'stale';
+                                continue;
+                            }
+                            bundle.isUrgent = true;
+                            bundle.urgentReason = `Severe low (${event.lowBG} mg/dL)`;
+                            break;
                         }
                         if (bundle.isUrgent) break;
                     }
+                    if (!bundle.isUrgent && _urgWithheld) {
+                        bundle.urgencyWithheld = _urgWithheld;
+                    }
+                    // [URGENCY-GATE-END]
                 });
                 
                 // Step 2: Sort by urgency, then tier, then recency, then confidence
@@ -3059,6 +3098,23 @@
             };
         };
         // [CURRENT-IOB-END]
+
+        // [EVENT-TS-START] v3.5.92 (DEF-037 canon): validity-based fallthrough.
+        // A truthy-but-unparseable value must never block a fallback chain — the
+        // first PARSEABLE field wins. Display 'time' is demoted to last as a
+        // best-effort (non-CAE detectors populate it with formatTimeForDisplay,
+        // which does not parse). Returns epoch ms or null.
+        const parseEventTimestamp = (e) => {
+            if (!e) return null;
+            const candidates = [e.eventTime, e.created_at, e.dateString, e.date, e.time];
+            for (const v of candidates) {
+                if (v == null) continue;
+                const t = new Date(v).getTime();
+                if (!isNaN(t)) return t;
+            }
+            return null;
+        };
+        // [EVENT-TS-END]
 
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
@@ -8126,7 +8182,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.91',
+                            version: '3.5.92',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8306,6 +8362,7 @@
                         timeBlock: bundle.timeBlock || 'General',
                         rootCause: bundle.rootCause || null,
                         urgentReason: bundle.urgentReason || null,
+                        urgencyWithheld: bundle.urgencyWithheld || null,
                         // v3.5.86: stacking tag + upstream-trace question survive serialization
                         ...(bundle.findings?.some(f => f.iobStackingSuspected) ? {
                             iobStackingSuspected: true,
@@ -8391,7 +8448,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.91',
+                        version: '3.5.92',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12097,15 +12154,19 @@
                         const _cutoff3d  = _now - 3 * 24 * 60 * 60 * 1000;
                         const _events = finding.events || [];
 
+                        // v3.5.92 (DEF-037): validity-based timestamp resolution. The old
+                        // truthiness chain read display 'time' first, which is truthy and
+                        // unparseable — every event dropped, and the CORRECT accumulation
+                        // counters were overwritten with 0 (silently suppressing whole
+                        // detector classes from the actionable list). Invariant now: never
+                        // overwrite with less information than accumulation started with.
                         if (_events.length > 0) {
-                            finding.eventsLast24h = _events.filter(e => {
-                                const t = new Date(e.time || e.eventTime || e.created_at || e.dateString || e.date).getTime();
-                                return !isNaN(t) && t >= _cutoff24h;
-                            }).length;
-                            finding.eventsLast3Days = _events.filter(e => {
-                                const t = new Date(e.time || e.eventTime || e.created_at || e.dateString || e.date).getTime();
-                                return !isNaN(t) && t >= _cutoff3d;
-                            }).length;
+                            const parsedTs = _events.map(parseEventTimestamp).filter(t => t !== null);
+                            if (parsedTs.length > 0) {
+                                finding.eventsLast24h = parsedTs.filter(t => t >= _cutoff24h).length;
+                                finding.eventsLast3Days = parsedTs.filter(t => t >= _cutoff3d).length;
+                            }
+                            // zero parseable timestamps → retain accumulation counters
                         }
                         // Invariant: 3-day count >= 24h count
                         finding.eventsLast3Days = Math.max(finding.eventsLast3Days, finding.eventsLast24h);
@@ -12815,7 +12876,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.91 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.92 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
