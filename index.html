@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.92</title>
+    <title>Daily Insulin Settings Review v3.5.93</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -1140,7 +1140,34 @@
                 
                 // Structural findings (basal signals, ratio warnings) skip recency penalties
                 if (finding.isStructural) {
-                    // Apply only state factor for structural findings
+                    // [CONF1-START] v3.5.93: evidence-volume factor, DISCOUNT-ONLY.
+                    // Severity for basal signals is deviation magnitude alone and
+                    // saturates at |dev| ≥ 19, so an 11-window/2-day signal scored
+                    // identically to a 187-window/4-day one (0.8075 both, Jul 25).
+                    // A well-evidenced finding is UNCHANGED (factor ≤ 1.0 always);
+                    // only thin evidence falls, floored at 0.5 so a thin-but-real
+                    // signal is demoted, never erased. Unknown evidence is not
+                    // penalized — no discount is invented from absent data.
+                    const EVIDENCE_FLOOR = 0.5;
+                    const EVIDENCE_DAY_FACTOR = { 1: 0.6, 2: 0.8, 3: 0.9 }; // 4+ days → 1.0
+                    const EVIDENCE_WINDOW_THIN = 20;      // < 20 windows → 0.8
+                    const EVIDENCE_WINDOW_MODERATE = 50;  // < 50 windows → 0.9; else 1.0
+                    const evDays = finding.contributingDayCount
+                        ?? finding.signalSupport?.contributingDayCount ?? null;
+                    const evWindows = finding.events?.[0]?.cleanWindows
+                        ?? finding.signalSupport?.cleanWindows ?? null;
+                    const dayFactor = evDays == null ? 1.0
+                        : evDays >= 4 ? 1.0
+                        : (EVIDENCE_DAY_FACTOR[evDays] ?? EVIDENCE_DAY_FACTOR[1]);
+                    const windowFactor = evWindows == null ? 1.0
+                        : evWindows < EVIDENCE_WINDOW_THIN ? 0.8
+                        : evWindows < EVIDENCE_WINDOW_MODERATE ? 0.9
+                        : 1.0;
+                    const evidenceFactor = Math.min(1.0, Math.max(EVIDENCE_FLOOR, dayFactor * windowFactor));
+                    base *= evidenceFactor;
+                    // [CONF1-END]
+
+                    // Apply state factor for structural findings
                     const stateMultipliers = {
                         [BodyStateType.STABLE]: 1.0,
                         [BodyStateType.RECOVERY]: 0.85,
@@ -8182,7 +8209,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.92',
+                            version: '3.5.93',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8448,7 +8475,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.92',
+                        version: '3.5.93',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12876,7 +12903,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.92 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.93 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
