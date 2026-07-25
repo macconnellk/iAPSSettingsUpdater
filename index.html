@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.90</title>
+    <title>Daily Insulin Settings Review v3.5.91</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3008,6 +3008,57 @@
             return new Date(anchorMs);
         };
         // [IOB-DIRECTION-END]
+
+        // [CURRENT-IOB-START] v3.5.91: run-time IOB diagnostic. Exposes exactly
+        // what the production 'before' lookup returns as of the run timestamp so
+        // the owner can compare against the Nightscout pill at the same moment
+        // (the v3.5.90 close gate the artifact couldn't previously support).
+        // Read by humans only — nothing consumes it. Never fabricates, never
+        // falls back to a forward record; null carries an explicit reason.
+        const classifyIOBSource = (status) => {
+            // Mirrors extractIOB's precedence chain, reporting which branch matched.
+            if (!status) return null;
+            if (typeof status.iob === 'number') return 'top_level_numeric';
+            if (status.iob && typeof status.iob === 'object' && status.iob.iob != null) return 'top_level_object';
+            if (status.openaps?.iob?.iob != null) return 'openaps_net';
+            return null;
+        };
+        const currentIOBDiagnostic = (deviceStatus, now = new Date()) => {
+            const asOf = now.toISOString();
+            const r = lookupIOB(deviceStatus, now, { direction: 'before' });
+            if (r.value == null) {
+                const reason = (!deviceStatus || deviceStatus.length === 0)
+                    ? 'no_devicestatus'
+                    : ((deviceStatus || []).some(s => s && extractIOB(s) != null)
+                        ? 'no_record_in_window'
+                        : 'no_readable_iob');
+                return { value: null, iobSource: null, recordTime: null, ageMin: null,
+                    asOf, lastBolusTime: null, unavailableReason: reason };
+            }
+            // Locate the record the production lookup selected (same ts + value) so
+            // source classification and lastBolusTime come from the audited record.
+            const srcMs = new Date(r.sourceTime).getTime();
+            let rec = null;
+            (deviceStatus || []).forEach(s => {
+                if (rec || !s || !s.created_at) return;
+                const iob = extractIOB(s);
+                if (iob == null || iob !== r.value) return;
+                const internal = s.openaps?.iob?.time;
+                let ts = internal ? new Date(internal).getTime() : NaN;
+                if (isNaN(ts)) ts = new Date(s.created_at).getTime();
+                if (ts === srcMs) rec = s;
+            });
+            return {
+                value: r.value,
+                iobSource: classifyIOBSource(rec),
+                recordTime: r.sourceTime,
+                ageMin: r.ageMinutes,
+                asOf,
+                lastBolusTime: rec?.openaps?.iob?.lastBolusTime || null,
+                unavailableReason: null
+            };
+        };
+        // [CURRENT-IOB-END]
 
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
@@ -8075,7 +8126,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.90',
+                            version: '3.5.91',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8109,7 +8160,8 @@
                         shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
                         oscillation: computeScheduleOscillation(cachedHistory),
                         changeEffectiveness: computeChangeEffectiveness(cachedHistory),
-                        requirementGap: computeRequirementGap(cachedHistory)
+                        requirementGap: computeRequirementGap(cachedHistory),
+                        currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus)
                     };
                 }
                 
@@ -8339,7 +8391,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.90',
+                        version: '3.5.91',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -8410,6 +8462,8 @@
                     changeEffectiveness: computeChangeEffectiveness(cachedHistory),
                     // INSTR-4: dawn provision vs measured requirement, derived
                     requirementGap: computeRequirementGap(cachedHistory),
+                    // v3.5.91: run-time IOB vs the pill — verification aid, no consumer
+                    currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus),
                     informationalFindings: (analysisResults.findings || [])
                         .filter(f => f.type === FindingType.DAWN_CORRECTION_PATTERN)
                         .map(f => ({
@@ -12761,7 +12815,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.90 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.91 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
