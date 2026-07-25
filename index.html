@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.89</title>
+    <title>Daily Insulin Settings Review v3.5.90</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2903,6 +2903,112 @@
         };
         // [PERSIST-KEY-END]
 
+        // [IOB-DIRECTION-START] v3.5.90 (DEF-032, DEF-019b): pre-event IOB lookups
+        // are strictly backward-looking. The prior nearest-either-direction lookup
+        // returned a record written ~2 min AFTER the meal bolus, so "IOB at meal
+        // entry" contained the meal's own insulin (Jul 24: 3.32U reported vs 0.951U
+        // true — effectiveBudgetRatio sign-inverted). Nothing was fabricated and no
+        // field precedence was wrong; the earlier provenance hypothesis is withdrawn.
+        // direction 'before': latest record at/before target within the window,
+        //   compared on the record's internal computation time (openaps.iob.time,
+        //   upload lags computation) and rejecting records whose lastBolusTime is
+        //   at/after the target (clock-skew contamination guard).
+        // direction 'nearest': byte-identical to the v3.5.89 behavior (created_at,
+        //   either direction) — retained where "state around this moment" is wanted.
+        // Window (±15 min) and null semantics unchanged: no qualifying backward
+        // record → null, never a forward record.
+        const IOB_LOOKUP_WINDOW_MS = 15 * 60 * 1000;
+        const lookupIOB = (deviceStatus, targetTime, opts = {}) => {
+            const direction = opts.direction || 'nearest';
+            const empty = { value: null, sourceTime: null, ageMinutes: null };
+            if (!deviceStatus || deviceStatus.length === 0) return empty;
+            const targetMs = targetTime instanceof Date
+                ? targetTime.getTime() : new Date(targetTime).getTime();
+            if (isNaN(targetMs)) return empty;
+            let best = null, bestDelta = Infinity;
+            deviceStatus.forEach(status => {
+                if (!status || !status.created_at) return;
+                const iob = extractIOB(status);
+                if (iob == null) return;
+                if (direction === 'before') {
+                    const internal = status.openaps?.iob?.time;
+                    let ts = internal ? new Date(internal).getTime() : NaN;
+                    if (isNaN(ts)) ts = new Date(status.created_at).getTime();
+                    if (isNaN(ts) || ts > targetMs) return;
+                    const lastBolus = status.openaps?.iob?.lastBolusTime;
+                    if (lastBolus != null) {
+                        const lb = new Date(lastBolus).getTime();
+                        if (!isNaN(lb) && lb >= targetMs) return;
+                    }
+                    const delta = targetMs - ts;
+                    if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) {
+                        bestDelta = delta; best = { value: iob, ts };
+                    }
+                } else {
+                    const ts = new Date(status.created_at).getTime();
+                    const delta = Math.abs(ts - targetMs);
+                    if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) {
+                        bestDelta = delta; best = { value: iob, ts };
+                    }
+                }
+            });
+            if (!best) return empty;
+            return {
+                value: best.value,
+                sourceTime: new Date(best.ts).toISOString(),
+                ageMinutes: Math.round((targetMs - best.ts) / 6000) / 10
+            };
+        };
+        // Record-form lookup with the same direction contract (netIobAtNadir path).
+        const findDeviceStatusAt = (deviceStatus, targetTime, opts = {}) => {
+            const direction = opts.direction || 'nearest';
+            if (!deviceStatus || !deviceStatus.length) return null;
+            const targetMs = targetTime instanceof Date
+                ? targetTime.getTime() : new Date(targetTime).getTime();
+            if (isNaN(targetMs)) return null;
+            let best = null, bestDelta = Infinity;
+            deviceStatus.forEach(status => {
+                if (!status || !status.created_at) return;
+                if (direction === 'before') {
+                    const internal = status.openaps?.iob?.time;
+                    let ts = internal ? new Date(internal).getTime() : NaN;
+                    if (isNaN(ts)) ts = new Date(status.created_at).getTime();
+                    if (isNaN(ts) || ts > targetMs) return;
+                    const lastBolus = status.openaps?.iob?.lastBolusTime;
+                    if (lastBolus != null) {
+                        const lb = new Date(lastBolus).getTime();
+                        if (!isNaN(lb) && lb >= targetMs) return;
+                    }
+                    const delta = targetMs - ts;
+                    if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) { bestDelta = delta; best = status; }
+                } else {
+                    const delta = Math.abs(new Date(status.created_at).getTime() - targetMs);
+                    if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) { bestDelta = delta; best = status; }
+                }
+            });
+            return best;
+        };
+        // Anchor for pre-MEAL lookups: insulin already on board that was NOT
+        // delivered for this meal — earliest of the meal timestamp and the first
+        // meal-attributable non-SMB delivery ([−2, +90] min, the decomposition's
+        // own capture rule). Owner workflow makes this ≈ the meal timestamp in
+        // practice (carbs → bolus → wait-to-eat); earliest-of kept for robustness.
+        const mealDeliveryAnchor = (treatments, mealTime) => {
+            const mealMs = mealTime instanceof Date ? mealTime.getTime() : new Date(mealTime).getTime();
+            if (isNaN(mealMs)) return mealTime;
+            let anchorMs = mealMs;
+            (treatments || []).forEach(t => {
+                if (!t || !t.created_at || !t.insulin || t.insulin <= 0) return;
+                if (t.eventType && t.eventType.includes('SMB')) return;
+                const tt = new Date(t.created_at).getTime();
+                if (isNaN(tt)) return;
+                const minsFromMeal = (tt - mealMs) / 60000;
+                if (minsFromMeal >= -2 && minsFromMeal <= 90 && tt < anchorMs) anchorMs = tt;
+            });
+            return new Date(anchorMs);
+        };
+        // [IOB-DIRECTION-END]
+
         const calculateRecencyWeight = (timestamp, analysisWindowDays) => {
             const now = new Date();
             const eventTime = new Date(timestamp);
@@ -3629,21 +3735,8 @@
                 };
 
                 // v3.5.68: nearest record *with readable IOB* (extractIOB handles openaps.iob.iob).
-                const getIOBAtTime = (deviceStatus, targetTime) => {
-                    if (!deviceStatus || !deviceStatus.length) return null;
-                    const targetMs = targetTime instanceof Date
-                        ? targetTime.getTime() : new Date(targetTime).getTime();
-                    const WINDOW_MS = 15 * 60 * 1000;
-                    let bestIOB = null, bestDelta = Infinity;
-                    deviceStatus.forEach(status => {
-                        if (!status.created_at) return;
-                        const iob = extractIOB(status);
-                        if (iob == null) return;
-                        const delta = Math.abs(new Date(status.created_at).getTime() - targetMs);
-                        if (delta <= WINDOW_MS && delta < bestDelta) { bestDelta = delta; bestIOB = iob; }
-                    });
-                    return bestIOB;
-                };
+                const getIOBAtTime = (deviceStatus, targetTime, opts = {}) =>
+                    lookupIOB(deviceStatus, targetTime, opts).value;
                 
                 const meals = nightscoutData.treatments.filter(t => 
                     t.carbs && t.carbs >= CONFIG.minMealCarbsForAttribution && !claimedEvents.meals.has(getEventId(t))
@@ -3707,7 +3800,8 @@
                         
                         if (percentGiven < 70) {
                             // Check IOB at meal time
-                            const iobAtMealTime = getIOBAtTime(nightscoutData.deviceStatus, mealTime);
+                            const iobAtMealTime = getIOBAtTime(nightscoutData.deviceStatus,
+                                mealDeliveryAnchor(nightscoutData.treatments, mealTime), { direction: 'before' });
                             
                             if (iobAtMealTime !== null && iobAtMealTime > 1.0) {
                                 // High IOB explains the reduction - not safety
@@ -4017,7 +4111,7 @@
                     }
 
                     // Check IOB at time of low
-                    const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
+                    const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime, { direction: 'before' });
                     
                     // If IOB is negative or very low, this is a resistant low (or completion reclassification)
                     if (iobAtLow !== null && iobAtLow < 0.2) {
@@ -4141,8 +4235,12 @@
                 return findings;
             },
             
-            findClosestDeviceStatus(deviceStatus, targetTime) {
+            findClosestDeviceStatus(deviceStatus, targetTime, opts = {}) {
                 // Shared deviceStatus matcher — returns the full record or null (v3.5.68).
+                // v3.5.90: opts.direction 'before' delegates to the module directional form.
+                if (opts && opts.direction === 'before') {
+                    return findDeviceStatusAt(deviceStatus, targetTime, opts);
+                }
                 // Method form so all PatternDetectors methods can call via this.findClosestDeviceStatus.
                 if (!deviceStatus || !deviceStatus.length) return null;
                 const targetMs = targetTime instanceof Date
@@ -4162,22 +4260,11 @@
                 return closest;
             },
 
-            getIOBAtTime(deviceStatus, targetTime) {
-                // v3.5.68: nearest record with readable IOB (extractIOB handles openaps.iob.iob).
-                if (!deviceStatus || deviceStatus.length === 0) return null;
-                const targetMs = targetTime instanceof Date
-                    ? targetTime.getTime()
-                    : new Date(targetTime).getTime();
-                const WINDOW_MS = 15 * 60 * 1000;
-                let bestIOB = null, bestDelta = Infinity;
-                deviceStatus.forEach(status => {
-                    if (!status.created_at) return;
-                    const iob = extractIOB(status);
-                    if (iob == null) return;
-                    const delta = Math.abs(new Date(status.created_at).getTime() - targetMs);
-                    if (delta <= WINDOW_MS && delta < bestDelta) { bestDelta = delta; bestIOB = iob; }
-                });
-                return bestIOB;
+            getIOBAtTime(deviceStatus, targetTime, opts = {}) {
+                // v3.5.90: delegates to the module-scope directional lookup. Default
+                // 'nearest' is byte-identical to the v3.5.68 behavior; pre-event call
+                // sites pass { direction: 'before' } explicitly.
+                return lookupIOB(deviceStatus, targetTime, opts).value;
             },
             
             /**
@@ -4809,7 +4896,9 @@
                     // Pre-meal corrections create active IOB when the meal dose lands.
                     // budgetRatio reflects meal insulin only — effective delivery is higher.
                     const IOB_CONFOUND_THRESHOLD_U = 0.3;
-                    const iobAtMealEntry = this.getIOBAtTime(nightscoutData.deviceStatus, effectiveMealTime);
+                    const iobEntryLookup = lookupIOB(nightscoutData.deviceStatus,
+                        mealDeliveryAnchor(nightscoutData.treatments, effectiveMealTime), { direction: 'before' });
+                    const iobAtMealEntry = iobEntryLookup.value;
                     const mealIobConfounded = iobAtMealEntry !== null
                         && iobAtMealEntry >= IOB_CONFOUND_THRESHOLD_U;
                     const effectiveBudgetRatio = (mealIobConfounded && decomp.expectedBudget > 0)
@@ -4827,10 +4916,10 @@
                         decomp.budgetRatio <= STACKING_OWN_RATIO_MAX &&
                         iobAtMealEntry >= STACKING_MIN_IOB_U;
 
-                    const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime);
+                    const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime, { direction: 'before' });
 
                     // Negative-IOB-at-low basal signal (v3.5.68)
-                    const iobRecordAtLow = this.findClosestDeviceStatus(nightscoutData.deviceStatus, lowTime);
+                    const iobRecordAtLow = this.findClosestDeviceStatus(nightscoutData.deviceStatus, lowTime, { direction: 'before' });
                     let netIobAtNadir = null;
                     let basalIobAtNadir = null;
                     let negBasalMode = false;
@@ -5151,6 +5240,7 @@
                                     ...(splitMealConsolidated ? ['split_meal_consolidated'] : [])
                                 ],
                                 ...(effectiveBudgetRatio !== null ? { effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)) } : {}),
+                                ...(iobEntryLookup.ageMinutes !== null ? { iobAtMealEntryAgeMin: iobEntryLookup.ageMinutes } : {}),
                                 details: `Meal (${consolidatedCarbs}g) → Low ${low.bg} mg/dL at ${effectiveMinsFromMealToLow.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
                                     + (mealIobConfounded
                                         ? ` Active IOB at meal entry: ${iobAtMealEntry.toFixed(2)}U. Effective budget ratio: ${effectiveBudgetRatio.toFixed(2)}x (meal + IOB vs CR budget).`
@@ -5332,7 +5422,7 @@
                 }
 
                 // IOB at high peak > 0.5U but BG still > 180
-                const iobAtPeak = this.getIOBAtTime(deviceStatus, highTime);
+                const iobAtPeak = this.getIOBAtTime(deviceStatus, highTime, { direction: 'before' });
                 if (iobAtPeak !== null && iobAtPeak > 0.5 && highPeakBG > 180) {
                     score += 0.2;
                 }
@@ -5477,7 +5567,9 @@
                                 : 100;
                             if (pctGiven < 70) {
                                 const iobAtMeal = this.getIOBAtTime(
-                                    nightscoutData.deviceStatus, mealTime
+                                    nightscoutData.deviceStatus,
+                                    mealDeliveryAnchor(nightscoutData.treatments, mealTime),
+                                    { direction: 'before' }
                                 );
                                 isSafetyReduction =
                                     !(iobAtMeal !== null && iobAtMeal > 1.0);
@@ -5496,7 +5588,9 @@
 
                     // IOB confound check (same logic as low path).
                     const IOB_CONFOUND_THRESHOLD_U = 0.3;
-                    const iobAtMealEntry = this.getIOBAtTime(nightscoutData.deviceStatus, mealTime);
+                    const iobEntryLookupH = lookupIOB(nightscoutData.deviceStatus,
+                        mealDeliveryAnchor(nightscoutData.treatments, mealTime), { direction: 'before' });
+                    const iobAtMealEntry = iobEntryLookupH.value;
                     const mealIobConfounded = iobAtMealEntry !== null
                         && iobAtMealEntry >= IOB_CONFOUND_THRESHOLD_U;
                     const effectiveBudgetRatio = (mealIobConfounded && decomp.expectedBudget > 0)
@@ -5504,8 +5598,7 @@
                         : null;
 
                     const iobAtHigh = this.getIOBAtTime(
-                        nightscoutData.deviceStatus, highTime
-                    );
+                        nightscoutData.deviceStatus, highTime, { direction: 'before' });
 
                     // §5.7 Step 4: Axis scoring (high direction)
                     const crScore = this._scoreCRAxisHigh(
@@ -5699,6 +5792,7 @@
                                     ...(splitMealConsolidated ? ['split_meal_consolidated'] : [])
                                 ],
                                 ...(effectiveBudgetRatio !== null ? { effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)) } : {}),
+                                ...(iobEntryLookupH.ageMinutes !== null ? { iobAtMealEntryAgeMin: iobEntryLookupH.ageMinutes } : {}),
                                 details: `Meal (${consolidatedCarbs}g) → High ${high.bg} mg/dL at ${minsFromMealToPeak.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
                                     + (mealIobConfounded
                                         ? ` Active IOB at meal entry: ${iobAtMealEntry.toFixed(2)}U. Effective budget ratio: ${effectiveBudgetRatio.toFixed(2)}x (meal + IOB vs CR budget).`
@@ -5901,7 +5995,12 @@
                     // (basal-substitution evidence + late-morning hypo risk), NOT meaningless.
                     // breakfastWithinWindow disambiguates the two clinical meanings; the suppression
                     // link (below) stays gated on breakfastWithinWindow — no meal, nothing to suppress.
-                    const iobAtWindowEnd = this.getIOBAtTime(nightscoutData.deviceStatus, windowEnd);
+                    const iobLookupAnchor = breakfastWithinWindow
+                        ? mealDeliveryAnchor(nightscoutData.treatments, windowEnd)
+                        : windowEnd;
+                    const iobLookup = lookupIOB(nightscoutData.deviceStatus, iobLookupAnchor, { direction: 'before' });
+                    const iobAtWindowEnd = iobLookup.value;
+                    const iobAtWindowEndAgeMin = iobLookup.ageMinutes;
                     // v3.5.68 DIAG-IOB (Phase 1): distinguish selection-bug (a) from genuine-gap (b).
                     // Logs the nearest record AND the nearest record WITH a readable IOB in the window.
                     // If nearestWithIob is a real timestamp → case (a), selection bug → apply Phase 2.
@@ -5961,7 +6060,8 @@
                         exitBG,
                         bgDelta,
                         iobAtWindowEnd,
-                        iobAtWindowEndAvailable
+                        iobAtWindowEndAvailable,
+                        iobAtWindowEndAgeMin
                     });
                 });
 
@@ -6081,6 +6181,7 @@
                         estimatedBolusReduction
                     },
                     breakfastWithinWindow: repr.breakfastWithinWindow,
+                    iobAtWindowEndAgeMin: repr.iobAtWindowEndAgeMin ?? null,
                     dawnWindowBlocks,
                     persistenceDays: persistenceDays,
                     similarEventsCount: persistenceDays,
@@ -7974,7 +8075,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.89',
+                            version: '3.5.90',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8238,7 +8339,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.89',
+                        version: '3.5.90',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12660,7 +12761,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.89 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.90 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
