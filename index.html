@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.94</title>
+    <title>Daily Insulin Settings Review v3.5.95</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -813,20 +813,46 @@
         
         const RecommendationEngine = {
             process(findings, bodyState, signalAnalysis, schedules, basalRatioInfo = null) {
+                // [PIPELINE-CENSUS-START] v3.5.95 (DEF-044). A finding that is absent from
+                // the output is indistinguishable from a finding that was never emitted —
+                // that ambiguity cost this defect three diagnostic rounds and is still
+                // unresolved. The census records per-type counts at each stage boundary so
+                // the NEXT absence is answered by reading one object instead of
+                // reconstructing the pipeline. Diagnostic only: it reads, never filters.
+                const censusOf = (fs_) => (fs_ || []).reduce((acc, f) => {
+                    const k = `${f.type}@${f.scheduleTime ?? '-'}`;
+                    acc[k] = (acc[k] || 0) + 1;
+                    return acc;
+                }, {});
+                const pipelineCensus = { emitted: censusOf(findings) };
+
                 // Step 0: Detect same-slot conflicts before filtering (BUG-008)
                 const { validFindings, slotConflicts } = this.detectSlotConflicts(findings);
-                
+                pipelineCensus.afterConflictDetection = censusOf(validFindings);
+
                 // Step 1: Filter findings based on state
                 let filteredFindings = this.filterByState(validFindings, bodyState);
-                
+                pipelineCensus.afterStateFilter = censusOf(filteredFindings);
+                pipelineCensus.stateFilterMode = bodyState.state;
+
                 // Step 2: Score findings
                 const scoredFindings = filteredFindings.map(f => ({
                     ...f,
                     calculatedConfidence: this.calculateConfidence(f, bodyState)
                 }));
-                
+
                 // Step 3: Group into bundles (pass basalRatioInfo for ratio protection)
                 const bundles = this.createBundles(scoredFindings, schedules, bodyState, signalAnalysis, basalRatioInfo);
+                pipelineCensus.afterBundling = censusOf(bundles.flatMap(b => b.findings || []));
+                // Named losses, so the reader never has to diff the four objects by hand.
+                const lostBetween = (a, b) => Object.keys(a).filter(k => !(k in b));
+                pipelineCensus.lost = {
+                    atConflictDetection: lostBetween(pipelineCensus.emitted, pipelineCensus.afterConflictDetection),
+                    atStateFilter: lostBetween(pipelineCensus.afterConflictDetection, pipelineCensus.afterStateFilter),
+                    atBundling: lostBetween(pipelineCensus.afterStateFilter, pipelineCensus.afterBundling)
+                };
+                this.lastPipelineCensus = pipelineCensus;
+                // [PIPELINE-CENSUS-END]
                 
                 // Step 3b: Add conflict bundles if any
                 slotConflicts.forEach(conflict => {
@@ -1082,20 +1108,55 @@
                 return { validFindings, slotConflicts };
             },
             
+            // [SAFETY-RETAIN-START] v3.5.95 (DEF-044/R3). The invariant, not the instance.
+            //
+            // The safety-tier architecture sits ENTIRELY downstream of this function:
+            // createBundles is what separates safety findings into their own individual
+            // bundles, and it runs at Step 3. Any filter here that can remove a safety
+            // finding deletes it before the safety tier can ever see it. DEF-045 was one
+            // such filter; it was not the only one. Auditing the remaining branches:
+            //   TRANSIENT_SENSITIVITY drops every weakening finding — that is EVERY low
+            //     finding, since no safety type is strengthen-classed.
+            //   RECOVERY drops severity < 0.9 — a 0.85 severe low.
+            //   TRANSIENT_RESISTANCE is safe only by the accident that no safety type
+            //     appears in strengthenTypes.
+            // None of these had fired on a real low yet. Rather than patch three branches
+            // and wait for a fourth, the retention is enforced once, at the boundary, so
+            // a future branch cannot reintroduce the class of defect.
             filterByState(findings, bodyState) {
+                const kept = this.filterByStateInner(findings, bodyState);
+                const keptSet = new Set(kept.map(f => f.__srcRef || f));
+                kept.forEach(f => { delete f.__srcRef; });
+                const rescued = findings.filter(f => this.isSafetyFinding(f) && !keptSet.has(f));
+                if (rescued.length > 0) {
+                    console.log(`[SAFETY-RETAIN] ${rescued.length} safety finding(s) retained ` +
+                        `against ${bodyState.state} filtering: ${rescued.map(f => f.type + '@' + f.scheduleTime).join(', ')}`);
+                }
+                // Rescued findings keep their evidence and lose only their lever — the
+                // same "withhold the action, keep the evidence" contract as quarantine.
+                return [...kept, ...rescued.map(f => Object.assign(f, {
+                    recommendationWithheld: f.recommendationWithheld || 'state_filtered',
+                    stateFilterReason: bodyState.state
+                }))];
+            },
+
+            filterByStateInner(findings, bodyState) {
                 switch (bodyState.state) {
                     case BodyStateType.TRANSIENT_RESISTANCE:
                         // Filter out all strengthening
                         return findings.filter(f => !this.isStrengthening(f));
-                        
+
                     case BodyStateType.TRANSIENT_SENSITIVITY:
                         // Filter out all weakening
                         return findings.filter(f => this.isStrengthening(f) || f.type === FindingType.REBOUND_HIGH);
-                        
+
                     case BodyStateType.OVERRIDE_ACTIVE:
-                        // Keep all for informational purposes but mark them
-                        return findings.map(f => ({ ...f, informationalOnly: true }));
-                        
+                        // Keep all for informational purposes but mark them.
+                        // __srcRef preserves identity across the copy so the safety-retention
+                        // boundary can tell "kept" from "dropped" — an object spread would
+                        // otherwise make every finding look dropped and be re-added.
+                        return findings.map(f => ({ ...f, informationalOnly: true, __srcRef: f }));
+
                     case BodyStateType.RECOVERY:
                         // Only high confidence findings — except CI/basal_insufficiency which
                         // are structural AGP patterns, not discrete events. Their severity (0.7)
@@ -1105,17 +1166,27 @@
                             (f.type === FindingType.CORRECTION_INEFFECTIVE &&
                              f.diagnosticContext?.patternType === 'basal_insufficiency')
                         );
-                        
+
                     case BodyStateType.HIGH_VARIABILITY:
-                        // Filter conflicting slots
-                        return this.filterConflictingSlots(findings);
-                        
+                        // v3.5.95 (DEF-045): delegated to the single corrected conflict
+                        // detector. The deleted filterConflictingSlots was a second
+                        // implementation with a divergent contract — no A4 predicate, no
+                        // visibility contract, param-blind direction classing, null/undefined
+                        // key aliasing, and a bare return that DELETED both sides of a
+                        // conflicted slot. It ran at Step 1, upstream of createBundles'
+                        // safety split, so it could delete a severity-0.95 low before that
+                        // low could ever become a safety bundle. detectSlotConflicts
+                        // quarantines instead of dropping; running it again here is
+                        // idempotent (already-flagged findings fail A4 and form no sides).
+                        return this.detectSlotConflicts(findings).validFindings;
+
                     case BodyStateType.STABLE:
                     default:
                         return findings;
                 }
             },
-            
+            // [SAFETY-RETAIN-END]
+
             isStrengthening(finding) {
                 // Strengthening = recommendation delivers MORE insulin. The direction
                 // contract is INSULIN DELIVERED, which for CR and ISF is INVERSE to
@@ -1136,31 +1207,11 @@
                 return strengthenTypes.includes(finding.type);
             },
             
-            filterConflictingSlots(findings) {
-                // Group by schedule time
-                const bySlot = {};
-                findings.forEach(f => {
-                    const key = `${f.primaryParameter}_${f.scheduleTime}`;
-                    if (!bySlot[key]) bySlot[key] = [];
-                    bySlot[key].push(f);
-                });
-                
-                // Remove slots with conflicting directions
-                const validFindings = [];
-                Object.values(bySlot).forEach(slotFindings => {
-                    const hasStrengthen = slotFindings.some(f => this.isStrengthening(f));
-                    const hasWeaken = slotFindings.some(f => !this.isStrengthening(f));
-                    
-                    if (hasStrengthen && hasWeaken) {
-                        // Conflict - skip this slot
-                        return;
-                    }
-                    validFindings.push(...slotFindings);
-                });
-                
-                return validFindings;
-            },
-            
+            // v3.5.95 (DEF-045): filterConflictingSlots deleted. There is now exactly one
+            // slot-conflict implementation — detectSlotConflicts. Do not reintroduce a
+            // second one: two implementations of one rule is how a fix passes the whole
+            // suite and leaves production wrong.
+
             calculateConfidence(finding, bodyState) {
                 let base = finding.severity || 0.5;
                 
@@ -1379,7 +1430,11 @@
                 // CR and ISF address meal bolus size and correction strength — mechanistically
                 // independent delivery channels that can point opposite to the basal signal.
                 // e.g., Dawn HIGH + CR weaken is valid: need more fasting basal AND less meal insulin.
-                if (finding.primaryParameter && finding.primaryParameter !== 'basal') return null;
+                // v3.5.95 (DEF-044/R1): must be an EQUALITY test, not a truthiness
+                // short-circuit. The old form let a param-less finding — and, while the
+                // identity mutation was live, every param-nulled CR finding — fall
+                // through and be evaluated against the fasting basal signal.
+                if (finding.primaryParameter !== 'basal') return null;
 
                 // Find the period for this finding's schedule time
                 const [hours] = finding.scheduleTime.split(':').map(Number);
@@ -1545,13 +1600,26 @@
                 const confidence = findings.length > 0
                     ? findings.reduce((sum, f) => sum + (f.calculatedConfidence || f.severity || 0.5), 0) / findings.length
                     : 0;
-                
+
+                // v3.5.95 Part C: a withheld finding is the reason a bundle can carry zero
+                // recommendations and still be the most important thing in the output.
+                // Surfaced at bundle level so the render gates and the export agree.
+                const withheldFindings = findings.filter(f => f.recommendationWithheld);
+
                 return {
                     id,
                     name,
                     tier,
                     priority: 'REFERENCE',
                     recommendations,
+                    hasWithheldFinding: withheldFindings.length > 0,
+                    withheldFindings: withheldFindings.map(f => ({
+                        type: f.type,
+                        reason: f.recommendationWithheld,
+                        scheduleTime: f.scheduleTime || null,
+                        parameter: f.primaryParameter || null,
+                        severity: f.severity ?? null
+                    })),
                     compoundEffect: {},
                     rootCause: this.generateRootCause(findings),
                     evidenceSummary: this.generateEvidenceSummary(findings),
@@ -2868,9 +2936,15 @@
                                 x.contributingFactors = [...(x.contributingFactors || []), 'iob_stacking'];
                             }
                         }
-                        if (x.primaryParameter === 'cr') {
-                            x.primaryParameter = null;
-                            x.suggestedChangePercent = 0;
+                        // v3.5.95 (DEF-044/R1): the withhold is expressed by the FLAG,
+                        // never by mutating identity. Nulling primaryParameter here
+                        // removed the finding from every param-keyed structure — it is
+                        // what silently deleted a covered high AND its paired severe low
+                        // at the same slot, and it made checkSignalConflict evaluate a CR
+                        // finding as a basal one. First reason wins; a finding already
+                        // withheld for coverage keeps that reason.
+                        if (x.primaryParameter === 'cr' && !x.recommendationWithheld) {
+                            x.recommendationWithheld = 'iob_stacking';
                             x.details = (x.details || '') +
                                 ' Dual high+low emission from one governing meal — spike-then-crash stacking signature; CR lever withheld.';
                         }
@@ -5960,8 +6034,8 @@
                                 scheduleTime: crEntry ? crEntry.time : '00:00',
                                 period: periodName,
                                 severity: sev,
-                                primaryParameter: coveredByIob ? null : 'cr',
-                                suggestedChangePercent: coveredByIob ? 0 : adj,
+                                primaryParameter: 'cr',          // unchanged by coverage — withhold is expressed by the flag alone
+                                suggestedChangePercent: adj,     // unchanged by coverage
                                 ...(coveredByIob ? { recommendationWithheld: 'covered_by_iob' } : {}),
                                 contributingFactors: [
                                     ...axisFactors,
@@ -7606,7 +7680,13 @@
                 // Watch List Section
                 output += `## Watch List\n\n`;
                 
-                const referenceBundles = bundles.filter(b => b.priority === 'REFERENCE' && (b.recommendations.length > 0 || b.isSlotConflict || b.isBasalRatioWarning || b.agpPersistent));
+                // v3.5.95 Part C: hasWithheldFinding joins the gate. A withheld finding has
+                // zero recommendations BY CONSTRUCTION — gating the narrative on
+                // recommendations.length made "withhold the action, keep the evidence"
+                // unachievable at the render layer no matter how correct detection was.
+                // The structured export's watchList has never had this gate; the two
+                // surfaces now agree.
+                const referenceBundles = bundles.filter(b => b.priority === 'REFERENCE' && (b.recommendations.length > 0 || b.isSlotConflict || b.isBasalRatioWarning || b.agpPersistent || b.hasWithheldFinding));
                 
                 if (referenceBundles.length > 0) {
                     referenceBundles.forEach(bundle => {
@@ -7628,6 +7708,24 @@
                         
                         output += `- **Status:** ${status}\n`;
                         output += `- **Confidence:** ${(bundle.confidence * 100).toFixed(0)}%\n`;
+
+                        // v3.5.95 Part C: state WHY no lever is proposed. A bundle that
+                        // renders with no recommendation and no reason reads as "nothing
+                        // here" — the failure mode this whole spec exists to end.
+                        if (bundle.hasWithheldFinding) {
+                            const WITHHOLD_REASONS = {
+                                slot_conflict: 'opposing findings at this slot — direction unresolved',
+                                covered_by_iob: 'insulin already delivered covers the meal — the dose was not the problem',
+                                iob_stacking: 'one meal produced both a high and a low — spike-then-crash, not a CR error',
+                                state_filtered: 'body state would have removed this finding; retained because it is a safety finding'
+                            };
+                            output += `- **No change proposed:**\n`;
+                            bundle.withheldFindings.forEach(w => {
+                                const why = WITHHOLD_REASONS[w.reason] || w.reason;
+                                output += `  - ${w.type}${w.scheduleTime ? ` @ ${w.scheduleTime}` : ''}` +
+                                    `${w.parameter ? ` (${w.parameter})` : ''} — ${why}\n`;
+                            });
+                        }
                         
                         // Show recency details - special handling for structural findings
                         if (bundle.isSlotConflict) {
@@ -8253,7 +8351,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.94',
+                            version: '3.5.95',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8434,6 +8532,17 @@
                         rootCause: bundle.rootCause || null,
                         urgentReason: bundle.urgentReason || null,
                         urgencyWithheld: bundle.urgencyWithheld || null,
+                        // v3.5.95 Part C: urgencyWithheld's sibling. Its absence is why every
+                        // withhold — slot_conflict, covered_by_iob, iob_stacking,
+                        // state_filtered — was invisible to the reviewer regardless of
+                        // whether the detection logic was right. Both generateStructuredExport
+                        // call sites (actions, watchList) map through here, so one passthrough
+                        // covers both.
+                        ...(bundle.hasWithheldFinding ? {
+                            recommendationWithheld: [...new Set(
+                                bundle.withheldFindings.map(w => w.reason))].join(','),
+                            withheldFindings: bundle.withheldFindings
+                        } : {}),
                         // v3.5.86: stacking tag + upstream-trace question survive serialization
                         ...(bundle.findings?.some(f => f.iobStackingSuspected) ? {
                             iobStackingSuspected: true,
@@ -8519,7 +8628,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.94',
+                        version: '3.5.95',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -8535,7 +8644,10 @@
                                 return Math.min(100, Math.round((actualReadings / (expectedPerDay * days)) * 100));
                             })(),
                             cleanWindows: analysisResults.signalAnalysis?.cleanWindows?.total || 0
-                        }
+                        },
+                        // v3.5.95 (DEF-044): per-stage finding census. `lost` names any
+                        // type@slot that entered a stage and did not leave it.
+                        pipelineCensus: RecommendationEngine.lastPipelineCensus || null
                     },
                     state: {
                         mode: this.formatStateName(bodyState.state).toLowerCase(),
@@ -12947,7 +13059,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.94 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.95 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
