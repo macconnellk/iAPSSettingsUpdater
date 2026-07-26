@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.93</title>
+    <title>Daily Insulin Settings Review v3.5.94</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -969,10 +969,26 @@
             },
 
             detectSlotConflicts(findings) {
-                // Group by schedule slot (parameter + time)
+                // v3.5.94 A4 (PM ruling): conflict is a property of RECOMMENDATIONS,
+                // not findings — a finding that proposes nothing cannot contradict
+                // anything. A finding joins a conflict side only if it carries a
+                // non-null primaryParameter, a non-null suggestedChangePercent, and
+                // no recommendationWithheld flag. This covers recommendation-less
+                // types (REBOUND_HIGH, RESISTANT_*) and coverage-withheld highs as
+                // a class, not by name; excluded from the sides, never from the
+                // output. The predicate can only reduce quarantine.
+                const joinsConflictSide = (f) =>
+                    f.primaryParameter != null && f.scheduleTime != null &&
+                    f.suggestedChangePercent != null && !f.recommendationWithheld;
+                // Membership is decided ONCE, before any mutation: the quarantine
+                // branch sets recommendationWithheld on side members, so re-running
+                // the predicate afterward would double-emit them via the
+                // pass-through loop (caught by T4/T6 during implementation).
+                const sideMembers = new Set();
                 const bySlot = {};
                 findings.forEach(f => {
-                    if (!f.primaryParameter || !f.scheduleTime) return;
+                    if (!joinsConflictSide(f)) return;
+                    sideMembers.add(f);
                     const key = `${f.primaryParameter} @ ${f.scheduleTime}`;
                     if (!bySlot[key]) bySlot[key] = [];
                     bySlot[key].push(f);
@@ -1038,16 +1054,27 @@
                                 weakenTypes: weakenFindings.map(f => f.type).join(', '),
                                 details: `Strengthen: ${strengthenFindings.map(f => f.type).join(', ')} vs Weaken: ${weakenFindings.map(f => f.type).join(', ')}`,
                             });
-                            // Don't add these to valid findings
+                            // v3.5.94 B2 (atomic with the B1 sign flip — PM ruling):
+                            // withhold the action, keep the evidence. Quarantine
+                            // suppresses the RECOMMENDATION, never the FINDING — a
+                            // Tier-1 severe low is never removed from the output by
+                            // conflict quarantine (the v3.5.70 lesson). Vocabulary
+                            // mirrors v3.5.92's urgencyWithheld.
+                            slotFindings.forEach(f => {
+                                f.recommendationWithheld = 'slot_conflict';
+                            });
+                            validFindings.push(...slotFindings);
                         }
                     } else {
                         validFindings.push(...slotFindings);
                     }
                 });
                 
-                // Add findings without slots
+                // Findings excluded from conflict sides pass through untouched —
+                // excluded from the SIDES, never from the OUTPUT. Uses the
+                // pre-mutation membership set, not the predicate.
                 findings.forEach(f => {
-                    if (!f.primaryParameter || !f.scheduleTime) {
+                    if (!sideMembers.has(f)) {
                         validFindings.push(f);
                     }
                 });
@@ -1090,22 +1117,21 @@
             },
             
             isStrengthening(finding) {
-                // Strengthening = recommendation delivers MORE insulin.
-                // Only these three types produce a strengthen recommendation.
-                //
-                // IMPORTANT — types that are NOT strengthen (common spec/test mistake):
-                //   DIRECT_MEAL_HIGH    → CR weaken (raise CR value = less insulin per gram)
-                //   ISF_SUPPRESSED_HIGH → ISF weaken (raise ISF value = less correction per unit)
-                //   ISF_INDUCED_LOW     → ISF weaken
-                //   DIRECT_MEAL_LOW     → CR weaken
-                //   UNEXPLAINED_LOW     → basal reduce
-                //   RESISTANT_LOW       → no recommendation (null)
-                // All of the above land in weakenFindings in detectSlotConflicts.
+                // Strengthening = recommendation delivers MORE insulin. The direction
+                // contract is INSULIN DELIVERED, which for CR and ISF is INVERSE to
+                // the schedule value: CR/ISF value DOWN = more insulin = strengthen.
+                // (v3.5.94/DEF-040: the previous comment here reasoned from the
+                // schedule number and misfiled DIRECT_MEAL_HIGH and
+                // ISF_SUPPRESSED_HIGH — whose own emissions are −7/−5/−3 and −5 —
+                // making detectSlotConflicts structurally blind to spike-vs-crash
+                // conflicts. Membership is pinned by the table-driven sign test;
+                // a divergence fails the suite rather than reading as documentation.)
                 const strengthenTypes = [
                     FindingType.POST_MEAL_HIGH,
                     FindingType.CORRECTION_INEFFECTIVE,
-                    // FASTING_DRIFT_HIGH removed -- dead code
-                    FindingType.BASAL_SIGNAL_HIGH
+                    FindingType.BASAL_SIGNAL_HIGH,
+                    FindingType.DIRECT_MEAL_HIGH,
+                    FindingType.ISF_SUPPRESSED_HIGH
                 ];
                 return strengthenTypes.includes(finding.type);
             },
@@ -1551,6 +1577,9 @@
             },
 
             findingToRecommendation(finding, schedules, basalRatioInfo = null) {
+                // v3.5.94 B2: a withheld finding proposes nothing — covers
+                // slot_conflict quarantine, covered_by_iob, and future withholds.
+                if (finding.recommendationWithheld) return null;
                 if (finding.type === FindingType.MIXED_ATTRIBUTION) return null;
                 if (finding.type === FindingType.RESISTANT_HIGH) return null;
                 if (finding.type === FindingType.PRESSURE_ARTIFACT) return null;
@@ -2813,6 +2842,13 @@
         // first position: own ratio < crCoherenceMinRatio short-circuits in the
         // scorer before stacking is considered.
         const STACKING_EFFECTIVE_RATIO = 1.50; // effective ratio at/above which the stack dominates
+        // v3.5.94 Part C (DEF-041): high-side coverage floor. Distinct from the
+        // low-side 1.50 by design — the low side asks "did a stack DOMINATE?";
+        // the high side asks the weaker "was the meal at least fully covered?"
+        // At effective ratio ≥ 1.0 the coverage arithmetic cannot support
+        // "CR too weak" regardless of how the high arose. (Jul 25's 1.49 sits
+        // just under 1.50 — reusing the stacking constant would let it through.)
+        const HIGH_SIDE_COVERAGE_RATIO = 1.0;
         const STACKING_OWN_RATIO_MAX = 1.20;   // own ratio at/below which the meal itself is not the over-dose
         const STACKING_MIN_IOB_U = 1.0;        // material prior IOB floor
         // Dual-emission signature: one governing meal producing both a high and a
@@ -5910,6 +5946,13 @@
                             );
                             const adj = high.bg > 250 ? -7 : high.bg > 220 ? -5 : -3;
                             const sev = high.bg > 250 ? 0.85 : high.bg > 220 ? 0.70 : 0.55;
+                            // v3.5.94 Part C (DEF-041): a meal that already received at
+                            // least its full CR budget counting entry IOB cannot support
+                            // a "CR too weak" conclusion — withhold the CR lever, keep
+                            // the finding at full severity/visibility. Mirrors the
+                            // v3.5.86 low-side pattern; null coverage is not coverage.
+                            const coveredByIob = effectiveBudgetRatio != null &&
+                                effectiveBudgetRatio >= HIGH_SIDE_COVERAGE_RATIO;
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.DIRECT_MEAL_HIGH,
@@ -5917,8 +5960,9 @@
                                 scheduleTime: crEntry ? crEntry.time : '00:00',
                                 period: periodName,
                                 severity: sev,
-                                primaryParameter: 'cr',
-                                suggestedChangePercent: adj,
+                                primaryParameter: coveredByIob ? null : 'cr',
+                                suggestedChangePercent: coveredByIob ? 0 : adj,
+                                ...(coveredByIob ? { recommendationWithheld: 'covered_by_iob' } : {}),
                                 contributingFactors: [
                                     ...axisFactors,
                                     'weak_cr',
@@ -8209,7 +8253,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.93',
+                            version: '3.5.94',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8475,7 +8519,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.93',
+                        version: '3.5.94',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12903,7 +12947,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.93 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.94 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
