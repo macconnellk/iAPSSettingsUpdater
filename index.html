@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.96</title>
+    <title>Daily Insulin Settings Review v3.5.97</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -8426,7 +8426,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.96',
+                            version: '3.5.97',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8654,6 +8654,26 @@
                     medianDeviation: period.medianDeviation,
                     signal: period.signal || 'INSUFFICIENT',
                     cleanWindows: period.cleanWindowCount || 0,
+                    // v3.5.97 Part B (DEF-052e, additive half). PURELY ADDITIVE — no field
+                    // above changes value or type.
+                    //
+                    // medianDeviation and signal are computed on the POST-CHANGE population
+                    // when a basal change split it; cleanWindows reports the UNSPLIT count.
+                    // On Jul 27 the console read "Deep Sleep — using 42 post-change windows,
+                    // dropped 137" while the export beside it read cleanWindows: 179, and two
+                    // exchanges went into asking whether a 4-day median could move +82 when it
+                    // was never a 4-day median — it was 42 windows from one night. Doubling
+                    // the evidence base without labelling the split would invite the same
+                    // misreading at twice the scale.
+                    effectiveWindowCount: period.effectiveWindowCount ?? period.cleanWindowCount ?? 0,
+                    populationSplit: period.populationSplit
+                        ? {
+                            changeDate: period.splitChangeDate
+                                ? String(period.splitChangeDate).slice(0, 10) : null,
+                            used: period.effectiveWindowCount ?? 0,
+                            dropped: (period.cleanWindowCount ?? 0) - (period.effectiveWindowCount ?? 0)
+                        }
+                        : null,
                     agpCheck: getAGPCheckForPeriod(period.name),
                     divergence: period.medianDeviation !== null ? getDivergence(period) : null
                 }));
@@ -8703,7 +8723,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.96',
+                        version: '3.5.97',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -10440,11 +10460,32 @@
                 // Use large count as fallback
                 const count = maxDays * 800;
                 
-                // Calculate date range for glucose (need full AGP window)
+                // [FETCH-WINDOW-START] v3.5.97 (DEF-036). ONE boundary, three endpoints.
+                //
+                // glucose was date-filtered; devicestatus and treatments were not. An
+                // un-filtered Nightscout query applies a server-side cap independent of
+                // the requested count: count=5600 was asked for and 2041 devicestatus
+                // records came back — about 4.4 days at the measured ~460/day. So a
+                // 7-day analysis was running on ~4.4 days of devicestatus, and because
+                // daily record density varies (456 on Jul 20 vs 553 on Jul 24), that
+                // boundary MOVED between runs. That is the clean-window instability
+                // that opened INSTR-5, and it is why contributingDayCount has never
+                // read 7 in any output this project has produced.
+                //
+                // Proven sufficient by direct query: the full Jul 20–27 window returns
+                // 3881 records in ONE date-filtered call, well under count. No chunking.
+                //
+                // The one-day lead-in is deliberate — edge readings need lookback, and
+                // the same applies to the treatments Gate A reads and the deviceStatus
+                // records a reading is matched against. Both filters are derived from
+                // the SAME Date object so they cannot drift apart.
                 const agpDays = 7;
-                const glucoseStartDate = new Date();
-                glucoseStartDate.setDate(glucoseStartDate.getDate() - Math.max(maxDays, agpDays) - 1);
-                const glucoseDateFilter = `&find[dateString][$gte]=${glucoseStartDate.toISOString()}`;
+                const fetchStartDate = new Date();
+                fetchStartDate.setDate(fetchStartDate.getDate() - Math.max(maxDays, agpDays) - 1);
+                const fetchStartISO = fetchStartDate.toISOString();
+                const glucoseDateFilter   = `&find[dateString][$gte]=${fetchStartISO}`;
+                const createdAtDateFilter = `&find[created_at][$gte]=${fetchStartISO}`;
+                // [FETCH-WINDOW-END]
                 
                 try {
                     // Fetch glucose with date filter to ensure full history
@@ -10459,7 +10500,7 @@
                     console.log('Glucose entries fetched:', glucose.length);
                     
                     // Fetch treatments
-                    const treatmentsUrl = `${baseUrl}/api/v1/treatments.json?count=${count * 2}${authParam}`;
+                    const treatmentsUrl = `${baseUrl}/api/v1/treatments.json?count=${count * 2}${createdAtDateFilter}${authParam}`;
                     console.log('Fetching treatments...');
                     const treatmentsRes = await fetch(treatmentsUrl, { headers });
                     if (!treatmentsRes.ok) {
@@ -10470,7 +10511,7 @@
                     console.log('Treatments fetched:', treatments.length);
                     
                     // Fetch device status
-                    const deviceStatusUrl = `${baseUrl}/api/v1/devicestatus.json?count=${count}${authParam}`;
+                    const deviceStatusUrl = `${baseUrl}/api/v1/devicestatus.json?count=${count}${createdAtDateFilter}${authParam}`;
                     console.log('Fetching device status...');
                     const deviceStatusRes = await fetch(deviceStatusUrl, { headers });
                     let deviceStatus = [];
@@ -13134,7 +13175,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.96 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.97 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
