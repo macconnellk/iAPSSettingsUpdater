@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.99</title>
+    <title>Daily Insulin Settings Review v3.6.00</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2384,6 +2384,38 @@
             if (otherReasons.length > 0) out.otherReasons = otherReasons;
             return out;
         };
+        // v3.6.00: the single predicate deciding whether a meal-driven LOW may carry a
+        // recommendation. Returns null (recommendation permitted) only when the numerator
+        // is exact — one non-SMB bolus, so M = S rather than M <= S — AND the ratio clears
+        // the coherence floor. Every other case retains the finding and withholds the
+        // action. One reason, not two: the rendered text differs, the vocabulary does not,
+        // and findingToRecommendation remains the single suppression path.
+        // Part C: the reviewer never sees a bare ratio. If a reviewer can read one, a
+        // reviewer will use it — and on 56% of meals it does not mean what it looks like.
+        const describeDelivery = (decomp) => {
+            if (!decomp) return '';
+            const n = decomp.bolusesInWindow ?? 0;
+            const s = decomp.deliveredUpperBound != null ? decomp.deliveredUpperBound.toFixed(2) : '?';
+            const b = decomp.expectedBudget > 0 ? decomp.expectedBudget.toFixed(2) : null;
+            if (decomp.budgetVerdict === 'unavailable' || b === null) {
+                return `Delivery: ${s}U across ${n} bolus(es); no CR budget available for this slot.`;
+            }
+            if (n === 1) {
+                return `Delivery: ${s}U against a ${b}U plan (single bolus — exact).`;
+            }
+            const verdict = decomp.budgetVerdict === 'under_delivered'
+                ? ' Even counting every bolus as meal insulin, delivery fell short of plan — under-delivery is established.'
+                : ' Cannot determine how much was meal insulin.';
+            return `Delivery: ${s}U against a ${b}U plan across ${n} boluses —` + verdict;
+        };
+
+        const budgetWithholdReason = (decomp) =>
+            (decomp && decomp.budgetDeterminate === true &&
+             decomp.budgetRatioUpper != null &&
+             decomp.budgetRatioUpper >= CONFIG.crCoherenceMinRatio)
+                ? null
+                : 'budget_indeterminate';
+
         // [STATEFLIP-START] INSTR-5 Part D (DEF-048, DEF-043). MEASUREMENT ONLY.
         // Nothing here is consumed by a gate, a threshold, a finding, or a
         // recommendation. It reads the same inputs the classifier reads and reports
@@ -5132,14 +5164,74 @@
                 const cat2Total = cat2SMBs.reduce((s, t) => s + t.insulin, 0);
                 const cat3Total = cat3SMBs.reduce((s, t) => s + t.insulin, 0);
                 const actualTotal = upfrontBolus + cat1Total + cat2Total;
-                const budgetRatio = expectedBudget > 0 ? actualTotal / expectedBudget : 0;
+
+                // [BUDGET-BOUND-START] v3.6.00 (DEF-067, DEF-069).
+                //
+                // The tool CANNOT determine meal insulin on a multi-bolus meal. Measured,
+                // not assumed: across 7 days, 79 non-SMB bolus records in the affected
+                // windows carry ONE distinct value on every candidate discriminator
+                // (eventType "Bolus", enteredBy "iAPS", isSMB false, isExternal false,
+                // carbs null; notes/insulinType/bolusType absent entirely), and the offset
+                // distribution is front-loaded with a long tail — median 22 min, no trough
+                // above 30 — so no time boundary is observable either. 29 of 52 governing
+                // meals are affected; 43 unique boluses; 51.15U excluded from actualTotal.
+                //
+                // So compute a BOUND instead of a point estimate. Let M = true meal
+                // insulin, S = every bolus in the window, B = expectedBudget. Some window
+                // boluses may be corrections, so M <= S, which supports exactly one sound
+                // inference: S < B PROVES under-delivery. It cannot establish
+                // over-delivery — that needs a lower bound the data does not support.
+                //
+                // S takes EVERY treatment with insulin > 0 in the window: no eventType
+                // test, no category test, no bgStillRising test. A bound that references
+                // any Cat array inherits that classification's assumptions, and the whole
+                // point is to depend on none of them. In particular cat1+cat2 would drop
+                // the uncategorised SMB bucket, making the bound TIGHTER than the truth
+                // and able to falsely prove under-delivery.
+                //
+                // Boluses shared with an adjacent meal window are counted into BOTH
+                // bounds, deliberately and without arbitration. An upper bound is
+                // permitted to be loose; a framing under which the hardest sub-problem
+                // needs no decision is the right framing. 7 such boluses in the Jul 20-27
+                // window. Do not "fix" this.
+                const windowBoluses = treatments.filter(t => {
+                    if (!t.insulin || t.insulin <= 0 || !t.created_at) return false;
+                    const mins = (new Date(t.created_at) - mealTime) / 60000;
+                    return mins >= -2 && mins <= 90;
+                });
+                const deliveredUpperBound = windowBoluses.reduce((s, t) => s + t.insulin, 0);
+                const bolusesInWindow = windowBoluses
+                    .filter(t => !(t.eventType && t.eventType.includes('SMB'))).length;
+                const budgetRatioUpper = expectedBudget > 0
+                    ? deliveredUpperBound / expectedBudget
+                    : null;
+                // With exactly one non-SMB bolus there is no second delivery to be
+                // ambiguous about, and every SMB inside a meal window is meal-attributed
+                // by construction (Cat3 requires no meal in the 3-hour lookback, which
+                // cannot hold here). So M = S and over-delivery becomes provable.
+                // NOTE: this asserts only that the NUMERATOR ambiguity is absent.
+                // expectedBudget still carries DEF-068 (profile) and DEF-070 (cluster).
+                // Accepted deliberately — gating on those would emit nothing at all.
+                const budgetDeterminate = bolusesInWindow === 1 && expectedBudget > 0;
+                const budgetVerdict =
+                    (expectedBudget <= 0 || bolusesInWindow === 0) ? 'unavailable'
+                    : (budgetRatioUpper < 1.0) ? 'under_delivered'
+                    : 'indeterminate';
+                // Retained under a new name for census comparison ONLY. Read by nothing —
+                // pinned by the read-only sweep. This is the number that was understated
+                // on 56% of meals.
+                const budgetRatioLegacy = expectedBudget > 0 ? actualTotal / expectedBudget : 0;
+                // [BUDGET-BOUND-END]
                 // §5.6: correctionTotal = Cat3 + Cat2 (budget already exhausted for Cat2 by definition)
                 const correctionTotal = cat3Total + cat2Total;
                 const corrections = [...cat2SMBs, ...cat3SMBs]
                     .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 
                 return {
-                    upfrontBolus, expectedBudget, actualTotal, budgetRatio,
+                    upfrontBolus, expectedBudget, actualTotal,
+                    // v3.6.00: the bound and the verdict replace the point estimate.
+                    deliveredUpperBound, budgetRatioUpper, budgetVerdict,
+                    budgetDeterminate, bolusesInWindow, budgetRatioLegacy,
                     correctionTotal, cat1SMBs, cat2SMBs, cat3SMBs,
                     cat1Total, cat2Total, cat3Total,
                     peakBG, peakTime, corrections
@@ -5148,23 +5240,37 @@
 
             /** §5.7 CR axis — low direction */
             _scoreCRAxisLow(decomp, minsFromMealToLow, glucose, mealTime, lowTime) {
-                // Coherence guard: an under-delivered meal (below the upfront share)
-                // cannot support a CR-too-strong conclusion. expectedBudget > 0 must
-                // short-circuit first — a zero/unknown budget is unknown, not
-                // under-delivered, and null < N is true in JS.
-                if (decomp.expectedBudget > 0 &&
-                    decomp.budgetRatio != null &&
-                    decomp.budgetRatio < CONFIG.crCoherenceMinRatio) {
-                    return 0;
-                }
-
+                // [CR-LOW-BUDGET-START] v3.6.00 B2 (Amendments 3 and 6).
+                //
+                // THE EARLY RETURN IS GONE. Nothing on the low side is deleted under any
+                // verdict. The v3.5.70 coherence guard returned 0 when the ratio fell
+                // below crCoherenceMinRatio, which silently removed the finding — and the
+                // asymmetry is why that is unsafe: a wrong `under_delivered` on the HIGH
+                // side suppresses a strengthen (less insulin, safe), but on the LOW side
+                // it suppressed a weaken (keeps insulin high, UNSAFE). The verdict can be
+                // wrong, because expectedBudget inherits DEF-068 (profile) and DEF-070
+                // (cluster). So the deletion becomes a withhold: full severity, tier and
+                // evidence retained, only the recommendation suppressed, via the existing
+                // findingToRecommendation guard. Withhold the action, keep the evidence.
+                //
+                // crCoherenceMinRatio is NO LONGER CONSULTED on the low side. The constant
+                // stays in CONFIG for the census.
+                //
+                // The over-delivery weights survive ONLY where over-delivery is provable.
+                // With one non-SMB bolus M = S exactly, so the ratio is not a bound but a
+                // value — 23 of 52 meals. Everywhere else an upper bound cannot establish
+                // over-delivery in either direction, so no ratio-derived weight is applied.
+                // The withhold decision itself lives in budgetWithholdReason() so the
+                // scorer and the emission site cannot drift — one predicate, two readers.
                 let score = 0;
-
-                if (decomp.budgetRatio > 1.40) {
-                    score += 0.8;                             // replaces +0.5
-                } else if (decomp.budgetRatio > 1.20) {
-                    score += 0.5;
+                if (budgetWithholdReason(decomp) === null) {
+                    if (decomp.budgetRatioUpper > 1.40) {
+                        score += 0.8;
+                    } else if (decomp.budgetRatioUpper > 1.20) {
+                        score += 0.5;
+                    }
                 }
+                // [CR-LOW-BUDGET-END]
 
                 if (minsFromMealToLow <= 90) {
                     score += 0.3;
@@ -5387,19 +5493,39 @@
                     const iobAtMealEntry = iobEntryLookup.value;
                     const mealIobConfounded = iobAtMealEntry !== null
                         && iobAtMealEntry >= IOB_CONFOUND_THRESHOLD_U;
+                    // v3.6.00 Amendment 4: computed from the BOUND, not actualTotal.
+                    // actualTotal inherits the understatement, and an understated value
+                    // FAILS TO FIRE the coverage withhold — letting a CR-strengthen proceed
+                    // that should have been suppressed. Because this is an upper bound,
+                    // "coverage is possible" is the conservative read for suppressing a
+                    // strengthen: the loose direction is the safe one here.
                     const effectiveBudgetRatio = (mealIobConfounded && decomp.expectedBudget > 0)
-                        ? (decomp.actualTotal + iobAtMealEntry) / decomp.expectedBudget
+                        ? (decomp.deliveredUpperBound + iobAtMealEntry) / decomp.expectedBudget
                         : null;
 
                     // v3.5.86 stacking guard (DEF-025). Every comparison null-guarded —
                     // unknown is not stacking. Requires own ratio ≥ crCoherenceMinRatio
                     // so the v3.5.70 under-delivery guard keeps first position.
+                    // v3.6.00 Amendments 4+6: the guard is an OVER-delivery test (own ratio in
+                    // [0.70, 1.20] with effective >= 1.50), and over-delivery is only
+                    // provable when the numerator is exact. So it gates on budgetDeterminate,
+                    // NOT on budgetVerdict — a single-bolus meal at ratio >= 1.0 is verdict
+                    // "indeterminate" by the enum but is in fact determined over-delivery,
+                    // and gating on the string would have silently disabled the guard on
+                    // every meal it was built for. Caught by v3.5.86-T4.
+                    // The guard needs a TRUSTWORTHY ratio, so it does
+                    // not fire on an indeterminate meal. Branching on the string verdict
+                    // rather than a numeric comparison makes a null comparison unwriteable
+                    // — `null < 0.70` is true and `null >= 1.50` is false, and both fail
+                    // unsafe. A missed stacking detection is safe here: the low proceeds to
+                    // normal scoring, where the B2 withhold catches it.
                     const iobStackingSuspected =
+                        decomp.budgetDeterminate === true &&
                         effectiveBudgetRatio != null && iobAtMealEntry != null &&
-                        decomp.budgetRatio != null && decomp.expectedBudget > 0 &&
-                        decomp.budgetRatio >= CONFIG.crCoherenceMinRatio &&
+                        decomp.budgetRatioUpper != null &&
+                        decomp.budgetRatioUpper >= CONFIG.crCoherenceMinRatio &&
                         effectiveBudgetRatio >= STACKING_EFFECTIVE_RATIO &&
-                        decomp.budgetRatio <= STACKING_OWN_RATIO_MAX &&
+                        decomp.budgetRatioUpper <= STACKING_OWN_RATIO_MAX &&
                         iobAtMealEntry >= STACKING_MIN_IOB_U;
 
                     const iobAtLow = this.getIOBAtTime(nightscoutData.deviceStatus, lowTime, { direction: 'before' });
@@ -5530,7 +5656,7 @@
                     if (iobStackingSuspected && !probableMealCompletion) {
                         const stackingQuestion =
                             `Low ${low.bg} mg/dL at ${formatTimeForDisplay(low.time)} — meal dosed at ` +
-                            `${decomp.budgetRatio.toFixed(2)}x its own budget, but ${iobAtMealEntry.toFixed(2)}U ` +
+                            `${decomp.budgetRatioUpper.toFixed(2)}x its own budget (upper bound), but ${iobAtMealEntry.toFixed(2)}U ` +
                             `of prior IOB was active at entry (effective ${effectiveBudgetRatio.toFixed(2)}x). ` +
                             `The crash is stacking-driven: trace the upstream corrections, not this meal's CR. ` +
                             `What drove the corrections in the prior 2\u20134 h?`;
@@ -5727,7 +5853,20 @@
                                 ],
                                 ...(effectiveBudgetRatio !== null ? { effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)) } : {}),
                                 ...(iobEntryLookup.ageMinutes !== null ? { iobAtMealEntryAgeMin: iobEntryLookup.ageMinutes } : {}),
-                                details: `Meal (${consolidatedCarbs}g) → Low ${low.bg} mg/dL at ${effectiveMinsFromMealToLow.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                                // v3.6.00 B2: THE load-bearing change. This finding used to
+                                // be deleted outright by the coherence guard's `return 0`.
+                                // It is now emitted at full severity and tier, with only the
+                                // recommendation withheld — a meal over-delivered by up to
+                                // 29% that produced a low becomes visible instead of absent.
+                                // First reason wins; a stacking withhold set earlier stands.
+                                ...(budgetWithholdReason(decomp)
+                                    ? { recommendationWithheld: budgetWithholdReason(decomp) } : {}),
+                                budgetVerdict: decomp.budgetVerdict,
+                                budgetDeterminate: decomp.budgetDeterminate === true,
+                                bolusesInWindow: decomp.bolusesInWindow,
+                                ...(decomp.budgetRatioUpper != null
+                                    ? { budgetRatioUpper: parseFloat(decomp.budgetRatioUpper.toFixed(3)) } : {}),
+                                details: `Meal (${consolidatedCarbs}g) → Low ${low.bg} mg/dL at ${effectiveMinsFromMealToLow.toFixed(0)}min. ${describeDelivery(decomp)}`
                                     + (mealIobConfounded
                                         ? ` Active IOB at meal entry: ${iobAtMealEntry.toFixed(2)}U. Effective budget ratio: ${effectiveBudgetRatio.toFixed(2)}x (meal + IOB vs CR budget).`
                                         : '')
@@ -5817,9 +5956,23 @@
             _scoreCRAxisHigh(decomp, minsFromMealToPeak, highTime, glucose, mealTime) {
                 let score = 0;
 
-                // Budget ratio
-                if (decomp.budgetRatio < 0.60)      { score += 0.6; }
-                else if (decomp.budgetRatio < 0.80) { score += 0.4; }
+                // [CR-HIGH-BUDGET-START] v3.6.00 B1 (DEF-069). The budget ratio no longer
+                // contributes ANY positive weight toward CR-too-weak.
+                //
+                // It previously added +0.6 below 0.60 and +0.4 below 0.80 — computed from
+                // actualTotal, which excludes every non-SMB bolus after the first and was
+                // therefore understated on 56% of meals. A meal that received EXTRA insulin
+                // and still went high scored as CR-too-weak and recommended MORE insulin.
+                // That signal was invalid where it mattered most, so it is retired rather
+                // than re-guarded.
+                //
+                // Determinacy is not consulted here: if S < B then M < B regardless of how
+                // many boluses there were, so one test covers every meal. Under-delivery
+                // established means the high is explained by the DELIVERY, not by CR — the
+                // CR-strengthen is suppressed outright, which is stronger than the previous
+                // behaviour, not weaker. The axis now wins on peak timing, trajectory and
+                // correction behaviour alone.
+                // [CR-HIGH-BUDGET-END]
 
                 // No Cat2 or Cat3 corrections fired despite BG > 180 for > 30 min
                 const noCorrections =
@@ -6079,8 +6232,14 @@
                     const iobAtMealEntry = iobEntryLookupH.value;
                     const mealIobConfounded = iobAtMealEntry !== null
                         && iobAtMealEntry >= IOB_CONFOUND_THRESHOLD_U;
+                    // v3.6.00 Amendment 4: computed from the BOUND, not actualTotal.
+                    // actualTotal inherits the understatement, and an understated value
+                    // FAILS TO FIRE the coverage withhold — letting a CR-strengthen proceed
+                    // that should have been suppressed. Because this is an upper bound,
+                    // "coverage is possible" is the conservative read for suppressing a
+                    // strengthen: the loose direction is the safe one here.
                     const effectiveBudgetRatio = (mealIobConfounded && decomp.expectedBudget > 0)
-                        ? (decomp.actualTotal + iobAtMealEntry) / decomp.expectedBudget
+                        ? (decomp.deliveredUpperBound + iobAtMealEntry) / decomp.expectedBudget
                         : null;
 
                     const iobAtHigh = this.getIOBAtTime(
@@ -6278,6 +6437,16 @@
                                 severity: sev,
                                 primaryParameter: 'cr',          // unchanged by coverage — withhold is expressed by the flag alone
                                 suggestedChangePercent: adj,     // unchanged by coverage
+                                // v3.6.00 B1: a high on a PROVEN under-delivered meal is
+                                // explained by the DELIVERY, not by CR — so the
+                                // CR-strengthen is suppressed. Suppressed, not deleted:
+                                // zeroing the axis would re-route the finding to
+                                // RESISTANT_HIGH and destroy the evidence, which is the
+                                // failure Amendment 3 forbids on the low side and which
+                                // is no more acceptable here. Placed BEFORE the coverage
+                                // spread so covered_by_iob, the more specific reason, wins.
+                                ...(decomp.budgetRatioUpper != null && decomp.budgetRatioUpper < 1.0
+                                    ? { recommendationWithheld: 'budget_indeterminate' } : {}),
                                 ...(coveredByIob ? { recommendationWithheld: 'covered_by_iob' } : {}),
                                 contributingFactors: [
                                     ...axisFactors,
@@ -6287,7 +6456,7 @@
                                 ],
                                 ...(effectiveBudgetRatio !== null ? { effectiveBudgetRatio: parseFloat(effectiveBudgetRatio.toFixed(2)) } : {}),
                                 ...(iobEntryLookupH.ageMinutes !== null ? { iobAtMealEntryAgeMin: iobEntryLookupH.ageMinutes } : {}),
-                                details: `Meal (${consolidatedCarbs}g) → High ${high.bg} mg/dL at ${minsFromMealToPeak.toFixed(0)}min. Budget ratio ${decomp.budgetRatio.toFixed(2)}x.`
+                                details: `Meal (${consolidatedCarbs}g) → High ${high.bg} mg/dL at ${minsFromMealToPeak.toFixed(0)}min. ${describeDelivery(decomp)}`
                                     + (mealIobConfounded
                                         ? ` Active IOB at meal entry: ${iobAtMealEntry.toFixed(2)}U. Effective budget ratio: ${effectiveBudgetRatio.toFixed(2)}x (meal + IOB vs CR budget).`
                                         : '')
@@ -8060,6 +8229,7 @@
                         // here" — the failure mode this whole spec exists to end.
                         if (bundle.hasWithheldFinding) {
                             const WITHHOLD_REASONS = {
+                                budget_indeterminate: 'more than one bolus in the meal window; the tool cannot tell meal insulin from correction insulin',
                                 slot_conflict: 'opposing findings at this slot — direction unresolved',
                                 covered_by_iob: 'insulin already delivered covers the meal — the dose was not the problem',
                                 iob_stacking: 'one meal produced both a high and a low — spike-then-crash, not a CR error',
@@ -8698,7 +8868,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.99',
+                            version: '3.6.00',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9029,7 +9199,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.99',
+                        version: '3.6.00',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -13540,7 +13710,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.99 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.6.00 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
