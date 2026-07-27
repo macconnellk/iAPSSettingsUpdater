@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.95</title>
+    <title>Daily Insulin Settings Review v3.5.96</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -1060,6 +1060,19 @@
                                 `ratio ${ratio.toFixed(1)}x). Stale recessive side suppressed.`
                             );
                             validFindings.push(...dominant.findings);
+                            // v3.5.96 Part A (DEF-049): the recessive side is SUPPRESSED,
+                            // not deleted. v3.5.95's retention contract was written against
+                            // the quarantine branch only; this branch dropped the loser
+                            // outright. Tier 4 the first time it fired for real
+                            // (cr @ 21:00, Jul 26) — but a stale direct_meal_low losing to
+                            // a recent correction_ineffective at one CR slot would delete a
+                            // severe-low finding. Same contract, same flag vocabulary, same
+                            // findingToRecommendation guard: no new suppression path.
+                            // Which side wins is untouched; only whether the loser stays visible.
+                            dominant.recessive.forEach(f => {
+                                f.recommendationWithheld = 'recency_resolved';
+                            });
+                            validFindings.push(...dominant.recessive);
                             slotConflicts.push({
                                 slot: slot,
                                 strengthenCount: strengthenFindings.length,
@@ -1068,7 +1081,8 @@
                                 weakenTypes: weakenFindings.map(f => f.type).join(', '),
                                 details: `Strengthen: ${strengthenFindings.map(f => f.type).join(', ')} vs Weaken: ${weakenFindings.map(f => f.type).join(', ')}`,
                                 recencyResolved: true,
-                                resolvedDirection: dominant.direction
+                                resolvedDirection: dominant.direction,
+                                suppressedTypes: dominant.recessive.map(f => f.type).join(', ')
                             });
                         } else {
                             // Genuine bidirectional conflict — quarantine both sides
@@ -3057,6 +3071,59 @@
             });
             return findings;
         };
+        // [HIGH-EPISODE-START] v3.5.96 Part B (DEF-050). One meal = one verdict.
+        //
+        // The low side above groups TEMPORALLY because a nadir has no intrinsic
+        // parent — adjacency is the only handle available. A post-meal high does
+        // have a parent and the engine already computes it, so keying on the
+        // parent is not an approximation of the temporal rule; it is the thing
+        // the temporal rule was approximating where the parent was unavailable.
+        // The Jul 26 case proves the difference: two peaks from one 77 g meal,
+        // 321 @42 min and 187 @202 min, identical budgetRatio and identical
+        // iobAtMealEntry (the fingerprint of one decomposition), 160 minutes
+        // apart — no adjacency window that is safe would ever join them.
+        //
+        // Grouping is by TYPE and meal, never meal alone: one meal producing a
+        // DIRECT_MEAL_HIGH and an ISF_SUPPRESSED_HIGH has made two distinct
+        // clinical claims on two different parameters, and collapsing those
+        // would destroy a finding rather than de-duplicate one.
+        //
+        // Unknown parentage is NOT shared parentage: a null governingMealTime
+        // passes through unconsolidated (PM ruling, verification item 2).
+        //
+        // The election discards a RECOMMENDATION, not an OBSERVATION. Every
+        // member peak's timing is retained on the representative so DEF-043's
+        // distribution keeps 42 AND 202 — consolidating them under one verdict
+        // is the right recommendation call and the wrong measurement call.
+        const consolidateHighEpisodesByMeal = (findings) => {
+            const byMealAndType = new Map();
+            (findings || []).forEach(f => {
+                if (!f || !f.governingMealTime) return;   // unparented → untouched
+                const key = `${f.type}@${String(f.governingMealTime)}`;
+                if (!byMealAndType.has(key)) byMealAndType.set(key, []);
+                byMealAndType.get(key).push(f);
+            });
+            const superseded = new Set();
+            byMealAndType.forEach(members => {
+                if (members.length < 2) return;
+                let rep = members[0];
+                members.forEach(m => {
+                    if ((m.peakBG ?? -Infinity) > (rep.peakBG ?? -Infinity)) rep = m;
+                });
+                rep.episodePeaks = members
+                    .map(m => ({
+                        bg: m.peakBG ?? null,
+                        minsFromMealToPeak: m.minsFromMealToPeak ?? null,
+                        eventTime: m.eventTime || null
+                    }))
+                    .sort((a, b) => (a.minsFromMealToPeak ?? 0) - (b.minsFromMealToPeak ?? 0));
+                rep.episodeCount = members.length;
+                members.forEach(m => { if (m !== rep) superseded.add(m); });
+            });
+            // Filter rather than rebuild: downstream ordering is preserved.
+            return (findings || []).filter(f => !superseded.has(f));
+        };
+        // [HIGH-EPISODE-END]
         // [EPISODE-END]
 
         // [PERSIST-KEY-START] v3.5.89 (DEF-028): stable persistence identity.
@@ -6056,12 +6123,19 @@
                     if (finding) {
                         // v3.5.86: meal identity for the dual-emission stacking signature
                         finding.governingMealTime = governingMeal?.created_at || null;
+                        // v3.5.96 Part B: the election key and the retained measurement.
+                        finding.peakBG = high.bg;
+                        finding.minsFromMealToPeak = Math.round(minsFromMealToPeak);
                         findings.push(finding);
                         allHighIds.forEach(id => claimedEvents.highs.add(id));
                     }
                 }
 
-                return findings;
+                // v3.5.96 Part B (DEF-050): one meal = one verdict. Two peaks from
+                // one excursion were producing two contradictory CR recommendations
+                // in a single bundle (cr@12:00 18→16.7 and 18→17.5, compound
+                // averaging them to −4.5%, a number matching neither).
+                return consolidateHighEpisodesByMeal(findings);
             },
 
             // ─────────────────────────────────────────────────────────────────
@@ -7717,7 +7791,8 @@
                                 slot_conflict: 'opposing findings at this slot — direction unresolved',
                                 covered_by_iob: 'insulin already delivered covers the meal — the dose was not the problem',
                                 iob_stacking: 'one meal produced both a high and a low — spike-then-crash, not a CR error',
-                                state_filtered: 'body state would have removed this finding; retained because it is a safety finding'
+                                state_filtered: 'body state would have removed this finding; retained because it is a safety finding',
+                                recency_resolved: 'a more recent signal at this slot points the other way'
                             };
                             output += `- **No change proposed:**\n`;
                             bundle.withheldFindings.forEach(w => {
@@ -8351,7 +8426,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.95',
+                            version: '3.5.96',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8628,7 +8703,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.95',
+                        version: '3.5.96',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -13059,7 +13134,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.95 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.96 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
