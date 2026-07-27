@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.98</title>
+    <title>Daily Insulin Settings Review v3.5.99</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2384,6 +2384,181 @@
             if (otherReasons.length > 0) out.otherReasons = otherReasons;
             return out;
         };
+        // [STATEFLIP-START] INSTR-5 Part D (DEF-048, DEF-043). MEASUREMENT ONLY.
+        // Nothing here is consumed by a gate, a threshold, a finding, or a
+        // recommendation. It reads the same inputs the classifier reads and reports
+        // what they would have produced at other run times.
+        //
+        // Why: two runs 106 minutes apart on Jul 25 classified `high_variability`
+        // and `transient_sensitivity`. The cause was benign — the 24 h TDD window
+        // slid past the prior evening's boluses (28.9 → 27.2 U), lifting
+        // carbAdjustedSensitivity 1.10 → 1.14 past the sustained-≥1.10 criterion.
+        // The consequence is not: TRANSIENT_SENSITIVITY removes every weakening
+        // finding, i.e. every low. R3's retention invariant now prevents the loss,
+        // but the classifier's clock sensitivity has never been measured.
+        //
+        // The sweep uses REAL data at each simulated hour rather than reconstructing
+        // it. tdd24h is not computed by this tool — it is parsed from the iAPS
+        // `Insulin 24h:` string in a deviceStatus record — so each simulated run time
+        // reads the records at or before that instant and extracts the value iAPS
+        // itself held then. Carbs are recomputed over the matching rolling window.
+        const SENSITIVITY_CRITERION = 1.10;   // mirrors StateDetector.detect; not redefined behavior
+        const computeRunTimeSweep = (nightscoutData, baselineBolusPerCarb, baselineBasal,
+                                     sweepStartHour = 18, sweepEndHour = 24) => {
+            if (!nightscoutData || baselineBolusPerCarb == null || baselineBasal == null) return null;
+            const ds = (nightscoutData.deviceStatus || []).filter(s => s && s.created_at);
+            if (ds.length === 0) return null;
+            const now = new Date();
+            const points = [];
+            for (let h = sweepStartHour; h <= sweepEndHour; h++) {
+                const at = new Date(now.getFullYear(), now.getMonth(), now.getDate(), Math.min(h, 23), h === 24 ? 59 : 0, 0);
+                if (at > now) continue;                       // never simulate the future
+                const priorRecords = ds
+                    .filter(s => new Date(s.created_at) <= at)
+                    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                if (priorRecords.length === 0) continue;
+                const { tdd24h } = extractTDDFromDeviceStatus(priorRecords, 20);
+                if (!tdd24h) continue;
+                const windowStart = new Date(at.getTime() - 24 * 60 * 60 * 1000);
+                const carbs24h = (nightscoutData.treatments || []).reduce((sum, t) => {
+                    if (!t.carbs || t.carbs <= 0 || !t.created_at) return sum;
+                    const tt = new Date(t.created_at);
+                    return (tt >= windowStart && tt <= at) ? sum + t.carbs : sum;
+                }, 0);
+                if (carbs24h <= 0) continue;
+                const expectedTDD = baselineBolusPerCarb * carbs24h + baselineBasal;
+                const sensitivity = expectedTDD / tdd24h;
+                points.push({
+                    hour: `${String(at.getHours()).padStart(2, '0')}:00`,
+                    tdd24h: parseFloat(tdd24h.toFixed(2)),
+                    carbs24h: Math.round(carbs24h),
+                    carbAdjustedSensitivity: parseFloat(sensitivity.toFixed(3)),
+                    meetsSensitivityCriterion: sensitivity >= SENSITIVITY_CRITERION
+                });
+            }
+            if (points.length === 0) return null;
+            const crossings = [];
+            for (let i = 1; i < points.length; i++) {
+                if (points[i].meetsSensitivityCriterion !== points[i - 1].meetsSensitivityCriterion) {
+                    crossings.push({
+                        between: `${points[i - 1].hour} → ${points[i].hour}`,
+                        from: points[i - 1].carbAdjustedSensitivity,
+                        to: points[i].carbAdjustedSensitivity,
+                        direction: points[i].meetsSensitivityCriterion ? 'entered' : 'exited'
+                    });
+                }
+            }
+            // The number that matters most: how many distinct classifications does ONE
+            // day produce, purely as a function of when the session happened to run.
+            const distinctCriterionStates = new Set(points.map(p => p.meetsSensitivityCriterion)).size;
+            return {
+                criterion: SENSITIVITY_CRITERION, points, crossings, distinctCriterionStates,
+                sensitivityRange: {
+                    min: Math.min(...points.map(p => p.carbAdjustedSensitivity)),
+                    max: Math.max(...points.map(p => p.carbAdjustedSensitivity))
+                }
+            };
+        };
+
+        // Flip history over the trailing window, from the logged history rows.
+        // `artifactFlagged` counts sessions the decision log later called an artifact —
+        // if most flips are later disowned, the classifier is measuring logging noise.
+        const ARTIFACT_TOKENS = /artifact|inflated|deflat|spurious/i;
+        const computeFlipHistory = (historyRows, days = 28) => {
+            const rows = (Array.isArray(historyRows) ? historyRows : [])
+                .filter(r => r && r.date)
+                .sort((a, b) => new Date(b.date) - new Date(a.date))
+                .slice(0, days);
+            if (rows.length === 0) return null;
+            const sessions = rows.map(r => {
+                const sens = r.carbAdjSensitivity != null && r.carbAdjSensitivity !== ''
+                    ? parseFloat(r.carbAdjSensitivity) : null;
+                const log = String(r.decisionLog || r.Decision_Log || r.notes || '');
+                return {
+                    date: r.date,
+                    state: r.state || r.bodyState || null,
+                    carbAdjustedSensitivity: Number.isFinite(sens) ? sens : null,
+                    carbs24h: r.carbs24h != null && r.carbs24h !== '' ? parseFloat(r.carbs24h) : null,
+                    tdd24h: r.tdd24h != null && r.tdd24h !== '' ? parseFloat(r.tdd24h) : null,
+                    daysInState: r.daysInState != null && r.daysInState !== '' ? parseInt(r.daysInState) : null,
+                    isOverride: r.isOverride === true || r.isOverride === 'TRUE' || r.isOverride === 'true',
+                    artifactFlagged: ARTIFACT_TOKENS.test(log)
+                };
+            });
+            let flips = 0;
+            for (let i = 1; i < sessions.length; i++) {
+                if (sessions[i].state && sessions[i - 1].state && sessions[i].state !== sessions[i - 1].state) flips++;
+            }
+            const withSens = sessions.filter(s => s.carbAdjustedSensitivity !== null);
+            const flaggedWithSens = withSens.filter(s => s.artifactFlagged);
+            return {
+                sessions, sessionCount: sessions.length, stateFlips: flips,
+                sessionsWithSensitivity: withSens.length,
+                artifactFlaggedCount: flaggedWithSens.length,
+                artifactFlaggedShare: withSens.length > 0
+                    ? parseFloat((flaggedWithSens.length / withSens.length).toFixed(3)) : null,
+                aboveCriterion: withSens.filter(s => s.carbAdjustedSensitivity >= SENSITIVITY_CRITERION).length
+            };
+        };
+
+        // Retention census — the ongoing proof that R3's invariant is load-bearing
+        // rather than decorative. Counts findings the state filter WOULD have removed
+        // and that `state_filtered` retention kept.
+        const computeRetentionCensus = (findings, bodyStateName) => {
+            const retained = (findings || []).filter(f => f && f.recommendationWithheld === 'state_filtered');
+            const bySeverity = { severe: 0, moderate: 0, mild: 0 };
+            const byType = {};
+            retained.forEach(f => {
+                const s = f.severity ?? 0;
+                if (s >= 0.8) bySeverity.severe++;
+                else if (s >= 0.5) bySeverity.moderate++;
+                else bySeverity.mild++;
+                byType[f.type] = (byType[f.type] || 0) + 1;
+            });
+            return {
+                state: bodyStateName || null,
+                retainedCount: retained.length,
+                bySeverity, byType,
+                lowestBG: retained.reduce((min, f) => {
+                    const bg = f.events?.[0]?.lowBG ?? f.events?.[0]?.bg ?? null;
+                    return (bg != null && (min == null || bg < min)) ? bg : min;
+                }, null)
+            };
+        };
+
+        // DEF-043 — meal-peak timing distribution. MEASUREMENT ONLY, no horizon, no
+        // constant, no gate. Observations logged BEFORE v3.5.96 are not independent
+        // samples: one excursion emitted two findings, so the same peak was counted
+        // twice. v3.5.96's governing-meal consolidation fixed the emission and
+        // episodePeaks retains every member's timing, so this counts consolidated
+        // episode members and starts the series here rather than carrying the old figures.
+        const computeMealPeakTiming = (findings) => {
+            const mins = [];
+            (findings || []).forEach(f => {
+                if (!f) return;
+                if (f.type !== FindingType.DIRECT_MEAL_HIGH && f.type !== FindingType.POST_MEAL_HIGH) return;
+                if (Array.isArray(f.episodePeaks) && f.episodePeaks.length > 0) {
+                    f.episodePeaks.forEach(p => {
+                        if (p && p.minsFromMealToPeak != null) mins.push(Math.round(p.minsFromMealToPeak));
+                    });
+                } else if (f.minsFromMealToPeak != null) {
+                    mins.push(Math.round(f.minsFromMealToPeak));
+                }
+            });
+            if (mins.length === 0) return { n: 0, observations: [], seriesStart: 'v3.5.96' };
+            const sorted = [...mins].sort((a, b) => a - b);
+            const med = sorted.length % 2 === 0
+                ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+                : sorted[Math.floor(sorted.length / 2)];
+            return {
+                n: sorted.length, observations: sorted,
+                min: sorted[0], max: sorted[sorted.length - 1], median: med,
+                seriesStart: 'v3.5.96',
+                note: 'Pre-v3.5.96 observations excluded — one excursion emitted two findings, so the same peak was double-counted.'
+            };
+        };
+        // [STATEFLIP-END]
+
         // R2 shadow: for each bimodal-blocked basal_signal_high bundle, what a
         // hour-granular gate keyed to the bundle's own scheduleTime H would
         // conclude. Detect-only: the real gate's verdict is not consulted,
@@ -6866,6 +7041,42 @@
                     const contributingDates = Object.keys(windowsByDate).sort();
                     const contributingDayCount = contributingDates.length;
 
+                    // [CONCENTRATION-START] INSTR-5 Part B (DEF-042). MEASUREMENT ONLY.
+                    //
+                    // contributingDayCount is a COUNT, not a distribution, and cannot tell
+                    // 29/2/4 from 19/14/10 — both report "3 days" and both scored 0.53865
+                    // on Jul 25, though one was 94% a single voided day. maxDayShare is the
+                    // number that separates them.
+                    //
+                    // ceilingUtilization makes starvation and impossible counts one number:
+                    // a clean window is one CGM reading, so a period's hard ceiling is
+                    // (hours x 12) per day at 5-minute cadence. The Jul 22 log recorded
+                    // Sleep Onset at 49/day against a 36 ceiling — pre-v3.5.79 duplicate
+                    // SGVs. Exceedance is now flagged rather than silently emitted.
+                    //
+                    // starved reports the margin against the EXISTING floor
+                    // (CONFIG.minEventsHighConfidence), which is what already decides
+                    // hasSufficientData. It deliberately does NOT introduce a second notion
+                    // of "not enough data" — there is one floor, and this exposes its margin.
+                    const PERIOD_HOURS = period.endHour - period.startHour;
+                    const READINGS_PER_HOUR = 12;                 // 5-minute CGM cadence
+                    const ceilingPerDay = PERIOD_HOURS * READINGS_PER_HOUR;
+                    const ceilingForWindow = ceilingPerDay * basalWindow;
+                    const dayCounts = Object.values(windowsByDate);
+                    const maxDayCount = dayCounts.length > 0 ? Math.max(...dayCounts) : 0;
+                    const maxDayShare = windowsInPeriod.length > 0
+                        ? parseFloat((maxDayCount / windowsInPeriod.length).toFixed(4))
+                        : null;
+                    const maxDayDate = maxDayCount > 0
+                        ? (contributingDates.find(d => windowsByDate[d] === maxDayCount) || null)
+                        : null;
+                    const ceilingUtilization = ceilingForWindow > 0
+                        ? parseFloat((windowsInPeriod.length / ceilingForWindow).toFixed(4))
+                        : null;
+                    const ceilingExceeded = dayCounts.some(c => c > ceilingPerDay);
+                    const ceilingExceededDates = contributingDates.filter(d => windowsByDate[d] > ceilingPerDay);
+                    // [CONCENTRATION-END]
+
                     // --- Parameter-change population partitioning ---
                     // If a basal change was applied to any entry in this period's hours during
                     // the analysis window, use only post-change windows for medianDeviation.
@@ -6993,6 +7204,17 @@
                         windowsByDate,
                         contributingDates,
                         contributingDayCount,
+                        // INSTR-5 Part B — measurement only, consumed by nothing.
+                        maxDayShare,
+                        maxDayDate,
+                        maxDayCount,
+                        ceilingPerDay,
+                        ceilingUtilization,
+                        ceilingExceeded,
+                        ceilingExceededDates,
+                        starved: !hasSufficientData,
+                        starvationFloor: CONFIG.minEventsHighConfidence,
+                        windowsToFloor: Math.max(0, CONFIG.minEventsHighConfidence - effectiveWindows.length),
                     };
                 });
                 
@@ -8476,7 +8698,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.98',
+                            version: '3.5.99',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8738,6 +8960,26 @@
                         signal: period.unsplitSignal ?? 'INSUFFICIENT',
                         windows: period.unsplitWindowCount ?? 0
                     },
+                    // INSTR-5 Part B — concentration and ceiling. Measurement only; the
+                    // floor reported is the EXISTING one, not a second competing notion.
+                    // windowsByDate ships here unconditionally: previously concentration
+                    // was only visible where a basal_signal finding happened to surface
+                    // it, which meant the periods with no finding — the ones most likely
+                    // to be starved — were exactly the ones you could not check.
+                    windowsByDate: period.windowsByDate || {},
+                    contributingDayCount: period.contributingDayCount ?? 0,
+                    concentration: {
+                        maxDayShare: period.maxDayShare ?? null,
+                        maxDayDate: period.maxDayDate ?? null,
+                        maxDayCount: period.maxDayCount ?? 0,
+                        ceilingPerDay: period.ceilingPerDay ?? null,
+                        ceilingUtilization: period.ceilingUtilization ?? null,
+                        ceilingExceeded: period.ceilingExceeded === true,
+                        ceilingExceededDates: period.ceilingExceededDates || [],
+                        starved: period.starved === true,
+                        starvationFloor: period.starvationFloor ?? null,
+                        windowsToFloor: period.windowsToFloor ?? 0
+                    },
                     agpCheck: getAGPCheckForPeriod(period.name),
                     divergence: period.medianDeviation !== null ? getDivergence(period) : null
                 }));
@@ -8787,7 +9029,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.98',
+                        version: '3.5.99',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -8806,7 +9048,9 @@
                         },
                         // v3.5.95 (DEF-044): per-stage finding census. `lost` names any
                         // type@slot that entered a stage and did not leave it.
-                        pipelineCensus: RecommendationEngine.lastPipelineCensus || null
+                        pipelineCensus: RecommendationEngine.lastPipelineCensus || null,
+                        // INSTR-5 Part D (DEF-048, DEF-043) — measurement only.
+                        stateFlipAudit: analysisResults?.stateFlipAudit || null
                     },
                     state: {
                         mode: this.formatStateName(bodyState.state).toLowerCase(),
@@ -11621,6 +11865,12 @@
                     // Calculate Carb-Adjusted Sensitivity from Sheets history
                     let carbAdjSensitivity = null;
                     let sensitivityHistoryLocal = null;
+                    // INSTR-5 Part D: the sweep needs the same baseline the live
+                    // calculation used, so it is captured rather than re-derived —
+                    // a sweep against a differently-derived baseline would measure
+                    // the re-derivation, not the run-time sensitivity.
+                    let sweepBaselineBolusPerCarb = null;
+                    let sweepBaselineBasal = null;
                     const basalTotal = activeSchedules?.basal
                         ? computeBasalDailyTotal(activeSchedules.basal) // BUG-A FIX: duration-weighted
                         : 0;
@@ -11688,6 +11938,8 @@
                                     
                                     // Carb-Adjusted Sensitivity = Expected / Actual
                                     carbAdjSensitivity = expectedTDD / tdd24h;
+                                    sweepBaselineBolusPerCarb = baselineBolusPerCarb;
+                                    sweepBaselineBasal = baselineBasal;
                                     
                                     console.log('Carb-Adjusted calculation:', {
                                         validEntries: validEntries.length,
@@ -12392,6 +12644,15 @@
                     const shadowUnblock = computeShadowUnblock(
                         processedBundles, hourlyAgpStats7d, aggregatedFindings, isNativeToday
                     );
+                    // INSTR-5 Part D — measurement only, consumed by nothing below.
+                    const stateFlipAudit = {
+                        runTimeSweep: computeRunTimeSweep(
+                            nightscoutData, sweepBaselineBolusPerCarb, sweepBaselineBasal),
+                        flipHistory: computeFlipHistory(sensitivityHistoryLocal, 28),
+                        retentionCensus: computeRetentionCensus(
+                            aggregatedFindings, detectedState?.state),
+                        mealPeakTiming: computeMealPeakTiming(aggregatedFindings)
+                    };
 
                     setAnalysisResults({
                         findings: aggregatedFindings,
@@ -12414,7 +12675,8 @@
                         insulinPerCarb: (tdd24h && totalCarbs24h > 0) ? (tdd24h / totalCarbs24h).toFixed(3) : null,
                         carbAdjSensitivity: carbAdjSensitivity ? carbAdjSensitivity.toFixed(2) : null,
                         gateCost,
-                        shadowUnblock
+                        shadowUnblock,
+                        stateFlipAudit
                     });
                     setBodyState(detectedState);
                     setBundles(processedBundles);
@@ -13278,7 +13540,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.98 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.99 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
