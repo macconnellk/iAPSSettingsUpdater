@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.5.97</title>
+    <title>Daily Insulin Settings Review v3.5.98</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -6801,7 +6801,7 @@
                         new Date(t.created_at) <= readingTime
                     );
                     if (failsGateA) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: readingTime.toISOString().slice(0,10), rejectedBy: 'gateA' });
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'gateA' });
                         return;
                     }
 
@@ -6816,7 +6816,7 @@
                         return diffMin > 0 && diffMin <= 20;
                     });
                     if (priorCGM.length === 0) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: readingTime.toISOString().slice(0,10), rejectedBy: 'gateB' });
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'gateB' });
                         return;
                     }
                     const prior = priorCGM.reduce((c, r) =>
@@ -6825,12 +6825,19 @@
                     const deltaTime = (readingTime - new Date(prior.dateString)) / 60000;
                     const deltaBG = reading.sgv - prior.sgv;
                     if (Math.abs(deltaBG / deltaTime) > 4.0) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: readingTime.toISOString().slice(0,10), rejectedBy: 'gateB' });
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'gateB' });
                         return;
                     }
 
-                    // Passed all gates — clean window
-                    const dateStr = readingTime.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+                    // Passed all gates — clean window.
+                    // v3.5.98 B1 (DEF-052c): LOCAL date, matching period membership.
+                    // Period grouping uses getHours() (local) while this key used
+                    // toISOString() (UTC). In EDT that stamped Sleep Onset (21:00–24:00
+                    // local = 01:00–04:00 UTC) one day LATE, and split a single local
+                    // Evening (17:00–21:00 local = 21:00–01:00 UTC) across two UTC dates
+                    // — inflating contributingDayCount and deflating maxDayShare on
+                    // exactly the two periods that motivated measuring concentration.
+                    const dateStr = getLocalDateString(readingTime); // local 'YYYY-MM-DD'
                     candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr, rejectedBy: null });
                     cleanWindows.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr });
                 });
@@ -6867,6 +6874,12 @@
                     let populationSplit  = false;
                     let postChangeCount  = 0;
                     let splitChangeDate  = null;
+                    // v3.5.98 B5 (DEF-060f): a split that was FOUND but not APPLIED (post-change
+                    // population below the floor, full population used) previously serialised
+                    // identically to a genuine anchor-at-window-start — both {used: N, dropped: 0}.
+                    // The console distinguished them; the JSON did not. Introduced in v3.5.97 B.
+                    let splitApplied     = false;
+                    let splitSkipReason  = null;
 
                     if (basalSchedule && basalSchedule.length > 0) {
                         const entriesInPeriod = basalSchedule.filter(entry => {
@@ -6900,6 +6913,7 @@
                             populationSplit = true;
 
                             if (postChangeWindows.length >= CONFIG.minEventsHighConfidence) {
+                                splitApplied = true;
                                 effectiveWindows = postChangeWindows;
                                 console.log(
                                     `Signal partition: ${period.name} — using ${postChangeWindows.length} ` +
@@ -6907,6 +6921,7 @@
                                     `dropped ${windowsInPeriod.length - postChangeWindows.length} pre-change`
                                 );
                             } else {
+                                splitSkipReason = 'below_floor';
                                 console.log(
                                     `Signal partition: ${period.name} — only ${postChangeWindows.length} ` +
                                     `post-change windows (need ${CONFIG.minEventsHighConfidence}); ` +
@@ -6916,15 +6931,45 @@
                         }
                     }
 
+                    // [MEDIAN-START] v3.5.98 B2 (DEF-052d): true median. The previous form
+                    // — deviations[Math.floor(n/2)] — returns the UPPER of the two central
+                    // values on even n, which is not the median and biases every period
+                    // upward. One estimator, used by both the shipped median and the
+                    // unsplit comparison below, so the two can never diverge.
+                    const medianOf = (sortedAsc) => {
+                        const n = sortedAsc.length;
+                        if (n === 0) return null;
+                        const mid = Math.floor(n / 2);
+                        return n % 2 === 0
+                            ? (sortedAsc[mid - 1] + sortedAsc[mid]) / 2
+                            : sortedAsc[mid];
+                    };
+                    const signalOf = (median) => median === null ? 'INSUFFICIENT' :
+                        median > 10 ? 'HIGH' :
+                        median < -10 ? 'LOW' : 'NEUTRAL';
+                    // [MEDIAN-END]
+
                     const hasSufficientData = effectiveWindows.length >= CONFIG.minEventsHighConfidence;
                     const deviations = effectiveWindows.map(w => w.deviation).sort((a, b) => a - b);
-                    const medianDeviation = hasSufficientData
-                        ? deviations[Math.floor(deviations.length / 2)]
-                        : null;
+                    const medianDeviation = hasSufficientData ? medianOf(deviations) : null;
 
-                    const signal = !hasSufficientData ? 'INSUFFICIENT' :
-                        medianDeviation > 10 ? 'HIGH' :
-                        medianDeviation < -10 ? 'LOW' : 'NEUTRAL';
+                    const signal = !hasSufficientData ? 'INSUFFICIENT' : signalOf(medianDeviation);
+
+                    // [UNSPLIT-START] v3.5.98 B6 (DEF-059 input, closes INSTR-5 A6).
+                    // MEASUREMENT ONLY — computed, never consumed. Nothing downstream reads
+                    // these fields; they do not touch medianDeviation, signal, confidence,
+                    // or any recommendation.
+                    //
+                    // What the split costs has been arguable rather than visible: on Jul 27
+                    // Deep Sleep discarded 272 of 314 windows and reported HIGH +110 from the
+                    // 42 that remained, with contributingDayCount: 7 of 7 printed beside it.
+                    // Emitting the unsplit median next to the shipped one makes that cost a
+                    // number in every run instead of a reconstruction after the fact.
+                    const unsplitDeviations = windowsInPeriod.map(w => w.deviation).sort((a, b) => a - b);
+                    const unsplitHasSufficient = windowsInPeriod.length >= CONFIG.minEventsHighConfidence;
+                    const unsplitMedianDeviation = unsplitHasSufficient ? medianOf(unsplitDeviations) : null;
+                    const unsplitSignal = !unsplitHasSufficient ? 'INSUFFICIENT' : signalOf(unsplitMedianDeviation);
+                    // [UNSPLIT-END]
 
                     return {
                         ...period,
@@ -6938,6 +6983,11 @@
                         rejectedByGate,
                         windowQuality,
                         populationSplit,
+                        splitApplied,
+                        splitSkipReason,
+                        unsplitMedianDeviation,
+                        unsplitSignal,
+                        unsplitWindowCount: windowsInPeriod.length,
                         postChangeCount,
                         splitChangeDate: splitChangeDate ? splitChangeDate.toISOString() : null,
                         windowsByDate,
@@ -8426,7 +8476,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.5.97',
+                            version: '3.5.98',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8671,9 +8721,23 @@
                             changeDate: period.splitChangeDate
                                 ? String(period.splitChangeDate).slice(0, 10) : null,
                             used: period.effectiveWindowCount ?? 0,
-                            dropped: (period.cleanWindowCount ?? 0) - (period.effectiveWindowCount ?? 0)
+                            dropped: (period.cleanWindowCount ?? 0) - (period.effectiveWindowCount ?? 0),
+                            // v3.5.98 B5 (DEF-060f): {used: N, dropped: 0} was ambiguous —
+                            // it meant either "anchor sits at the window start, nothing to
+                            // discard" or "post-change population below the floor, split
+                            // abandoned". Different situations, identical JSON. Now separated.
+                            applied: period.splitApplied === true,
+                            skipReason: period.splitSkipReason ?? null
                         }
                         : null,
+                    // v3.5.98 B6: measurement only — what this period would report with no
+                    // split. Nothing downstream consumes these; they exist so the split's
+                    // cost is visible nightly rather than reconstructed after the fact.
+                    unsplit: {
+                        medianDeviation: period.unsplitMedianDeviation ?? null,
+                        signal: period.unsplitSignal ?? 'INSUFFICIENT',
+                        windows: period.unsplitWindowCount ?? 0
+                    },
                     agpCheck: getAGPCheckForPeriod(period.name),
                     divergence: period.medianDeviation !== null ? getDivergence(period) : null
                 }));
@@ -8723,7 +8787,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.5.97',
+                        version: '3.5.98',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9100,11 +9164,24 @@
                             isSlotConflict: bundle.isSlotConflict
                         });
                         
+                        // [TURN1-TIME-START] v3.5.98 B4 (DEF-053): `bundle.scheduleTime` does
+                        // not exist — createBundle never sets it — so all five interpolations
+                        // below were falling through to `undefined` whenever the event's own
+                        // time was also absent, and rendering it to the reviewer verbatim
+                        // ("Meal at undefined caused low", "Impacts: undefined CR") while the
+                        // same finding's evidence string read correctly. The finding carries
+                        // the slot; read it from there, and when nothing resolves, drop the
+                        // clause rather than print a placeholder — a question with a missing
+                        // time is still answerable, a question that says "undefined" is not.
+                        const slotOf = (f) => f?.scheduleTime || bundle.timeBlock || null;
+                        const at = (t) => t ? ` at ${t}` : '';
+                        // [TURN1-TIME-END]
+
                         // Post-meal highs
                         if (finding?.type === 'post_meal_high') {
                             if (finding.eventsLast24h > 0) {
                                 const event = finding.events?.[0];
-                                const mealTime = event?.time || bundle.scheduleTime;
+                                const mealTime = event?.time || slotOf(finding);
                                 const carbs = event?.mealCarbs || '?';
                                 const peak = event?.peakBG || '?';
                                 
@@ -9119,7 +9196,7 @@
                                 }
                                 
                                 periodContext.questions.push({
-                                    q: `Meal at ${mealTime} (${carbs}g → ${peak} peak). What was eaten? Pre-bolus timing?`,
+                                    q: `Meal${at(mealTime)} (${carbs}g → ${peak} peak). What was eaten? Pre-bolus timing?`,
                                     impacts: impacts
                                 });
                             }
@@ -9129,7 +9206,7 @@
                         if (finding?.type === 'unexplained_low') {
                             if (finding.eventsLast24h > 0) {
                                 const event = finding.events?.[0];
-                                const timeStr = event?.time || bundle.scheduleTime;
+                                const timeStr = event?.time || slotOf(finding);
                                 
                                 // Get impacts from recommendations
                                 let impacts = 'basal timing';
@@ -9142,7 +9219,7 @@
                                 }
                                 
                                 periodContext.questions.push({
-                                    q: `Unexplained low at ${timeStr}. Any skipped snack or extra activity?`,
+                                    q: `Unexplained low${at(timeStr)}. Any skipped snack or extra activity?`,
                                     impacts: impacts
                                 });
                             }
@@ -9152,11 +9229,12 @@
                         if (finding?.type === 'direct_meal_low') {
                             if (finding.eventsLast24h > 0) {
                                 const event = finding.events?.[0];
-                                const mealTime = event?.time || bundle.scheduleTime;
-                                
+                                const mealTime = event?.time || slotOf(finding);
+                                const crSlot = slotOf(finding);
+
                                 periodContext.questions.push({
-                                    q: `Meal at ${mealTime} caused low. Carb count accurate? Meal timing consistent?`,
-                                    impacts: `${bundle.scheduleTime} CR`
+                                    q: `Meal${at(mealTime)} caused low. Carb count accurate? Meal timing consistent?`,
+                                    impacts: crSlot ? `${crSlot} CR` : 'CR'
                                 });
                             }
                         }
@@ -9164,7 +9242,7 @@
                         // CR conflicts
                         if (bundle.isSlotConflict) {
                             periodContext.questions.push({
-                                q: `CR conflict at ${bundle.scheduleTime} (strengthen vs weaken). Are meals at this time consistent day-to-day, or highly variable?`,
+                                q: `CR conflict${at(slotOf(finding))} (strengthen vs weaken). Are meals at this time consistent day-to-day, or highly variable?`,
                                 impacts: 'whether to hold CR changes or act'
                             });
                         }
@@ -10567,9 +10645,34 @@
                     }
                     // [GLUCOSE-DEDUP-END]
 
+                    // [DEVICESTATUS-DEDUP-START] v3.5.98 B3 (DEF-057). LOOKUP HYGIENE, NOT
+                    // COVERAGE — say it that way. Coverage was a fetch property and v3.5.97
+                    // fixed it; truncation happened before dedup could ever have run, so this
+                    // cannot and does not change cleanWindows or contributingDayCount (pinned
+                    // by T4). The Jul 25 raw pull confirmed devicestatus is dual-written
+                    // 1–2 s apart, which means lookupIOB's nearest/before searches have been
+                    // choosing between near-identical twins on every call. Same keep-first
+                    // per-minute key as glucose; records are newest-first from Nightscout, so
+                    // keep-first retains the LATEST record in each minute.
+                    const seenStatusMinutes = new Set();
+                    const dedupedDeviceStatus = (deviceStatus || []).filter(s => {
+                        if (!s || !s.created_at) return true; // unkeyable — pass through
+                        const minuteKey = String(s.created_at).substring(0, 16); // YYYY-MM-DDTHH:MM
+                        if (seenStatusMinutes.has(minuteKey)) return false;
+                        seenStatusMinutes.add(minuteKey);
+                        return true;
+                    });
+                    if (dedupedDeviceStatus.length !== (deviceStatus || []).length) {
+                        console.log('Device status dedup: ' + (deviceStatus || []).length + ' → ' +
+                            dedupedDeviceStatus.length + ' (' +
+                            ((deviceStatus || []).length - dedupedDeviceStatus.length) +
+                            ' same-minute duplicates dropped)');
+                    }
+                    // [DEVICESTATUS-DEDUP-END]
+
                     console.log('=== fetchNightscoutData complete ===');
 
-                    return { glucose: dedupedGlucose, treatments, deviceStatus, profile };
+                    return { glucose: dedupedGlucose, treatments, deviceStatus: dedupedDeviceStatus, profile };
                     
                 } catch (err) {
                     console.error('Nightscout fetch error:', err);
@@ -13175,7 +13278,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.5.97 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.5.98 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
