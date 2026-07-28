@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.02</title>
+    <title>Daily Insulin Settings Review v3.6.03</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3167,7 +3167,33 @@
                         date: ch.date, param: ch.param, block: ch.block,
                         oldValue: ch.oldValue, newValue: ch.newValue,
                         changePercent: Math.round(ch.changePercent * 10) / 10,
-                        direction: ch.direction, period: ch.period,
+                        direction: ch.direction,
+                        // v3.6.03 Part A (DEF-084). v3.6.02 moved the MEASUREMENT to the
+                        // effect period and left the LABEL on the clock period, so
+                        // basal@07:00 rendered "Dawn" while being measured against
+                        // Morning — a number labelled with a population it was not
+                        // computed from, i.e. the DEF-052e class reintroduced by the
+                        // build meant to fix its sibling.
+                        //
+                        // `period` now holds the EFFECT period, because that is what
+                        // every consumer reading it is implicitly asking: which
+                        // population produced this verdict? Consumer sweep before
+                        // changing it (spec stop condition): the only reader of the
+                        // serialized field is the trend-context display table;
+                        // ledgerVerdictFor matches on param/block/date, the Log Script
+                        // does not consume it, and no test reads it. Nothing expects the
+                        // clock hour, so nothing changes meaning silently.
+                        //
+                        // Both fields ship on EVERY row, CR and ISF included, where they
+                        // are equal. A field present on some rows and absent on others
+                        // invites exactly the inference this project keeps getting wrong.
+                        schedulePeriod: ch.schedulePeriod || ch.period || null,
+                        effectPeriods: (ch.effectPeriods && ch.effectPeriods.length)
+                            ? ch.effectPeriods
+                            : (ch.period ? [ch.period] : []),
+                        period: (ch.effectPeriods && ch.effectPeriods.length)
+                            ? ch.effectPeriods.join(' + ')
+                            : (ch.period || null),
                         verdict: v.verdict,
                         preDeviation: v.preDeviation ?? null, postDeviation: v.postDeviation ?? null,
                         preLowPct: v.preLowPct ?? null, postLowPct: v.postLowPct ?? null,
@@ -3175,9 +3201,37 @@
                     };
                 })
                 .sort((a, b) => new Date(b.date) - new Date(a.date));
-            const summary = { improved: 0, worsened: 0, neutral: 0, causedLow: 0, reverted: 0, voided: 0, confounded: 0, pending: 0 };
-            const summaryKey = { IMPROVED: 'improved', WORSENED: 'worsened', NEUTRAL: 'neutral', CAUSED_LOW: 'causedLow', REVERTED: 'reverted', VOIDED: 'voided', CONFOUNDED: 'confounded', PENDING: 'pending' };
-            ledger.forEach(l => { summary[summaryKey[l.verdict]]++; });
+            // [ENUM-DISPATCH-START] v3.6.03 Part B.
+            //
+            // summaryKey had no INDETERMINATE_WINDOW entry, so that branch evaluated
+            // summary[undefined]++ → NaN, adding an `undefined: NaN` key. The row
+            // survived in `ledger`; the summary was corrupted. It never executed in
+            // production, which is exactly why it shipped: [h+1, h+1.5] contains a
+            // whole-hour boundary only when frac(h) > 0.5, and every schedule entry
+            // sits at :00 or :30.
+            //
+            // The entry is the small half. The half that matters is that an unmapped
+            // key must FAIL LOUDLY rather than increment `undefined` — a dispatch table
+            // returning undefined for an unrecognised input is the silent-null-fallback
+            // class this register has now filed against name-keyed Sheets columns,
+            // getIOBAtTime, and slice(indexOf(...)). Swallowing the row instead would be
+            // the same defect wearing a different coat, so the row is counted under
+            // `unknown` AND announced.
+            const summary = { improved: 0, worsened: 0, neutral: 0, causedLow: 0, reverted: 0, voided: 0, confounded: 0, pending: 0, indeterminateWindow: 0 };
+            const summaryKey = { IMPROVED: 'improved', WORSENED: 'worsened', NEUTRAL: 'neutral', CAUSED_LOW: 'causedLow', REVERTED: 'reverted', VOIDED: 'voided', CONFOUNDED: 'confounded', PENDING: 'pending', INDETERMINATE_WINDOW: 'indeterminateWindow' };
+            ledger.forEach(l => {
+                const key = summaryKey[l.verdict];
+                if (key === undefined) {
+                    // Named, counted, never silent. The invariant downstream is that the
+                    // counts sum to ledger.length, which holds either way.
+                    console.error(`[ENUM-DISPATCH] unmapped ledger verdict "${l.verdict}" — ` +
+                        `summaryKey has no entry; counted under "unknown"`);
+                    summary.unknown = (summary.unknown || 0) + 1;
+                    return;
+                }
+                summary[key]++;
+            });
+            // [ENUM-DISPATCH-END]
 
             return {
                 preSessions: LEDGER_PRE, postSessions: LEDGER_POST, horizon: LEDGER_HORIZON,
@@ -8513,10 +8567,24 @@
                             getLocalDateString(new Date(l.date)) === changeDate);
                         return hit ? hit.verdict : null;
                     };
+                    // v3.6.03 Part B sweep: a SECOND unguarded verdict dispatch, found
+                    // by the sweep rather than by the failure. It had the same missing
+                    // entry and would have rendered a bare `undefined` in the Outcome
+                    // column. Same treatment — entry added, unmapped keys announced and
+                    // rendered visibly rather than as the word "undefined".
                     const verdictEmoji = {
                         IMPROVED: '✓ Improved', WORSENED: '✗ Worsened', NEUTRAL: '− Neutral',
                         CAUSED_LOW: '⚠️ Caused low', REVERTED: '↩️ Reverted', VOIDED: '∅ Voided',
-                        CONFOUNDED: '✳ Confounded', PENDING: '⏳ Pending'
+                        CONFOUNDED: '✳ Confounded', PENDING: '⏳ Pending',
+                        INDETERMINATE_WINDOW: '⧉ Indeterminate window'
+                    };
+                    const renderVerdict = (v) => {
+                        if (!v) return '⏳';
+                        if (verdictEmoji[v] === undefined) {
+                            console.error(`[ENUM-DISPATCH] unmapped verdict "${v}" in verdictEmoji`);
+                            return `⚠️ ${v}`;
+                        }
+                        return verdictEmoji[v];
                     };
                     output += `### Recent Changes\n\n`;
                     output += `| Date | Source | Change | Outcome |\n`;
@@ -8525,7 +8593,7 @@
                     recentChanges.forEach(change => {
                         const source = change.source === 'auto_detected' ? 'Auto' : 'Manual';
                         const verdict = ledgerVerdictFor(change);
-                        output += `| ${change.date} | ${source} | ${change.scheduleTime} ${change.param}: ${change.oldValue}→${change.newValue} | ${verdict ? verdictEmoji[verdict] : '⏳'} |\n`;
+                        output += `| ${change.date} | ${source} | ${change.scheduleTime} ${change.param}: ${change.oldValue}→${change.newValue} | ${renderVerdict(verdict)} |\n`;
                     });
                     output += `\n`;
                 }
@@ -9068,7 +9136,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.02',
+                            version: '3.6.03',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9417,7 +9485,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.02',
+                        version: '3.6.03',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -14018,7 +14086,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.02 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.6.03 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
