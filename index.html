@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.00</title>
+    <title>Daily Insulin Settings Review v3.6.01</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -1749,7 +1749,12 @@
                     newValue,
                     changePercent: actualChangePercent,
                     protectionLevel: ProtectionLevel.CLEAR,
-                    ratioWarning
+                    ratioWarning,
+                    // v3.6.01 Part C (DEF-080). READ-ONLY — no branch consumes it.
+                    ...(effectiveParameter === 'basal'
+                        ? expectedBasalEffect(currentEntry.value, newValue,
+                                              effectiveScheduleTime, schedules)
+                        : {})
                 };
             },
             
@@ -2384,6 +2389,74 @@
             if (otherReasons.length > 0) out.otherReasons = otherReasons;
             return out;
         };
+        // [BASAL-EFFECT-START] v3.6.01 Part C (DEF-080). READ-ONLY.
+        //
+        // changePercent is a percentage of a RATE and carries no clinical meaning on
+        // its own. `0.35 → 0.30` is −14.3%, and it is also ~10 mg/dL. The second number
+        // is what governs the decision, and it has now been computed by hand in two
+        // consecutive sessions — Jul 27 ("0.05U ≈ 10 mg/dL at ISF 207 ... zeroing the
+        // whole 10:00 block buys only ~72 mg/dL" against an observed −80 mg/dL/hr, which
+        // is what rejected a deeper cut) and Jul 26 ("~6 mg/dL effect at ISF 120").
+        //
+        // governingISF ships alongside because the effect figure is uninterpretable
+        // without it: the same 0.05 U/hr step is ~6 mg/dL at ISF 120 and ~21 mg/dL at
+        // ISF 211, and B's schedule spans 111–211.
+        //
+        // If the block spans an ISF boundary a RANGE is reported rather than electing
+        // one value — the v3.6.00 principle: a figure that cannot be computed as a point
+        // must not serialise as one.
+        //
+        // No CR/ISF analogue. A basal rate change over a known interval is a known unit
+        // quantity; the CR and ISF equivalents need assumptions about meal or correction
+        // size, and an analogue that needs assumptions is a different spec.
+        const expectedBasalEffect = (currentValue, newValue, scheduleTime, schedules) => {
+            const isfSchedule = schedules && schedules.isf;
+            const basalSchedule = schedules && schedules.basal;
+            if (!isfSchedule || !isfSchedule.length || !basalSchedule || !scheduleTime) return {};
+            if (currentValue == null || newValue == null) return {};
+            const toMin = (t) => {
+                const [h, m] = String(t).split(':').map(Number);
+                return (h || 0) * 60 + (m || 0);
+            };
+            // Block duration: this basal entry until the next one (wrapping at midnight).
+            const times = basalSchedule.map(e => toMin(e.time)).sort((a, b) => a - b);
+            const start = toMin(scheduleTime);
+            const next = times.find(t => t > start);
+            const blockHours = ((next != null ? next : 1440) - start) / 60;
+            if (!(blockHours > 0)) return {};
+            const deltaU = (newValue - currentValue) * blockHours;   // signed U over the block
+            // Every ISF value in force across the block — not just the one at its start.
+            const isfPoints = isfSchedule
+                .map(e => ({ min: toMin(e.time), value: e.value, time: e.time }))
+                .sort((a, b) => a.min - b.min);
+            const endMin = (next != null ? next : 1440);
+            const inBlock = isfPoints.filter(p => p.min >= start && p.min < endMin);
+            let governing = isfPoints[0];
+            isfPoints.forEach(p => { if (p.min <= start) governing = p; });
+            const spanning = inBlock.filter(p => p.min > start);
+            const effectFor = (isf) => (isf > 0 ? parseFloat((deltaU * isf).toFixed(1)) : null);
+            if (spanning.length > 0) {
+                const all = [governing, ...spanning];
+                const vals = all.map(p => effectFor(p.value)).filter(v => v != null);
+                if (vals.length === 0) return {};
+                return {
+                    expectedEffectMgdl: {
+                        min: Math.min(...vals), max: Math.max(...vals), isRange: true
+                    },
+                    governingISF: all.map(p => ({ value: p.value, time: p.time })),
+                    effectBlockHours: blockHours
+                };
+            }
+            const point = effectFor(governing && governing.value);
+            if (point == null) return {};
+            return {
+                expectedEffectMgdl: point,
+                governingISF: { value: governing.value, time: governing.time },
+                effectBlockHours: blockHours
+            };
+        };
+        // [BASAL-EFFECT-END]
+
         // v3.6.00: the single predicate deciding whether a meal-driven LOW may carry a
         // recommendation. Returns null (recommendation permitted) only when the numerator
         // is exact — one non-SMB bolus, so M = S rather than M <= S — AND the ratio clears
@@ -4642,6 +4715,7 @@
                             findings.push({
                                 id: `finding_resistant_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.DIRECT_MEAL_LOW,
+                                bg: low.bg,   // v3.6.01 (DEF-078)
                                 detectedAt: new Date().toISOString(),
                                 eventTime: low.localTime || low.time,
                                 scheduleTime: getCRForTime(mealWithin3h.created_at, crSchedule)?.time || `${String(lowTime.getHours()).padStart(2,'0')}:00`,
@@ -5639,6 +5713,7 @@
                     const makeCompletionFinding = (detailSuffix) => ({
                         id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.DIRECT_MEAL_LOW,
+                        bg: low.bg,   // v3.6.01 (DEF-078)
                         eventTime: low.time,
                         scheduleTime: getCRForTime(effectiveGoverningMeal.created_at, crSchedule)?.time || null,
                         period: periodName,
@@ -5663,6 +5738,7 @@
                         finding = {
                             id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                             type: FindingType.DIRECT_MEAL_LOW,
+                            bg: low.bg,   // v3.6.01 (DEF-078)
                             eventTime: low.time,
                             scheduleTime: getCRForTime(effectiveMealTime.toISOString(), crSchedule)?.time || null,
                             period: periodName,
@@ -5686,6 +5762,7 @@
                             : {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.RESISTANT_LOW,
+                                bg: low.bg,   // v3.6.01 (DEF-078)
                                 eventTime: low.time,
                                 scheduleTime: null,
                                 period: periodName,
@@ -5793,6 +5870,7 @@
                                 : {
                                     id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                     type: FindingType.RESISTANT_LOW,
+                                    bg: low.bg,   // v3.6.01 (DEF-078)
                                     eventTime: low.time,
                                     scheduleTime: null,
                                     period: periodName,
@@ -5806,6 +5884,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.UNEXPLAINED_LOW,
+                                bg: low.bg,   // v3.6.01 (DEF-078)
                                 eventTime: low.time,
                                 scheduleTime: null,
                                 period: periodName,
@@ -5822,6 +5901,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.ISF_INDUCED_LOW,
+                                bg: low.bg,   // v3.6.01 (DEF-078)
                                 eventTime: low.time,
                                 scheduleTime: isfEntry ? isfEntry.time : '00:00',
                                 period: periodName,
@@ -5839,6 +5919,7 @@
                             finding = {
                                 id: `finding_engine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                                 type: FindingType.DIRECT_MEAL_LOW,
+                                bg: low.bg,   // v3.6.01 (DEF-078)
                                 eventTime: low.time,
                                 scheduleTime: crEntry ? crEntry.time : '00:00',
                                 period: periodName,
@@ -8868,7 +8949,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.00',
+                            version: '3.6.01',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -8967,7 +9048,18 @@
                                 f.type === 'isf_induced_low' || f.type === 'transient_high_low' ||
                                 f.type === 'post_meal_high') {
                                 // Extract BG from the finding's events array (type-specific property names)
-                                const bg = evt0.lowBG || evt0.peakBG || evt0.highBG || null;
+                                // v3.6.01 (DEF-078): fall back to the finding's own scalar.
+                                // The condition was never the SLOT — it is the absence of an
+                                // events[] array, which every CAE-emitted low lacks while the
+                                // detector-emitted ones carry it. So `unexplained_low @ Morning`
+                                // (severity 0.90, confidence 0.972, 42 mg/dL) rendered bg: null
+                                // while the DEMOTED 05:00 low in the same run carried bg: 40 —
+                                // the most severe finding was the one missing its value.
+                                // A scalar is used rather than synthesising events[]: nothing
+                                // reads f.bg, whereas events[] is read by aggregateFindings,
+                                // evidenceDetails and attachEpisodeEvidence, so populating it
+                                // would change behaviour rather than reporting.
+                                const bg = evt0.lowBG || evt0.peakBG || evt0.highBG || f.bg || null;
                                 
                                 // Extract date from eventTime — use local time for Claude readability
                                 let eventDate = null;
@@ -9071,7 +9163,14 @@
                             currentValue: rec.currentValue,
                             recommendedValue: rec.newValue,
                             changePercent: rec.changePercent,
-                            protectionLevel: rec.protectionLevel || 'clear'
+                            protectionLevel: rec.protectionLevel || 'clear',
+                            // v3.6.01 Part C — read-only; a percentage of a rate is not a
+                            // clinical quantity, this is.
+                            ...(rec.expectedEffectMgdl !== undefined
+                                ? { expectedEffectMgdl: rec.expectedEffectMgdl,
+                                    governingISF: rec.governingISF,
+                                    effectBlockHours: rec.effectBlockHours }
+                                : {})
                         })),
                         evidence,
                         compoundEffect: bundle.compoundEffect?.description ? {
@@ -9199,7 +9298,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.00',
+                        version: '3.6.01',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -10424,20 +10523,46 @@
                             const ageDays = (now - sessionDate) / (1000 * 60 * 60 * 24);
                             return Math.exp(-SESSION_DECAY_FACTOR * (ageDays / SESSION_WINDOW_DAYS));
                         };
+                        // [PERSIST-TALLY-START] v3.6.01 (DEF-075). Counts SESSIONS, not findings.
+                        //
+                        // The previous form incremented freq once per ITEM while printing
+                        // rows.length as the denominator, so any detector emitting more than
+                        // once per run inflated its own persistence. The Jul 27 output printed
+                        // "00:00 RESISTANT LOW: 28/14 sessions" — a count exceeding its own
+                        // denominator — and the same session weakened 10:00 basal citing
+                        // "Unexplained Low (Morning) 4/14 = STRUCTURAL threshold met" against a
+                        // raw threshold of 3, where 4 findings may represent 2 sessions.
+                        //
+                        // An impossible number printed every session for this counter's entire
+                        // life without being caught, so the invariant is now STRUCTURAL rather
+                        // than documented: a key is added to a per-session Set before tallying,
+                        // which makes freq[key] > rows.length unreachable by construction, and
+                        // the assertion below fails loudly if that ever stops being true.
                         const tally = (rows, field) => {
-                            const freq = {}, weighted = {}, displayName = {};
+                            const freq = {}, weighted = {}, displayName = {}, distinctSessions = {};
                             for (const e of rows) {
                                 const items = Array.isArray(e[field]) ? e[field] : [];
                                 const w = sessionRecencyWeight(gapLocalDateKey(e.date || e.timestamp || '') || '');
+                                const seenThisSession = new Set();
                                 for (const item of items) {
                                     const key = persistenceKey(item);
+                                    displayName[key] = item.name || key; // most recent variant wins
+                                    if (seenThisSession.has(key)) continue;   // one session, one count
+                                    seenThisSession.add(key);
                                     freq[key] = (freq[key] || 0) + 1;
                                     weighted[key] = (weighted[key] || 0) + w;
-                                    displayName[key] = item.name || key; // most recent variant wins
+                                    distinctSessions[key] = (distinctSessions[key] || 0) + 1;
                                 }
                             }
-                            return { freq, weighted, displayName };
+                            // A counter and its denominator must be structurally unable to diverge.
+                            Object.entries(freq).forEach(([k, v]) => {
+                                if (v > rows.length) {
+                                    console.error(`[PERSIST-INVARIANT] ${k}: ${v} > ${rows.length} sessions — impossible`);
+                                }
+                            });
+                            return { freq, weighted, displayName, distinctSessions };
                         };
+                        // [PERSIST-TALLY-END]
                         const PERSIST_RAW_THRESHOLD = 3;
                         const PERSIST_WEIGHTED_THRESHOLD = 1.5;
                         const renderTally = (label, rows, field) => {
@@ -10445,9 +10570,22 @@
                             const persistent = Object.entries(freq).filter(([k, v]) =>
                                 v >= PERSIST_RAW_THRESHOLD && (weighted[k] || 0) >= PERSIST_WEIGHTED_THRESHOLD);
                             if (persistent.length > 0) {
-                                output += `**${label}** (3+ appearances, recency-weighted, keyed by detector@slot):\n`;
+                                // v3.6.01: two distinct keys can share one display name
+                                // (`Safety: 09:30 Meal-Induced Low` rendered at 6/14 and 3/14).
+                                // The KEYS are genuinely different — persistenceKey is
+                                // detector@slot — so the NAME is what is ambiguous. Render the
+                                // key alongside it only where a collision actually exists, so
+                                // the common case stays readable.
+                                const nameCount = {};
+                                persistent.forEach(([k]) => {
+                                    const n = displayName[k];
+                                    nameCount[n] = (nameCount[n] || 0) + 1;
+                                });
+                                output += `**${label}** (3+ sessions, recency-weighted, keyed by detector@slot):\n`;
                                 for (const [key, count] of persistent) {
-                                    output += `- ${displayName[key]}: ${count}/${rows.length} sessions (weighted: ${(weighted[key] || 0).toFixed(1)})\n`;
+                                    const collides = nameCount[displayName[key]] > 1;
+                                    const label2 = collides ? `${displayName[key]} \`[${key}]\`` : displayName[key];
+                                    output += `- ${label2}: ${count}/${rows.length} sessions (weighted: ${(weighted[key] || 0).toFixed(1)})\n`;
                                 }
                                 output += '\n';
                             } else {
@@ -13710,7 +13848,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.00 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.6.01 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
