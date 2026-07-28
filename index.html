@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.04</title>
+    <title>Daily Insulin Settings Review v3.6.05</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -8312,29 +8312,44 @@
                 
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     console.log('SPEC 4: No changes needed - using short-form report');
-                    return this.formatNoChangesReport(analysisResults, bodyState, bundles, agp7day, agp48h, dateStr);
+                    return this.formatNoChangesReport(analysisResults, bodyState, bundles, agp7day, agp48h, dateStr, hMeta);
                 }
                 
                 let output = `# Daily Insulin Settings Review\n`;
                 output += `**Date:** ${dateStr}\n`;
-                
-                // Show override % for OVERRIDE_ACTIVE, days for other states
-                const stateInfo = bodyState.state === BodyStateType.OVERRIDE_ACTIVE
-                    ? `Override ${bodyState.overridePercent || 100}%`
-                    : `Day ${bodyState.daysInState}`;
-                output += `**State:** ${this.formatStateName(bodyState.state)} (${stateInfo})\n\n`;
-                output += `---\n\n`;
-                
-                // Current State Section
-                output += `## Current State\n\n`;
-                output += `${STATE_DESCRIPTIONS[bodyState.state]}\n\n`;
-                
-                if (bodyState.contributingFactors && bodyState.contributingFactors.length > 0) {
-                    output += `**Contributing Factors:**\n`;
-                    bodyState.contributingFactors.forEach(factor => {
-                        output += `- ${factor}\n`;
-                    });
-                    output += `\n`;
+
+                // v3.6.05 Part B (DEF-088 containment): a state derived from unreadable
+                // history is declared, not printed. "Stable (Day 30) — Normal operation.
+                // Full optimization enabled." beside historyAvailable:false is the single
+                // most misleading line the tool has produced.
+                if (!hMeta.historyAvailable) {
+                    output += `**State:** ⚠️ UNDETERMINED — history unavailable\n\n`;
+                    output += `---\n\n`;
+                    output += `## Current State\n\n`;
+                    output += `**⚠️ BODY STATE COULD NOT BE DETERMINED** — reason: \`${hMeta.historyUnavailableReason || 'history_unavailable'}\`.\n\n`;
+                    output += `State detection reads change history, TDD history and sensitivity history. ` +
+                        `None were readable this session, so no mode, day count or optimization posture ` +
+                        `is reported. **Recommendations below were gated by a state that could not be ` +
+                        `determined — do not apply any parameter change from this session.**\n\n`;
+                } else {
+                    // Show override % for OVERRIDE_ACTIVE, days for other states
+                    const stateInfo = bodyState.state === BodyStateType.OVERRIDE_ACTIVE
+                        ? `Override ${bodyState.overridePercent || 100}%`
+                        : `Day ${bodyState.daysInState}`;
+                    output += `**State:** ${this.formatStateName(bodyState.state)} (${stateInfo})\n\n`;
+                    output += `---\n\n`;
+
+                    // Current State Section
+                    output += `## Current State\n\n`;
+                    output += `${STATE_DESCRIPTIONS[bodyState.state]}\n\n`;
+
+                    if (bodyState.contributingFactors && bodyState.contributingFactors.length > 0) {
+                        output += `**Contributing Factors:**\n`;
+                        bodyState.contributingFactors.forEach(factor => {
+                            output += `- ${factor}\n`;
+                        });
+                        output += `\n`;
+                    }
                 }
                 
                 if (bodyState.recommendedOverride) {
@@ -8678,9 +8693,22 @@
                         output += `**Carb-Adjusted Sensitivity:** ${sensitivity.toFixed(2)}\n`;
                         output += `  _${interpretation} (${changeStr})_\n`;
                         output += `  _Formula: Expected TDD for today's carbs ÷ Actual TDD_\n`;
+                    } else if (!hMeta.historyAvailable) {
+                        // v3.6.05 Part A (DEF-089). This branch previously claimed
+                        // "Insufficient history (needs 7+ days)" against 192 logged rows —
+                        // an affirmative false statement about the owner's data, made at
+                        // the moment the tool could not read that data at all.
+                        output += `**Carb-Adjusted Sensitivity:** **⚠️ UNAVAILABLE** — history could not be read (\`${hMeta.historyUnavailableReason || 'history_unavailable'}\`)\n`;
+                        output += `  _Not computed. Absent, not a normal-range reading, and not a statement about how much history exists._\n`;
                     } else {
-                        output += `**Carb-Adjusted Sensitivity:** _Insufficient history (needs 7+ days)_\n`;
-                        output += `  _Will calculate automatically once you have 3+ days logged_\n`;
+                        // The old copy carried TWO numbers and neither matched the code:
+                        // the gate is validEntries.length >= 3, and validEntries excludes
+                        // override days and requires both tdd24h and carbs24h. "7+ days"
+                        // had nothing behind it; "3+ days logged" overstated what counts.
+                        // A corrected number that is still wrong is the defect this build
+                        // closes, so the condition is stated rather than counted.
+                        output += `**Carb-Adjusted Sensitivity:** _Not calculated_\n`;
+                        output += `  _Requires at least three prior non-override sessions that logged both TDD and carbs._\n`;
                     }
                     output += `\n`;
                     output += `\n`;
@@ -8703,7 +8731,13 @@
                         // BUG-023: Show different message for signal fallback
                         if (isSignalFallback) {
                             output += `- Target: ${targetPct.toFixed(1)}% (using today's signal`;
-                            if (dynamicTarget?.hasGap) {
+                            // v3.6.05 Part A: this site degrades honestly and is the
+                            // template — but the conflation reached it too. "Insufficient
+                            // recent history" is a claim about how much history exists;
+                            // it must not be printed when none could be read.
+                            if (!hMeta.historyAvailable) {
+                                output += ` - ⚠️ HISTORY UNAVAILABLE, no historical target computed`;
+                            } else if (dynamicTarget?.hasGap) {
                                 output += ` - historical data has gap from override`;
                             } else if (dynamicTarget?.insufficientEntries) {
                                 output += ` - insufficient recent history`;
@@ -9049,18 +9083,33 @@
             },
             
             // SPEC 4: Format short "No Changes Needed" report
-            formatNoChangesReport(analysisResults, bodyState, bundles, agp7day, agp48h, dateStr) {
+            // v3.6.05 Part B: the fifth state-header site. Guarding four and leaving this
+            // one is the exact error this build exists to correct — and "No Changes
+            // Recommended / your parameters look well-tuned" is the most reassuring
+            // sentence in the tool, so it is the worst one to print on absent history.
+            formatNoChangesReport(analysisResults, bodyState, bundles, agp7day, agp48h, dateStr, historyMeta = null) {
+                const hAvail = historyMeta ? historyMeta.historyAvailable !== false : true;
                 let output = `# Daily Insulin Settings Review\n`;
                 output += `**Date:** ${dateStr}\n`;
-                
-                const stateInfo = bodyState.state === BodyStateType.OVERRIDE_ACTIVE
-                    ? `Override ${bodyState.overridePercent || 100}%`
-                    : `Day ${bodyState.daysInState}`;
-                output += `**State:** ${this.formatStateName(bodyState.state)} (${stateInfo})\n\n`;
-                output += `---\n\n`;
-                
-                output += `## ✓ No Changes Recommended\n\n`;
-                output += `Your parameters look well-tuned today.\n\n`;
+
+                if (!hAvail) {
+                    output += `**State:** ⚠️ UNDETERMINED — history unavailable\n\n`;
+                    output += `---\n\n`;
+                    output += `## ⚠️ No Changes Recommended — BUT HISTORY WAS UNAVAILABLE\n\n`;
+                    output += `Reason: \`${(historyMeta && historyMeta.historyUnavailableReason) || 'history_unavailable'}\`.\n\n`;
+                    output += `**This is not a clean session.** Body state, lockouts and recent-change ` +
+                        `context could not be read, so "no changes" reflects what the tool could not ` +
+                        `evaluate as much as what it found. Do not read this as reassurance.\n\n`;
+                } else {
+                    const stateInfo = bodyState.state === BodyStateType.OVERRIDE_ACTIVE
+                        ? `Override ${bodyState.overridePercent || 100}%`
+                        : `Day ${bodyState.daysInState}`;
+                    output += `**State:** ${this.formatStateName(bodyState.state)} (${stateInfo})\n\n`;
+                    output += `---\n\n`;
+
+                    output += `## ✓ No Changes Recommended\n\n`;
+                    output += `Your parameters look well-tuned today.\n\n`;
+                }
                 
                 // Metrics table
                 const tir = agp7day?.overall?.tir?.inRange || 0;
@@ -9150,7 +9199,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.04',
+                            version: '3.6.05',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9499,10 +9548,24 @@
                     .flatMap(e => parseVoidsTokens(e && e.decisionLog)
                         .map(t => ({ ...t, voidDate: gapLocalDateKey(e && e.date) })));
 
+                // v3.6.05 Part B: hoisted so both the available and unavailable state
+                // branches reference ONE expression. basalRatio is derived from the
+                // basal schedule, not from history, so it keeps its value under
+                // unavailability — the same "clean subset of evidence" principle that
+                // keeps eventsLast24h and compound-effect arithmetic intact.
+                const basalRatioBlock = analysisResults.basalRatioInfo ? {
+                    value: analysisResults.basalRatioInfo.ratio,
+                    cap: analysisResults.basalRatioInfo.cap,
+                    exceedsCap: analysisResults.basalRatioInfo.exceedsCap,
+                    maxRate: { value: analysisResults.basalRatioInfo.maxRate, hour: analysisResults.basalRatioInfo.maxHour },
+                    minRate: { value: analysisResults.basalRatioInfo.minRate, hour: analysisResults.basalRatioInfo.minHour },
+                    blockedRecommendations: bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio')).length
+                } : null;
+
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.04',
+                        version: '3.6.05',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9521,23 +9584,51 @@
                         },
                         // v3.5.95 (DEF-044): per-stage finding census. `lost` names any
                         // type@slot that entered a stage and did not leave it.
-                        pipelineCensus: RecommendationEngine.lastPipelineCensus || null,
+                        // v3.6.05 Part B: the per-stage counts are real — they record what
+                        // the pipeline did. stateFilterMode names the state that GOVERNED
+                        // the filter, and that state was derived from absent history.
+                        pipelineCensus: (() => {
+                            const pc = RecommendationEngine.lastPipelineCensus || null;
+                            if (!pc || hMeta.historyAvailable) return pc;
+                            return { ...pc, stateFilterMode: UNAVAILABLE('stateFilterMode') };
+                        })(),
                         // INSTR-5 Part D (DEF-048, DEF-043) — measurement only.
-                        stateFlipAudit: analysisResults?.stateFlipAudit || null
+                        // v3.6.05 Part A/B: flipHistory reads the logged rows directly and
+                        // returned a bare null. retentionCensus counts what the state filter
+                        // retained — and the state was computed from history that could not
+                        // be read, so `retainedCount: 0` when nothing was filtered is the
+                        // same lie as a zero confounded count against an empty ledger.
+                        stateFlipAudit: (() => {
+                            const sfa = analysisResults?.stateFlipAudit || null;
+                            if (!sfa || hMeta.historyAvailable) return sfa;
+                            return { ...sfa,
+                                flipHistory: UNAVAILABLE('flipHistory'),
+                                retentionCensus: UNAVAILABLE('retentionCensus') };
+                        })()
                     },
-                    state: {
+                    // v3.6.05 Part B (DEF-088, containment). StateDetector reads
+                    // changeHistory, tddHistory and sensitivityHistory. With none of them
+                    // readable it falls through every branch to the STABLE default and
+                    // reports "Normal operation. Full optimization enabled." in the same
+                    // document that declares historyAvailable: false. Nothing in the
+                    // v3.6.04 output reconciled those two statements, and the degraded run
+                    // consequently read as healthier than the healthy one.
+                    //
+                    // DECLARE, DO NOT COMPUTE: no mode, no day count, no posture.
+                    state: hMeta.historyAvailable ? {
                         mode: this.formatStateName(bodyState.state).toLowerCase(),
                         daysInState: bodyState.daysInState,
                         overridePercent: bodyState.overridePercent || null,
                         contributingFactors: bodyState.contributingFactors || [],
-                        basalRatio: analysisResults.basalRatioInfo ? {
-                            value: analysisResults.basalRatioInfo.ratio,
-                            cap: analysisResults.basalRatioInfo.cap,
-                            exceedsCap: analysisResults.basalRatioInfo.exceedsCap,
-                            maxRate: { value: analysisResults.basalRatioInfo.maxRate, hour: analysisResults.basalRatioInfo.maxHour },
-                            minRate: { value: analysisResults.basalRatioInfo.minRate, hour: analysisResults.basalRatioInfo.minHour },
-                            blockedRecommendations: bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio')).length
-                        } : null
+                        basalRatio: basalRatioBlock
+                    } : {
+                        available: false,
+                        reason: hMeta.historyUnavailableReason || 'history_unavailable',
+                        note: 'Body state is derived from change history, TDD history and ' +
+                              'sensitivity history. None were readable, so no mode, day count ' +
+                              'or optimization posture is reported. Recommendations in this ' +
+                              'session were gated by a state that could not be determined.',
+                        basalRatio: basalRatioBlock
                     },
                     actions: primaryBundles.map(b => {
                         const mapped = mapBundle(b);
@@ -9614,7 +9705,11 @@
                                  analysisResults.tdd24h < analysisResults.tdd2Week ? 'DOWN' : 'FLAT') : null
                         },
                         carbs24h: analysisResults.totalCarbs24h || null,
-                        carbAdjustedSensitivity: analysisResults.carbAdjSensitivity ? parseFloat(analysisResults.carbAdjSensitivity) : null,
+                        // v3.6.05 Part A (DEF-089): a null here reads as "computed, no
+                        // signal". When history is unreadable it was never computed.
+                        carbAdjustedSensitivity: analysisResults.carbAdjSensitivity
+                            ? parseFloat(analysisResults.carbAdjSensitivity)
+                            : (hMeta.historyAvailable ? null : UNAVAILABLE('carbAdjustedSensitivity')),
                         basalPercentOfTDD: {
                             current: analysisResults.signalAnalysis?.currentBasalPercent || null,
                             signal: analysisResults.signalAnalysis?.signalOnlyAnchor || null,
@@ -9724,15 +9819,28 @@
                 };
                 
                 // SPEC 3: Add delta comparison if yesterday data available
+                //
+                // v3.6.05 Part A (DEF-089). The v3.6.04 marker sat in the `catch` of a
+                // `try` that only runs when yesterdayEntry EXISTS. Absent history means
+                // no yesterdayEntry, so control never reached the guard — it was written
+                // for a path it could not be on. The marker belongs on the `else`.
+                //
+                // The `catch` keeps its own distinct reason: "delta could not be
+                // generated" and "there is no history to compare against" are different
+                // facts and must not share a marker.
+                //
+                // The `else` still yields null when history IS available and genuinely
+                // holds no prior session. A real first session must still read as one.
                 if (yesterdayEntry) {
                     try {
                         structured.delta = this.generateDeltaExport(bundles, yesterdayEntry, structured.signals);
                     } catch(e) {
                         console.warn('Delta export generation failed:', e);
-                        structured.delta = hMeta.historyAvailable ? null : UNAVAILABLE('delta');
+                        structured.delta = { unavailable: true, section: 'delta',
+                            reason: 'generation_failed: ' + ((e && e.message) || 'unknown') };
                     }
                 } else {
-                    structured.delta = null;
+                    structured.delta = hMeta.historyAvailable ? null : UNAVAILABLE('delta');
                 }
                 
                 return structured;
@@ -10965,7 +11073,23 @@
             },
             
             // SPEC 3: Generate Delta View - "What's Changed" section
-            generateDeltaSection(todayBundles, yesterdayEntry, todaySignals) {
+            //
+            // v3.6.05 Part A (DEF-089). This gate had no availability guard at all, so
+            // an unreadable history rendered as "First session" — the exact false
+            // reassurance DEF-086 exists to eliminate, printed by the run meant to
+            // prove it gone. Absence and emptiness were decided at the same branch.
+            //
+            // Both cases survive, and that distinction is the whole point: history
+            // unavailable says so; history available holding one session still says
+            // "first session", because that statement is then TRUE.
+            generateDeltaSection(todayBundles, yesterdayEntry, todaySignals, historyMeta = null) {
+                const hAvail = historyMeta ? historyMeta.historyAvailable !== false : true;
+                if (!hAvail) {
+                    return '## What\'s Changed\n\n**⚠️ UNAVAILABLE** — history could not be read (`' +
+                        ((historyMeta && historyMeta.historyUnavailableReason) || 'history_unavailable') +
+                        '`).\n\nNo comparison was performed. This is **absent, not a first session** — ' +
+                        'prior sessions may exist and could not be reached.\n\n---\n\n';
+                }
                 if (!yesterdayEntry) {
                     return '## What\'s Changed\n\n_First session — no comparison available._\n\n---\n\n';
                 }
@@ -13684,7 +13808,7 @@
                                 return parsed.signals || null;
                             } catch(e) { return null; }
                         })();
-                        deltaSection = OutputFormatter.generateDeltaSection(bundles, yesterdayEntry, todaySignals);
+                        deltaSection = OutputFormatter.generateDeltaSection(bundles, yesterdayEntry, todaySignals, historyMeta);
                         console.log('Delta section generated, length:', deltaSection.length);
                     } catch (deltaErr) {
                         console.error('Delta section generation failed:', deltaErr);
@@ -14139,7 +14263,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.04 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.6.05 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -14429,7 +14553,14 @@
                                                 </span>
                                                 {analysisResults.effectiveTargetSource === 'signal-fallback' && (
                                                     <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400">
-                                                        {dynamicTarget?.hasGap ? 'Gap Detected' : 'Insufficient History'}
+                                                        {/* v3.6.05 Part A: "Insufficient History" was the default for
+                                                            BOTH "we read the history and it was short" and "we never
+                                                            got an answer". A null dynamicTarget under signal-fallback
+                                                            means loadDynamicTarget failed outright — no plumbing
+                                                            needed to tell the two apart, only the branch. */}
+                                                        {dynamicTarget?.hasGap ? 'Gap Detected'
+                                                            : dynamicTarget?.insufficientEntries ? 'Insufficient History'
+                                                            : '⚠️ History Unavailable'}
                                                     </span>
                                                 )}
                                                 {dynamicTarget?.confidence && analysisResults.effectiveTargetSource !== 'signal-fallback' && (
