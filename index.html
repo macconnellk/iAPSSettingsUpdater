@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.01</title>
+    <title>Daily Insulin Settings Review v3.6.02</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2359,6 +2359,62 @@
             if (f.type === 'resistant_low') return 'external_or_basal';
             return f.primaryParameter || 'unattributed';
         };
+        // [EFFECT-LAG-START] v3.6.02 (DEF-076 Surfaces A and C). ONE implementation.
+        //
+        // A glucose nadir at time T was driven by insulin delivered in the block
+        // starting at approximately T − 60–90 min. The instructions have taught the
+        // reviewer to do this subtraction by hand for weeks, because the tool declines
+        // to do arithmetic it has every input for. This is that arithmetic.
+        //
+        // BASAL ONLY. CR and ISF act at meal and correction time with no absorption
+        // lag; they are correctly assigned today and must not move.
+        //
+        // The lag is a RANGE and no midpoint is elected. 60–90 min gives an effect
+        // window of [hour + 1, hour + 1.5]. Where that window sits inside one circadian
+        // period, use it. Where it crosses a boundary, report BOTH and elect neither —
+        // the same principle as v3.6.00's budget bounds and v3.6.01's ISF ranges:
+        // a figure that cannot be computed as a point must not serialise as one.
+        //
+        // Consumed by BOTH computeChangeEffectiveness (which period the ledger measures)
+        // and expectedBasalEffect (which ISF governs). Deriving the lag a second time is
+        // how this defect would acquire a fourth surface — pinned by T5.
+        const BASAL_EFFECT_LAG_MIN_H = 1.0;    // 60 min
+        const BASAL_EFFECT_LAG_MAX_H = 1.5;    // 90 min
+        const periodAtHour = (h) => {
+            const hh = ((h % 24) + 24) % 24;
+            return CIRCADIAN_PERIODS.find(p => hh >= p.startHour && hh < p.endHour) || null;
+        };
+        const basalEffectWindow = (scheduleTime) => {
+            if (scheduleTime == null) return null;
+            const hour = typeof scheduleTime === 'number'
+                ? scheduleTime
+                : parseInt(String(scheduleTime).split(':')[0], 10);
+            if (!isFinite(hour)) return null;
+            const minutes = typeof scheduleTime === 'number'
+                ? 0 : (parseInt(String(scheduleTime).split(':')[1], 10) || 0);
+            const startH = hour + minutes / 60 + BASAL_EFFECT_LAG_MIN_H;
+            const endH   = hour + minutes / 60 + BASAL_EFFECT_LAG_MAX_H;
+            // Sample the window at both ends and at every whole hour inside it, so a
+            // period narrower than the window cannot be skipped over.
+            const samples = [startH];
+            for (let h = Math.ceil(startH); h < endH; h++) samples.push(h);
+            samples.push(endH - 1e-9);   // half-open: the window ends before endH
+            const periods = [];
+            samples.forEach(h => {
+                const p = periodAtHour(h);
+                if (p && !periods.some(x => x.name === p.name)) periods.push(p);
+            });
+            return {
+                startHour: startH,
+                endHour: endH,
+                effectPeriods: periods.map(p => p.name),
+                effectPeriodObjects: periods,
+                schedulePeriod: periodAtHour(hour) ? periodAtHour(hour).name : null,
+                spansBoundary: periods.length > 1
+            };
+        };
+        // [EFFECT-LAG-END]
+
         // Bucket a non-PRIMARY generated bundle's status to the stable gate enum.
         // Precedence mirrors getBundleStatus (safety strings outrank staging).
         const gateCostBucket = (status, statusReason) => {
@@ -2425,15 +2481,28 @@
             const blockHours = ((next != null ? next : 1440) - start) / 60;
             if (!(blockHours > 0)) return {};
             const deltaU = (newValue - currentValue) * blockHours;   // signed U over the block
-            // Every ISF value in force across the block — not just the one at its start.
+            // v3.6.02 A3 (DEF-076 Surface C): resolve ISF at the EFFECT window, not the
+            // block's own clock hour. v3.6.01 resolved at the block hour because the spec
+            // said so — a third instance of this defect shipped while the first two sat
+            // registered. basal 08:00 reported governingISF 131 @07:00 and −6.6 mg/dL; the
+            // effect lands 09:00–09:30 where ISF is 207, so the true figure is ≈ −10.4 —
+            // a 1.6x understatement of the number this field exists to make trustworthy.
+            // Every other block sits near an ISF boundary and is benign, which is exactly
+            // why it would not have been noticed.
+            // The SAME lag helper as the ledger — deriving it again here is how this
+            // defect would get a fourth surface.
+            const win = basalEffectWindow(scheduleTime);
+            const effStart = win ? Math.round(win.startHour * 60) : start;
+            const effEnd   = win ? Math.round(win.endHour * 60) : (next != null ? next : 1440);
+            // Every ISF value in force across the EFFECT window — not just its first.
             const isfPoints = isfSchedule
                 .map(e => ({ min: toMin(e.time), value: e.value, time: e.time }))
                 .sort((a, b) => a.min - b.min);
-            const endMin = (next != null ? next : 1440);
-            const inBlock = isfPoints.filter(p => p.min >= start && p.min < endMin);
+            const endMin = effEnd;
+            const inBlock = isfPoints.filter(p => p.min >= effStart && p.min < endMin);
             let governing = isfPoints[0];
-            isfPoints.forEach(p => { if (p.min <= start) governing = p; });
-            const spanning = inBlock.filter(p => p.min > start);
+            isfPoints.forEach(p => { if (p.min <= effStart) governing = p; });
+            const spanning = inBlock.filter(p => p.min > effStart);
             const effectFor = (isf) => (isf > 0 ? parseFloat((deltaU * isf).toFixed(1)) : null);
             if (spanning.length > 0) {
                 const all = [governing, ...spanning];
@@ -2957,12 +3026,25 @@
                         if (Math.abs(vb - va) < LEDGER_EPS || Math.abs(va) < LEDGER_EPS) return;
                         const hour = parseInt(String(k).split(':')[0], 10);
                         const period = CIRCADIAN_PERIODS.find(p => hour >= p.startHour && hour < p.endHour);
+                        // v3.6.02 A2: basal effect is measured on the period the insulin
+                        // ACTS in, not the one its clock hour falls in. basal@07:00 was
+                        // scored against Dawn (7.33 → 9.5, reading as no effect) while its
+                        // effect peaks 08:00–08:30 in Morning, which moved +17 → −2 — the
+                        // ledger was measuring the wrong period and would have returned a
+                        // false NEUTRAL on a change that plainly worked.
+                        // schedulePeriod is retained under its own name so every
+                        // reassignment stays auditable against the pre-fix figures.
+                        const eff = param === 'basal' ? basalEffectWindow(k) : null;
+                        const effectPeriods = eff ? eff.effectPeriods : (period ? [period.name] : []);
                         changes.push({
                             sessionIndex: i,
                             date: sessions[i].date,
                             param, block: k,
                             oldValue: va, newValue: vb,
                             changePercent: (vb - va) / va * 100,
+                            schedulePeriod: period ? period.name : null,
+                            effectPeriods,
+                            spansPeriodBoundary: !!(eff && eff.spansBoundary),
                             // Direction inversion is load-bearing: for CR and ISF a
                             // numeric INCREASE delivers LESS insulin (weaken).
                             direction: param === 'basal'
@@ -3006,13 +3088,50 @@
                 // Windows. Post includes session i — the first day under the change.
                 const preRows = sessions.slice(Math.max(0, i - LEDGER_PRE), i);
                 const postRows = sessions.slice(i, i + LEDGER_POST);
-                const preDevs = preRows.map(s => ch.period ? s.dev(ch.period) : null).filter(v => v !== null);
-                const postDevs = postRows.map(s => ch.period ? s.dev(ch.period) : null).filter(v => v !== null);
-                const preLow = meanOf(preRows.map(s => ch.period ? s.low(ch.period) : null));
-                const postLow = meanOf(postRows.map(s => ch.period ? s.low(ch.period) : null));
+                // v3.6.02 A2: measure on the EFFECT period. For CR and ISF, effectPeriods
+                // is the clock period, so this is byte-identical to v3.6.01 for them.
+                const measurePeriods = (ch.effectPeriods && ch.effectPeriods.length)
+                    ? ch.effectPeriods
+                    : (ch.period ? [ch.period] : []);
+                const figuresFor = (periodName) => {
+                    const pd = preRows.map(s => periodName ? s.dev(periodName) : null).filter(v => v !== null);
+                    const qd = postRows.map(s => periodName ? s.dev(periodName) : null).filter(v => v !== null);
+                    return {
+                        period: periodName,
+                        preDevs: pd, postDevs: qd,
+                        preLow: meanOf(preRows.map(s => periodName ? s.low(periodName) : null)),
+                        postLow: meanOf(postRows.map(s => periodName ? s.low(periodName) : null)),
+                        preDeviation: meanOf(pd), postDeviation: meanOf(qd)
+                    };
+                };
+                // Two periods → the window is indeterminate. Report BOTH and elect
+                // neither, rather than choosing one and reporting it as authoritative.
+                if (measurePeriods.length > 1) {
+                    const byPeriod = measurePeriods.map(figuresFor);
+                    return {
+                        verdict: 'INDETERMINATE_WINDOW',
+                        schedulePeriod: ch.schedulePeriod || ch.period || null,
+                        effectPeriods: measurePeriods,
+                        byPeriod: byPeriod.map(f => ({
+                            period: f.period,
+                            preDeviation: f.preDeviation, postDeviation: f.postDeviation,
+                            preLowPct: f.preLow, postLowPct: f.postLow
+                        })),
+                        // Leading period's figures also surface flat, so any consumer that
+                        // reads preDeviation/postDeviation without knowing this verdict
+                        // still gets a number rather than undefined.
+                        preDeviation: byPeriod[0].preDeviation, postDeviation: byPeriod[0].postDeviation,
+                        preLowPct: byPeriod[0].preLow, postLowPct: byPeriod[0].postLow
+                    };
+                }
+                const f0 = figuresFor(measurePeriods[0] || null);
+                const preDevs = f0.preDevs, postDevs = f0.postDevs;
+                const preLow = f0.preLow, postLow = f0.postLow;
                 const metrics = {
-                    preDeviation: meanOf(preDevs), postDeviation: meanOf(postDevs),
-                    preLowPct: preLow, postLowPct: postLow
+                    preDeviation: f0.preDeviation, postDeviation: f0.postDeviation,
+                    preLowPct: preLow, postLowPct: postLow,
+                    schedulePeriod: ch.schedulePeriod || ch.period || null,
+                    effectPeriods: measurePeriods
                 };
                 // 4. PENDING — validity: ≥2 valid pre rows, all LEDGER_POST post rows valid
                 if (postEnd > sessions.length - 1 || preDevs.length < 2 || postDevs.length < LEDGER_POST) {
@@ -8949,7 +9068,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.01',
+                            version: '3.6.02',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9298,7 +9417,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.01',
+                        version: '3.6.02',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -10538,14 +10657,54 @@
                         // than documented: a key is added to a per-session Set before tallying,
                         // which makes freq[key] > rows.length unreachable by construction, and
                         // the assertion below fails loudly if that ever stops being true.
+                        // v3.6.02 Part B (DEF-083). Normalise key CONVENTIONS at read time.
+                        //
+                        // Two conventions coexist in the history: a lowercased display name
+                        // (older rows) and detector@slot (newer). v3.6.01's collision
+                        // renderer is what made this visible — it printed
+                        // `03:00 Correction Ineffectiveness [name:...]` at 10/14 beside
+                        // `[correction_ineffective@03:00]` at 3/14. One clinical item, 13 of
+                        // 14 sessions, reported as 10. It also explains v3.6.01's prediction
+                        // gap: the 28 was accumulating across BOTH key forms as well as
+                        // duplicating within sessions.
+                        //
+                        // Map name-form → detector-form only where UNAMBIGUOUS. Where a name
+                        // maps to more than one detector key, leave it unresolved and REPORT
+                        // it — a count that silently discards rows is the same defect class
+                        // as the one being fixed. Never merge by display name: names are the
+                        // ambiguous half, which is why the renderer exists.
+                        const buildKeyAliasMap = (rows, field) => {
+                            const nameToDetectorKeys = {};
+                            for (const e of rows) {
+                                const items = Array.isArray(e[field]) ? e[field] : [];
+                                for (const item of items) {
+                                    const k = persistenceKey(item);
+                                    if (k.startsWith('name:')) continue;
+                                    const n = 'name:' + normalizeItemName(item && item.name);
+                                    (nameToDetectorKeys[n] = nameToDetectorKeys[n] || new Set()).add(k);
+                                }
+                            }
+                            const alias = {}, ambiguous = [];
+                            Object.entries(nameToDetectorKeys).forEach(([n, set]) => {
+                                if (set.size === 1) alias[n] = [...set][0];
+                                else ambiguous.push({ nameKey: n, candidates: [...set] });
+                            });
+                            return { alias, ambiguous };
+                        };
                         const tally = (rows, field) => {
                             const freq = {}, weighted = {}, displayName = {}, distinctSessions = {};
+                            const { alias, ambiguous } = buildKeyAliasMap(rows, field);
+                            const unresolvedKeys = new Set();
+                            let rawItemCount = 0;
                             for (const e of rows) {
                                 const items = Array.isArray(e[field]) ? e[field] : [];
                                 const w = sessionRecencyWeight(gapLocalDateKey(e.date || e.timestamp || '') || '');
                                 const seenThisSession = new Set();
                                 for (const item of items) {
-                                    const key = persistenceKey(item);
+                                    rawItemCount++;
+                                    const rawKey = persistenceKey(item);
+                                    const key = alias[rawKey] || rawKey;
+                                    if (key.startsWith('name:')) unresolvedKeys.add(key);
                                     displayName[key] = item.name || key; // most recent variant wins
                                     if (seenThisSession.has(key)) continue;   // one session, one count
                                     seenThisSession.add(key);
@@ -10560,7 +10719,18 @@
                                     console.error(`[PERSIST-INVARIANT] ${k}: ${v} > ${rows.length} sessions — impossible`);
                                 }
                             });
-                            return { freq, weighted, displayName, distinctSessions };
+                            if (unresolvedKeys.size > 0) {
+                                console.log('[PERSIST-UNRESOLVED] name-form keys with no unambiguous ' +
+                                    'detector mapping (counted, not dropped): ' + [...unresolvedKeys].join(', '));
+                            }
+                            if (ambiguous.length > 0) {
+                                console.log('[PERSIST-AMBIGUOUS] ' + JSON.stringify(ambiguous));
+                            }
+                            return {
+                                freq, weighted, displayName, distinctSessions,
+                                unresolvedKeys: [...unresolvedKeys], ambiguousNames: ambiguous,
+                                rawItemCount
+                            };
                         };
                         // [PERSIST-TALLY-END]
                         const PERSIST_RAW_THRESHOLD = 3;
@@ -13848,7 +14018,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.01 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.6.02 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
