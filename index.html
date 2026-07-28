@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.03</title>
+    <title>Daily Insulin Settings Review v3.6.04</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -8279,7 +8279,9 @@
                 return Math.round((sub70 / total) * 1000) / 10;
             },
 
-            formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], cachedHistory = []) {
+            formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], cachedHistory = [], historyMeta = null) {
+                const hMeta = historyMeta || { historyAvailable: Array.isArray(cachedHistory) && cachedHistory.length > 0,
+                    historyUnavailableReason: 'not_supplied_by_caller' };
                 const now = new Date();
                 const dateStr = now.toLocaleDateString('en-US', { 
                     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' 
@@ -9104,7 +9106,19 @@
             },
             
             // Generate structured JSON export for Claude analysis
-            generateStructuredExport(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], yesterdayEntry = null, cachedHistory = []) {
+            generateStructuredExport(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], yesterdayEntry = null, cachedHistory = [], historyMeta = null) {
+                // v3.6.04 Part C: availability is derived from the RESOLVED source, never
+                // from the raw state — otherwise the flag reads false above a trend block
+                // showing 26 rows. Absent meta = legacy caller; infer conservatively.
+                const hMeta = historyMeta || { historyAvailable: Array.isArray(cachedHistory) && cachedHistory.length > 0,
+                    historyEntryCount: (cachedHistory || []).length,
+                    historyUnavailableReason: (Array.isArray(cachedHistory) && cachedHistory.length > 0) ? null : 'not_supplied_by_caller',
+                    historySource: null };
+                // An unavailable collection must not serialise as an empty one. Zeros beside
+                // an empty ledger read as "26 changes analysed, none confounded" — clinically
+                // meaningful and false. UNAVAILABLE is the value; null is not a value.
+                const UNAVAILABLE = (section) => ({ unavailable: true, section,
+                    reason: hMeta.historyUnavailableReason || 'history_unavailable' });
                 // Calculate AGP (same as formatForClaude)
                 const agp7day = analysisResults.nightscoutData?.glucose 
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7) 
@@ -9136,7 +9150,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.03',
+                            version: '3.6.04',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9168,9 +9182,12 @@
                         // 10-blocked / 0-actionable night IS a potential fast-path night.
                         gateCost: analysisResults?.gateCost || null,
                         shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
-                        oscillation: computeScheduleOscillation(cachedHistory),
-                        changeEffectiveness: computeChangeEffectiveness(cachedHistory),
-                        requirementGap: computeRequirementGap(cachedHistory),
+                        historyAvailable: hMeta.historyAvailable,
+                        historyEntryCount: hMeta.historyEntryCount ?? (cachedHistory || []).length,
+                        ...(hMeta.historyAvailable ? {} : { historyUnavailableReason: hMeta.historyUnavailableReason }),
+                        oscillation: hMeta.historyAvailable ? computeScheduleOscillation(cachedHistory) : UNAVAILABLE('oscillation'),
+                        changeEffectiveness: hMeta.historyAvailable ? computeChangeEffectiveness(cachedHistory) : UNAVAILABLE('changeEffectiveness'),
+                        requirementGap: hMeta.historyAvailable ? computeRequirementGap(cachedHistory) : UNAVAILABLE('requirementGap'),
                         currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus)
                     };
                 }
@@ -9485,7 +9502,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.03',
+                        version: '3.6.04',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9556,11 +9573,14 @@
                     gateCost: analysisResults?.gateCost || null,
                     shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
                     // INSTR-2: derived from history snapshots every run (auto-backfilling)
-                    oscillation: computeScheduleOscillation(cachedHistory),
+                    historyAvailable: hMeta.historyAvailable,
+                    historyEntryCount: hMeta.historyEntryCount ?? (cachedHistory || []).length,
+                    ...(hMeta.historyAvailable ? {} : { historyUnavailableReason: hMeta.historyUnavailableReason }),
+                    oscillation: hMeta.historyAvailable ? computeScheduleOscillation(cachedHistory) : UNAVAILABLE('oscillation'),
                     // INSTR-6: honest per-change verdicts, derived + auto-backfilling
-                    changeEffectiveness: computeChangeEffectiveness(cachedHistory),
+                    changeEffectiveness: hMeta.historyAvailable ? computeChangeEffectiveness(cachedHistory) : UNAVAILABLE('changeEffectiveness'),
                     // INSTR-4: dawn provision vs measured requirement, derived
-                    requirementGap: computeRequirementGap(cachedHistory),
+                    requirementGap: hMeta.historyAvailable ? computeRequirementGap(cachedHistory) : UNAVAILABLE('requirementGap'),
                     // v3.5.91: run-time IOB vs the pill — verification aid, no consumer
                     currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus),
                     informationalFindings: (analysisResults.findings || [])
@@ -9709,7 +9729,7 @@
                         structured.delta = this.generateDeltaExport(bundles, yesterdayEntry, structured.signals);
                     } catch(e) {
                         console.warn('Delta export generation failed:', e);
-                        structured.delta = null;
+                        structured.delta = hMeta.historyAvailable ? null : UNAVAILABLE('delta');
                     }
                 } else {
                     structured.delta = null;
@@ -13414,6 +13434,55 @@
             // Copy for Claude review
             const copyForClaudeReview = async () => {
                 console.log('=== copyForClaudeReview called ===');
+
+                // [HISTORY-RESOLVE-START] v3.6.04 Part B (DEF-086).
+                //
+                // HOIST THE FALLBACK, NOT THE VARIABLE. cachedSheetsEntries was null for
+                // the ENTIRE 10:34 invocation — consistently, at every site. The three
+                // consumers never disagreed about the variable; they disagreed about what
+                // to do when it was empty. generateTrendSection had an `else if` that
+                // refetched and won; formatForClaude and generateStructuredExport had no
+                // rescue and silently took []. The comment on that fallback read
+                // "shouldn't happen normally". It happened, and it was the only reason
+                // one consumer survived.
+                //
+                // Capturing the state into a local would have captured the same null —
+                // it would have passed the regression suite and changed nothing.
+                //
+                // History is now resolved ONCE, awaited, before any consumer runs. No
+                // retry, no polling, no timer: a timing patch on a timing-shaped bug is
+                // still a timing patch. Either it resolves or it is declared unavailable.
+                //
+                // A RESOLVED fetch returning zero rows is AVAILABLE with count 0. That is
+                // a different state from "we never got an answer", and the whole point of
+                // this build is that the two must not serialise identically.
+                let resolvedHistory = [];
+                let historyMeta = { historyAvailable: false, historyEntryCount: 0,
+                                    historyUnavailableReason: null, historySource: null };
+                if (Array.isArray(cachedSheetsEntries) && cachedSheetsEntries.length > 0) {
+                    resolvedHistory = cachedSheetsEntries;
+                    historyMeta = { historyAvailable: true, historyEntryCount: resolvedHistory.length,
+                                    historyUnavailableReason: null, historySource: 'state_cache' };
+                } else if (sheetsWebAppUrl) {
+                    try {
+                        const historyData = await jsonpFetch(`${sheetsWebAppUrl}?action=read&days=14`);
+                        if (historyData && historyData.success && Array.isArray(historyData.entries)) {
+                            resolvedHistory = historyData.entries;
+                            historyMeta = { historyAvailable: true, historyEntryCount: resolvedHistory.length,
+                                            historyUnavailableReason: null, historySource: 'fetch' };
+                        } else {
+                            historyMeta.historyUnavailableReason = 'fetch_returned_no_entries';
+                        }
+                    } catch (histErr) {
+                        historyMeta.historyUnavailableReason = 'fetch_failed: ' + histErr.message;
+                    }
+                } else {
+                    historyMeta.historyUnavailableReason = 'no_sheets_url_configured';
+                }
+                console.log('[HISTORY-RESOLVE]', JSON.stringify(historyMeta),
+                    '| state cache was', (Array.isArray(cachedSheetsEntries) && cachedSheetsEntries.length > 0)
+                        ? 'POPULATED' : 'COLD');
+                // [HISTORY-RESOLVE-END]
                 
                 if (!analysisResults) {
                     console.error('copyForClaudeReview: Missing analysisResults');
@@ -13450,13 +13519,14 @@
                         CONFIG,
                         dynamicTarget,
                         detectedChanges,
-                        cachedSheetsEntries || [] // Pass cached history for period TIR trends
+                        resolvedHistory, // v3.6.04: the resolved source, never the raw state
+                        historyMeta
                     );
                     
                     // SPEC 3: Extract yesterday's entry from cache for delta comparison
                     let yesterdayEntry = null;
-                    if (cachedSheetsEntries && cachedSheetsEntries.length > 0) {
-                        const sorted = [...cachedSheetsEntries].sort((a, b) => new Date(a.date) - new Date(b.date));
+                    if (resolvedHistory.length > 0) {
+                        const sorted = [...resolvedHistory].sort((a, b) => new Date(a.date) - new Date(b.date));
                         const todayStr = getLocalDateString(); // DQ-A FIX: was new Date().toISOString().split('T')[0] (UTC, diverges near midnight)
                         // Find most recent entry that is NOT from today
                         for (let i = sorted.length - 1; i >= 0; i--) {
@@ -13474,7 +13544,10 @@
                     try {
                         // Part C: consecutiveCrashAlert — attach to bundles before serialization.
                         // Scan history for slots with sub-60 lows in 2+ sessions.
-                        const historyForAlert = cachedSheetsEntries || [];
+                        // v3.6.04: consecutiveCrashAlert is a TIER-1 SAFETY FLAG and was
+                        // the fifth casualty — it silently went false on the 10:34 run, and
+                        // its absence is indistinguishable from "no consecutive crashes".
+                        const historyForAlert = resolvedHistory;
                         const slotSessionCount = {};
                         for (const entry of historyForAlert) {
                             const slots = Array.isArray(entry.safetyLowSlots) ? entry.safetyLowSlots : [];
@@ -13591,7 +13664,8 @@
                             dynamicTarget,
                             detectedChanges,
                             yesterdayEntry,
-                            cachedSheetsEntries || []
+                            resolvedHistory,
+                            historyMeta
                         );
                         structuredJSON = '# STRUCTURED DATA (for Claude analysis)\n\n```json\n' + 
                             JSON.stringify(structured, null, 2) + '\n```\n\n---\n\n';
@@ -13618,18 +13692,20 @@
                     }
                     
                     // SPEC 2: Build trend section from cached Sheets data (no async fetch needed)
+                    // v3.6.04 Part B: ONE path. The per-consumer `else if (sheetsWebAppUrl)
+                    // { await jsonpFetch(...) }` rescue that used to live here is deleted —
+                    // it was the only reason this section survived the 10:34 run while two
+                    // sibling consumers silently took []. History is resolved at the top of
+                    // this function now; every consumer reads the same collection.
                     let trendSection = '';
-                    if (cachedSheetsEntries && cachedSheetsEntries.length > 0) {
+                    if (historyMeta.historyAvailable && resolvedHistory.length > 0) {
                         try {
-                            // Filter to last 14 days from cached entries
                             const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
-                            const recentEntries = cachedSheetsEntries.filter(e => {
+                            const recentEntries = resolvedHistory.filter(e => {
                                 const d = new Date(e.date || e.timestamp);
                                 return d >= fourteenDaysAgo;
                             });
-                            console.log(`Trend section: Using ${recentEntries.length} cached entries (of ${cachedSheetsEntries.length} total)`);
-                            
-                            // Build current session data for comparison
+                            console.log(`Trend section: Using ${recentEntries.length} entries (of ${resolvedHistory.length} resolved)`);
                             const currentData = {
                                 primaryActions: (bundles || []).filter(b => b.priority === 'PRIMARY').map(b => ({
                                     name: b.name,
@@ -13644,41 +13720,18 @@
                                     status: getBundleStatus(b).status
                                 }))
                             };
-                            
-                            trendSection = OutputFormatter.generateTrendSection(recentEntries, currentData, cachedSheetsEntries || []);
+                            trendSection = OutputFormatter.generateTrendSection(recentEntries, currentData, resolvedHistory);
                         } catch (trendErr) {
-                            console.error('Trend section generation failed:', trendErr);
+                            console.error('Trend section failed:', trendErr);
                             trendSection = '# TREND CONTEXT\n\n_Error generating trend section_\n\n---\n\n';
                         }
-                    } else if (sheetsWebAppUrl) {
-                        // Fallback: fetch if no cache (shouldn't happen normally)
-                        try {
-                            console.log('Trend section: No cache, fetching via JSONP...');
-                            const historyData = await jsonpFetch(`${sheetsWebAppUrl}?action=read&days=14`);
-                            
-                            if (historyData.success && historyData.entries && historyData.entries.length > 0) {
-                                const currentData = {
-                                    primaryActions: (bundles || []).filter(b => b.priority === 'PRIMARY').map(b => ({
-                                        name: b.name,
-                                        detector: b.findings?.[0]?.type || null,
-                                        scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
-                                        timeBlock: b.timeBlock || 'General'
-                                    })),
-                                    watchItems: (bundles || []).filter(b => b.priority === 'REFERENCE').map(b => ({
-                                        name: b.name,
-                                        detector: b.findings?.[0]?.type || null,
-                                        scheduleTime: b.recommendations?.[0]?.scheduleTime || b.findings?.[0]?.scheduleTime || null,
-                                        status: getBundleStatus(b).status
-                                    }))
-                                };
-                                trendSection = OutputFormatter.generateTrendSection(historyData.entries, currentData, historyData.entries);
-                            }
-                        } catch (trendErr) {
-                            console.error('Trend history fetch failed (continuing without trends):', trendErr);
-                            trendSection = '# TREND CONTEXT\n\n_Failed to fetch history: ' + trendErr.message + '_\n\n---\n\n';
-                        }
                     } else {
-                        trendSection = '# TREND CONTEXT\n\n_No Google Sheets URL configured. Configure Sheets URL to enable trend tracking._\n\n---\n\n';
+                        // An unavailable history is DECLARED, never rendered as an empty one.
+                        trendSection = '# TREND CONTEXT\n\n**⚠️ HISTORY UNAVAILABLE** — reason: `' +
+                            (historyMeta.historyUnavailableReason || 'unknown') + '`.\n\n' +
+                            'The change-effectiveness ledger, oscillation, requirement-gap, ' +
+                            'delta and consecutive-crash sections are **absent, not empty**. ' +
+                            'Nothing about change effectiveness may be concluded from this session.\n\n---\n\n';
                     }
                     
                     // SPEC 3: Inject delta section between Current State and Tonight's Action
@@ -14086,7 +14139,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.03 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.6.04 — State-Aware Recommendations</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
