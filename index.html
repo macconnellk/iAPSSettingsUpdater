@@ -508,9 +508,55 @@
         
         const StateDetector = {
             detect(signalAnalysis, tddHistory, changeHistory, userOverride = null, carbAdjSensitivity = null, sensitivityHistory = null) {
+                // [STATE-PROBE-START] DEF-088 MEASUREMENT ONLY — v3.6.06-probe.
+                // Every argument by name, plus the derived values each branch tests.
+                // Comes out again; nothing here is consumed by any gate.
+                try {
+                    const _p = signalAnalysis && signalAnalysis.periods ? signalAnalysis.periods : [];
+                    const _sig = _p.filter(x => x.hasSufficientData);
+                    const _dir = _sig.map(x => x.medianDeviation > 10 ? 'HIGH'
+                        : x.medianDeviation < -10 ? 'LOW' : 'NEUTRAL');
+                    console.log('[STATE-PROBE] args', JSON.stringify({
+                        signalAnalysis_periods: _p.map(x => ({
+                            name: x.name, medianDeviation: x.medianDeviation, signal: x.signal,
+                            hasSufficientData: x.hasSufficientData,
+                            cleanWindows: x.cleanWindows, effectiveWindowCount: x.effectiveWindowCount,
+                            populationSplitApplied: !!(x.populationSplit && x.populationSplit.applied)
+                        })),
+                        tddHistory: tddHistory === null ? 'null(literal)' : typeof tddHistory,
+                        changeHistory_changes: (changeHistory && changeHistory.changes || []).map(c => ({
+                            id: c.id, date: c.date, timestamp: c.timestamp, source: c.source,
+                            param: c.param, scheduleTime: c.scheduleTime, outcome: c.outcome
+                        })),
+                        changeHistory_overrides: (changeHistory && changeHistory.overrides || []).length,
+                        userOverride: userOverride ? { active: userOverride.active, percent: userOverride.percent,
+                            startDate: userOverride.startDate, endDate: userOverride.endDate } : null,
+                        carbAdjSensitivity: carbAdjSensitivity,
+                        sensitivityHistory: sensitivityHistory === null ? 'null'
+                            : (Array.isArray(sensitivityHistory) ? sensitivityHistory.length : typeof sensitivityHistory)
+                    }));
+                    console.log('[STATE-PROBE] derived', JSON.stringify({
+                        CONFIG_recoveryDays: CONFIG.recoveryDays,
+                        getRecentChanges: ChangeTracker.getRecentChanges(CONFIG.recoveryDays)
+                            .map(c => ({ date: c.date, source: c.source, param: c.param, scheduleTime: c.scheduleTime })),
+                        getRecentChanges_length: ChangeTracker.getRecentChanges(CONFIG.recoveryDays).length,
+                        checkRecentOverrideEnd: this.checkRecentOverrideEnd(changeHistory),
+                        signals_length: _sig.length,
+                        HIGH: _dir.filter(d => d === 'HIGH').length,
+                        LOW: _dir.filter(d => d === 'LOW').length,
+                        NEUTRAL: _dir.filter(d => d === 'NEUTRAL').length,
+                        tddVelocity: this.calculateTDDVelocity(tddHistory)
+                    }));
+                    console.log('[STATE-PROBE] store@detect-entry',
+                        (localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL').length,
+                        'chars |', localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL');
+                } catch (probeErr) { console.log('[STATE-PROBE] THREW', probeErr && probeErr.message); }
+                // [STATE-PROBE-END]
+
                 // Check for user-declared override first
                 if (userOverride && userOverride.active) {
                     return {
+                        __probeBranch: '1-user-override',
                         state: BodyStateType.OVERRIDE_ACTIVE,
                         confidence: 1.0,
                         daysInState: this.calculateOverrideDays(userOverride),
@@ -519,11 +565,12 @@
                         recommendedOverride: null
                     };
                 }
-                
+
                 // Check for recent override removal (recovery)
                 const recentOverrideEnd = this.checkRecentOverrideEnd(changeHistory);
                 if (recentOverrideEnd) {
                     return {
+                        __probeBranch: '2-recent-override-end',
                         state: BodyStateType.RECOVERY,
                         confidence: 0.9,
                         daysInState: recentOverrideEnd.daysSince,
@@ -531,11 +578,12 @@
                         recommendedOverride: null
                     };
                 }
-                
+
                 // Check for many recent changes (recovery)
                 const recentChanges = ChangeTracker.getRecentChanges(CONFIG.recoveryDays);
                 if (recentChanges.length >= 3) {
                     return {
+                        __probeBranch: '3-recent-changes',
                         state: BodyStateType.RECOVERY,
                         confidence: 0.85,
                         daysInState: 1,
@@ -554,6 +602,7 @@
                     const priorSensitivity = sortedHistory.length > 0 ? parseFloat(sortedHistory[0].carbAdjSensitivity) : null;
                     if (priorSensitivity !== null && priorSensitivity >= 1.10) {
                         return {
+                            __probeBranch: '4-sustained-sensitivity',
                             state: BodyStateType.TRANSIENT_SENSITIVITY,
                             confidence: 0.85,
                             daysInState: 2,
@@ -588,6 +637,7 @@
                             highCount > lowCount &&
                             tddVelocity > CONFIG.transientTDDVelocity) {
                             return {
+                                __probeBranch: '5-transient-resistance',
                                 state: BodyStateType.TRANSIENT_RESISTANCE,
                                 confidence: Math.min(directionConsistency, 0.95),
                                 daysInState: this.estimateTransientDays(tddHistory, 'resistance'),
@@ -604,6 +654,7 @@
                             lowCount > highCount &&
                             tddVelocity < -CONFIG.transientTDDVelocity) {
                             return {
+                                __probeBranch: '6-transient-sensitivity-velocity',
                                 state: BodyStateType.TRANSIENT_SENSITIVITY,
                                 confidence: Math.min(directionConsistency, 0.95),
                                 daysInState: this.estimateTransientDays(tddHistory, 'sensitivity'),
@@ -618,6 +669,7 @@
                         // High variability (conflicting signals)
                         if (highCount >= 2 && lowCount >= 2) {
                             return {
+                                __probeBranch: '7-high-variability',
                                 state: BodyStateType.HIGH_VARIABILITY,
                                 confidence: 0.8,
                                 daysInState: 1,
@@ -633,6 +685,7 @@
                 
                 // Default to stable
                 return {
+                    __probeBranch: '8-default-stable',
                     state: BodyStateType.STABLE,
                     confidence: 0.9,
                     daysInState: this.estimateStableDays(changeHistory),
@@ -9200,6 +9253,9 @@
                     return {
                         meta: {
                             version: '3.6.05',
+                        // DEF-088 probe build: behaviour is v3.6.05 exactly; only
+                        // [STATE-PROBE] logging was added. 3.6.06 stays unconsumed.
+                        probeBuild: 'DEF-088-state-detector-inputs — INSTRUMENTATION, NOT A RELEASE',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9566,6 +9622,9 @@
                 const structured = {
                     meta: {
                         version: '3.6.05',
+                        // DEF-088 probe build: behaviour is v3.6.05 exactly; only
+                        // [STATE-PROBE] logging was added. 3.6.06 stays unconsumed.
+                        probeBuild: 'DEF-088-state-detector-inputs — INSTRUMENTATION, NOT A RELEASE',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12254,6 +12313,11 @@
                 setTargetLoadError(null);
                 
                 try {
+                    // [STATE-PROBE] DEF-088: run-entry store snapshot. The premise under
+                    // test is that localStorage was static across runs — verified, not assumed.
+                    console.log('[STATE-PROBE] store@run-entry',
+                        (localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL').length,
+                        'chars |', localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL');
                     // Load dynamic basal target from history (BUG-018)
                     console.log('Loading dynamic target...');
                     let effectiveBasalTarget = basalTDDPercent;
@@ -13009,6 +13073,30 @@
                         carbAdjSensitivity || null,
                         sensitivityHistoryLocal
                     );
+                    // [STATE-PROBE-RESULT-START] DEF-088 MEASUREMENT ONLY — v3.6.06-probe.
+                    // The three fetches the block reaches, logged beside the outcome so a
+                    // healthy/blocked diff shows which input moved, not just that one did.
+                    console.log('[STATE-PROBE-RESULT]', JSON.stringify({
+                        branch: detectedState.__probeBranch,
+                        state: detectedState.state,
+                        daysInState: detectedState.daysInState,
+                        contributingFactors: detectedState.contributingFactors,
+                        fetch_dynamicTarget_365: dynamicResult === null ? 'null(threw or none)'
+                            : { value: dynamicResult.value, noRecentData: !!dynamicResult.noRecentData,
+                                insufficientEntries: !!dynamicResult.insufficientEntries,
+                                hasGap: !!dynamicResult.hasGap, daysOfData: dynamicResult.daysOfData,
+                                totalDaysAvailable: dynamicResult.totalDaysAvailable },
+                        fetch_yesterdaySchedule: yesterdayScheduleResult === null ? 'null'
+                            : { date: yesterdayScheduleResult.date },
+                        fetch_carbAdj_14: sensitivityHistoryLocal === null ? 'null'
+                            : (Array.isArray(sensitivityHistoryLocal) ? sensitivityHistoryLocal.length : typeof sensitivityHistoryLocal),
+                        carbAdjSensitivity: carbAdjSensitivity,
+                        effectiveTargetSource: effectiveTargetSource,
+                        detectedChanges_thisRun: pendingDetectedChanges.length
+                    }));
+                    console.log('[STATE-PROBE] store@detect-exit',
+                        (localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL').length, 'chars');
+                    // [STATE-PROBE-RESULT-END]
                     
                     // Spec 2A / v3.5.68: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
