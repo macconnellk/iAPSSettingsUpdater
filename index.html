@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.05</title>
+    <title>Daily Insulin Settings Review v3.6.06</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -285,17 +285,6 @@
                 try {
                     const stored = localStorage.getItem(this.STORAGE_KEY);
                     const history = stored ? JSON.parse(stored) : { changes: [], overrides: [] };
-                    // INSTR-6 migration: auto_detected entries were stamped EFFECTIVE at
-                    // birth with no assessment. Rewrite to APPLIED. Idempotent — once no
-                    // matches remain, this never writes again.
-                    let migrated = 0;
-                    (history.changes || []).forEach(c => {
-                        if (c.source === 'auto_detected' && c.outcome === OutcomeType.EFFECTIVE) {
-                            c.outcome = OutcomeType.APPLIED;
-                            migrated++;
-                        }
-                    });
-                    if (migrated > 0) this.saveHistory(history);
                     return history;
                 } catch (e) {
                     console.error('Failed to load change history:', e);
@@ -311,51 +300,6 @@
                 }
             },
             
-            logChange(change) {
-                const history = this.getHistory();
-                const newChange = {
-                    id: `change_${Date.now()}`,
-                    date: getLocalDateString(),
-                    timestamp: new Date().toISOString(),
-                    ...change,
-                    outcome: OutcomeType.PENDING,
-                    outcomeDate: null,
-                    outcomeNotes: null
-                };
-                history.changes.push(newChange);
-                this.saveHistory(history);
-                return newChange;
-            },
-
-            // Register a change detected by schedule comparison (not manually queued).
-            // Stamps APPLIED — the pump has the new value; that is ALL this verified.
-            // Effectiveness verdicts come from the change-effectiveness ledger
-            // (INSTR-6), never stamped at birth. Deduplicates: skips if an
-            // auto_detected entry for this slot already exists with today's date.
-            registerAutoDetected(change) {
-                const today = getLocalDateString();
-                const existing = this.getChangesForSlot(change.param, change.scheduleTime);
-                const alreadyToday = existing.some(
-                    e => e.source === 'auto_detected' && e.date === today
-                );
-                if (alreadyToday) return null;
-
-                const history = this.getHistory();
-                const newChange = {
-                    id: `change_auto_${Date.now()}`,
-                    date: today,
-                    timestamp: new Date().toISOString(),
-                    source: 'auto_detected',
-                    outcome: OutcomeType.APPLIED,
-                    outcomeDate: null,
-                    outcomeNotes: null,
-                    ...change
-                };
-                history.changes.push(newChange);
-                this.saveHistory(history);
-                return newChange;
-            },
-            
             logOverride(override) {
                 const history = this.getHistory();
                 const newOverride = {
@@ -367,31 +311,6 @@
                 history.overrides.push(newOverride);
                 this.saveHistory(history);
                 return newOverride;
-            },
-            
-            logOutcome(changeId, outcome, notes = null) {
-                const history = this.getHistory();
-                const change = history.changes.find(c => c.id === changeId);
-                if (change) {
-                    change.outcome = outcome;
-                    change.outcomeDate = getLocalDateString();
-                    change.outcomeNotes = notes;
-                    this.saveHistory(history);
-                }
-            },
-            
-            getRecentChanges(days = 7) {
-                const history = this.getHistory();
-                const cutoff = new Date();
-                cutoff.setDate(cutoff.getDate() - days);
-                return history.changes.filter(c => new Date(c.date) >= cutoff);
-            },
-            
-            getChangesForSlot(param, scheduleTime) {
-                const history = this.getHistory();
-                return history.changes.filter(c => 
-                    c.param === param && c.scheduleTime === scheduleTime
-                );
             },
             
             getActiveOverride() {
@@ -412,91 +331,16 @@
                 }
             },
             
-            daysSinceChange(param, scheduleTime) {
-                const changes = this.getChangesForSlot(param, scheduleTime);
-                if (changes.length === 0) return null;
-                
-                const lastChange = changes[changes.length - 1];
-                // Compare local calendar dates to avoid UTC-midnight off-by-one.
-                // lastChange.date is YYYY-MM-DD local; getLocalDateString() returns same format.
-                const todayStr = getLocalDateString();
-                const lastStr  = lastChange.date;
-                const today = new Date(todayStr + 'T00:00:00');
-                const last  = new Date(lastStr  + 'T00:00:00');
-                const diffTime = today - last;
-                return Math.floor(diffTime / (1000 * 60 * 60 * 24));
-            },
-            
-            getParameterVelocity(param, scheduleTime) {
-                const changes = this.getChangesForSlot(param, scheduleTime);
-                const lookback = CONFIG.oscillationLookbackDays;
-                const cutoff = new Date();
-                cutoff.setDate(cutoff.getDate() - lookback);
-                
-                const recentChanges = changes.filter(c => new Date(c.date) >= cutoff);
-                
-                if (recentChanges.length === 0) {
-                    return {
-                        param,
-                        scheduleTime,
-                        changesInPeriod: 0,
-                        netChangePercent: 0,
-                        consecutiveSameDirection: 0,
-                        oscillationDetected: false,
-                        history: []
-                    };
-                }
-                
-                // Calculate net change
-                const netChangePercent = recentChanges.reduce((sum, c) => sum + (c.changePercent || 0), 0);
-                
-                // Detect oscillation (direction changes)
-                let directionChanges = 0;
-                let consecutiveSameDirection = 1;
-                let lastDirection = null;
-                
-                for (const change of recentChanges) {
-                    const direction = (change.changePercent || 0) > 0 ? 'up' : 'down';
-                    if (lastDirection && direction !== lastDirection) {
-                        directionChanges++;
-                        consecutiveSameDirection = 1;
-                    } else if (lastDirection === direction) {
-                        consecutiveSameDirection++;
-                    }
-                    lastDirection = direction;
-                }
-                
-                // Oscillation = 2+ direction changes in 7 days
-                const weekCutoff = new Date();
-                weekCutoff.setDate(weekCutoff.getDate() - 7);
-                const weekChanges = recentChanges.filter(c => new Date(c.date) >= weekCutoff);
-                
-                let weekDirectionChanges = 0;
-                lastDirection = null;
-                for (const change of weekChanges) {
-                    const direction = (change.changePercent || 0) > 0 ? 'up' : 'down';
-                    if (lastDirection && direction !== lastDirection) {
-                        weekDirectionChanges++;
-                    }
-                    lastDirection = direction;
-                }
-                
-                return {
-                    param,
-                    scheduleTime,
-                    changesInPeriod: recentChanges.length,
-                    netChangePercent,
-                    consecutiveSameDirection,
-                    oscillationDetected: weekDirectionChanges >= 2,
-                    history: recentChanges.map(c => [c.date, c.newValue])
-                };
-            },
-            
-            detectOscillation(param, scheduleTime) {
-                const velocity = this.getParameterVelocity(param, scheduleTime);
-                return velocity.oscillationDetected;
-            },
-            
+            // v3.6.06 (DEF-094): daysSinceChange / getParameterVelocity /
+            // getChangesForSlot moved to ChangeRecord (Sheets-derived). They survived
+            // the first pass of this build with zero callers — the same superseded-but-
+            // live shape as yesterday_schedule and logOutcome. Structural test T1b
+            // caught them; the behavioural tests all passed with them still present.
+            //
+            // What remains here is OVERRIDE state only, which is device-local by
+            // necessity (Part D) — and clearHistory, which stays UNCALLED: the two
+            // partial stores are the only surviving record of what each device knew
+            // during the split period, and that is forensic evidence, not garbage.
             clearHistory() {
                 localStorage.removeItem(this.STORAGE_KEY);
             }
@@ -508,55 +352,10 @@
         
         const StateDetector = {
             detect(signalAnalysis, tddHistory, changeHistory, userOverride = null, carbAdjSensitivity = null, sensitivityHistory = null) {
-                // [STATE-PROBE-START] DEF-088 MEASUREMENT ONLY — v3.6.06-probe.
-                // Every argument by name, plus the derived values each branch tests.
-                // Comes out again; nothing here is consumed by any gate.
-                try {
-                    const _p = signalAnalysis && signalAnalysis.periods ? signalAnalysis.periods : [];
-                    const _sig = _p.filter(x => x.hasSufficientData);
-                    const _dir = _sig.map(x => x.medianDeviation > 10 ? 'HIGH'
-                        : x.medianDeviation < -10 ? 'LOW' : 'NEUTRAL');
-                    console.log('[STATE-PROBE] args', JSON.stringify({
-                        signalAnalysis_periods: _p.map(x => ({
-                            name: x.name, medianDeviation: x.medianDeviation, signal: x.signal,
-                            hasSufficientData: x.hasSufficientData,
-                            cleanWindows: x.cleanWindows, effectiveWindowCount: x.effectiveWindowCount,
-                            populationSplitApplied: !!(x.populationSplit && x.populationSplit.applied)
-                        })),
-                        tddHistory: tddHistory === null ? 'null(literal)' : typeof tddHistory,
-                        changeHistory_changes: (changeHistory && changeHistory.changes || []).map(c => ({
-                            id: c.id, date: c.date, timestamp: c.timestamp, source: c.source,
-                            param: c.param, scheduleTime: c.scheduleTime, outcome: c.outcome
-                        })),
-                        changeHistory_overrides: (changeHistory && changeHistory.overrides || []).length,
-                        userOverride: userOverride ? { active: userOverride.active, percent: userOverride.percent,
-                            startDate: userOverride.startDate, endDate: userOverride.endDate } : null,
-                        carbAdjSensitivity: carbAdjSensitivity,
-                        sensitivityHistory: sensitivityHistory === null ? 'null'
-                            : (Array.isArray(sensitivityHistory) ? sensitivityHistory.length : typeof sensitivityHistory)
-                    }));
-                    console.log('[STATE-PROBE] derived', JSON.stringify({
-                        CONFIG_recoveryDays: CONFIG.recoveryDays,
-                        getRecentChanges: ChangeTracker.getRecentChanges(CONFIG.recoveryDays)
-                            .map(c => ({ date: c.date, source: c.source, param: c.param, scheduleTime: c.scheduleTime })),
-                        getRecentChanges_length: ChangeTracker.getRecentChanges(CONFIG.recoveryDays).length,
-                        checkRecentOverrideEnd: this.checkRecentOverrideEnd(changeHistory),
-                        signals_length: _sig.length,
-                        HIGH: _dir.filter(d => d === 'HIGH').length,
-                        LOW: _dir.filter(d => d === 'LOW').length,
-                        NEUTRAL: _dir.filter(d => d === 'NEUTRAL').length,
-                        tddVelocity: this.calculateTDDVelocity(tddHistory)
-                    }));
-                    console.log('[STATE-PROBE] store@detect-entry',
-                        (localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL').length,
-                        'chars |', localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL');
-                } catch (probeErr) { console.log('[STATE-PROBE] THREW', probeErr && probeErr.message); }
-                // [STATE-PROBE-END]
 
                 // Check for user-declared override first
                 if (userOverride && userOverride.active) {
                     return {
-                        __probeBranch: '1-user-override',
                         state: BodyStateType.OVERRIDE_ACTIVE,
                         confidence: 1.0,
                         daysInState: this.calculateOverrideDays(userOverride),
@@ -570,7 +369,6 @@
                 const recentOverrideEnd = this.checkRecentOverrideEnd(changeHistory);
                 if (recentOverrideEnd) {
                     return {
-                        __probeBranch: '2-recent-override-end',
                         state: BodyStateType.RECOVERY,
                         confidence: 0.9,
                         daysInState: recentOverrideEnd.daysSince,
@@ -580,10 +378,10 @@
                 }
 
                 // Check for many recent changes (recovery)
-                const recentChanges = ChangeTracker.getRecentChanges(CONFIG.recoveryDays);
+                // v3.6.06 (DEF-094): Sheets-derived, not localStorage. Same test.
+                const recentChanges = ChangeRecord.getRecentChanges(CONFIG.recoveryDays);
                 if (recentChanges.length >= 3) {
                     return {
-                        __probeBranch: '3-recent-changes',
                         state: BodyStateType.RECOVERY,
                         confidence: 0.85,
                         daysInState: 1,
@@ -602,7 +400,6 @@
                     const priorSensitivity = sortedHistory.length > 0 ? parseFloat(sortedHistory[0].carbAdjSensitivity) : null;
                     if (priorSensitivity !== null && priorSensitivity >= 1.10) {
                         return {
-                            __probeBranch: '4-sustained-sensitivity',
                             state: BodyStateType.TRANSIENT_SENSITIVITY,
                             confidence: 0.85,
                             daysInState: 2,
@@ -637,7 +434,6 @@
                             highCount > lowCount &&
                             tddVelocity > CONFIG.transientTDDVelocity) {
                             return {
-                                __probeBranch: '5-transient-resistance',
                                 state: BodyStateType.TRANSIENT_RESISTANCE,
                                 confidence: Math.min(directionConsistency, 0.95),
                                 daysInState: this.estimateTransientDays(tddHistory, 'resistance'),
@@ -654,7 +450,6 @@
                             lowCount > highCount &&
                             tddVelocity < -CONFIG.transientTDDVelocity) {
                             return {
-                                __probeBranch: '6-transient-sensitivity-velocity',
                                 state: BodyStateType.TRANSIENT_SENSITIVITY,
                                 confidence: Math.min(directionConsistency, 0.95),
                                 daysInState: this.estimateTransientDays(tddHistory, 'sensitivity'),
@@ -669,7 +464,6 @@
                         // High variability (conflicting signals)
                         if (highCount >= 2 && lowCount >= 2) {
                             return {
-                                __probeBranch: '7-high-variability',
                                 state: BodyStateType.HIGH_VARIABILITY,
                                 confidence: 0.8,
                                 daysInState: 1,
@@ -685,7 +479,6 @@
                 
                 // Default to stable
                 return {
-                    __probeBranch: '8-default-stable',
                     state: BodyStateType.STABLE,
                     confidence: 0.9,
                     daysInState: this.estimateStableDays(changeHistory),
@@ -765,13 +558,8 @@
             },
             
             estimateStableDays(changeHistory) {
-                const recentChanges = ChangeTracker.getRecentChanges(30);
-                if (recentChanges.length === 0) return 30;
-                
-                const lastChange = recentChanges[recentChanges.length - 1];
-                const lastDate = new Date(lastChange.date);
-                const today = new Date();
-                return Math.floor((today - lastDate) / (1000 * 60 * 60 * 24));
+                // v3.6.06: delegates to the derived record (one date convention).
+                return ChangeRecord.estimateStableDays() ?? 30;
             }
         };
 
@@ -782,7 +570,7 @@
         const ProtectionSystem = {
             assignProtection(scheduleTime, param, period, findings, signalAnalysis) {
                 // Recent change lock
-                const daysSince = ChangeTracker.daysSinceChange(param, scheduleTime);
+                const daysSince = ChangeRecord.daysSinceChange(param, scheduleTime);
                 const lockoutDays = (param === 'cr' || param === 'isf')
                     ? CONFIG.bolusLockoutDays
                     : CONFIG.changeLockoutDays;
@@ -819,7 +607,7 @@
                 }
                 
                 // Oscillation protection
-                const oscillating = ChangeTracker.detectOscillation(param, scheduleTime);
+                const oscillating = ChangeRecord.detectOscillation(param, scheduleTime);
                 if (oscillating) {
                     return {
                         level: ProtectionLevel.CAUTION,
@@ -886,6 +674,22 @@
                 // Step 1: Filter findings based on state
                 let filteredFindings = this.filterByState(validFindings, bodyState);
                 pipelineCensus.afterStateFilter = censusOf(filteredFindings);
+
+                // [HISTORY-UNAVAILABLE-WITHHOLD] v3.6.06 Part C (DEF-094).
+                // With the change record derived from Sheets, "history unavailable" and
+                // "no change record" are the SAME condition — and it is known here,
+                // before findingToRecommendation runs. That is why this needed no second
+                // suppression path and no post-bundle mutation: it is the seventh reason
+                // in the v3.5.95 contract, reaching the one existing guard by the front
+                // door. Findings keep full evidence and severity; only the lever is held.
+                if (!ChangeRecord.available()) {
+                    const why = ChangeRecord.get().reason || 'history_unavailable';
+                    filteredFindings.forEach(f => {
+                        if (!f.recommendationWithheld) f.recommendationWithheld = 'history_unavailable';
+                    });
+                    console.log('[HISTORY-UNAVAILABLE-WITHHOLD]', filteredFindings.length,
+                        'finding(s) retained without a lever —', why);
+                }
                 pipelineCensus.stateFilterMode = bodyState.state;
 
                 // Step 2: Score findings
@@ -1367,7 +1171,7 @@
                 
                 // Stability factor - only apply if oscillation is truly detected
                 if (finding.scheduleTime && finding.primaryParameter) {
-                    const velocity = ChangeTracker.getParameterVelocity(
+                    const velocity = ChangeRecord.getParameterVelocity(
                         finding.primaryParameter, 
                         finding.scheduleTime
                     );
@@ -2859,6 +2663,211 @@
         };
         // [INSTR3-HELPERS-END]
 
+        // [SNAPSHOT-DIFF-START] v3.6.06 (DEF-094). ONE implementation of the question
+        // "what moved between two schedule snapshots". Three consumers: the
+        // change-effectiveness ledger, the oscillation walker, and the device-independent
+        // change record. Previously the first two carried near-identical private copies;
+        // a third copy for the gates would have been the paraphrase this register has
+        // now refused three times.
+        //
+        // The two callers differ ONLY in which key set they walk and whether they care
+        // about structural add/remove — both are options here, and both callers' outputs
+        // are byte-identical to their private versions (asserted by T10).
+        const SNAPSHOT_EPS = 1e-9;
+        const parseSnapshot = (v) => {
+            if (!v) return null;
+            if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { return null; } }
+            return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
+        };
+        // `unionKeys` — oscillation walks a ∪ b so it can tally add/remove as structural;
+        // the ledger walks b only, because a key that vanished has no post-value to score.
+        const diffScheduleSnapshot = (a, b, { unionKeys = false } = {}) => {
+            const out = { changes: [], structural: 0 };
+            if (!a || !b) return out;
+            const keys = unionKeys
+                ? new Set([...Object.keys(a), ...Object.keys(b)])
+                : new Set(Object.keys(b));
+            keys.forEach(k => {
+                const va = a[k], vb = b[k];
+                const hasA = typeof va === 'number' && isFinite(va);
+                const hasB = typeof vb === 'number' && isFinite(vb);
+                if (hasA !== hasB) { out.structural++; return; }
+                if (!hasA) return;
+                if (Math.abs(va) < SNAPSHOT_EPS) { out.structural++; return; } // div-zero guard
+                if (Math.abs(vb - va) < SNAPSHOT_EPS) return;                  // unchanged
+                out.changes.push({ block: k, oldValue: va, newValue: vb,
+                    changePercent: (vb - va) / va * 100 });
+            });
+            return out;
+        };
+        const SNAPSHOT_PARAMS = ['basal', 'cr', 'isf'];
+        // The live Nightscout profile arrives as [{time, value}]; snapshots are maps.
+        // Module scope deliberately — the React component's scheduleToObject is a local
+        // and is not reachable from the derivation.
+        const scheduleArrayToMap = (scheduleArray) => {
+            if (!Array.isArray(scheduleArray)) return null;
+            const obj = {};
+            scheduleArray.forEach(e => { if (e && e.time != null) obj[e.time] = e.value; });
+            return obj;
+        };
+        // [SNAPSHOT-DIFF-END]
+
+        // [CHANGE-RECORD-START] v3.6.06 (DEF-094). The change record is DERIVED FROM
+        // SHEETS, not from localStorage.
+        //
+        // Every safety gate used to read ChangeTracker, which is localStorage, which is
+        // per-browser and per-device. Measured Jul 29: identical Nightscout data and
+        // identical Sheets history produced `recovery / Day 1` with 10 findings in one
+        // browser and `stable / Day 30` with 18 findings in another, three minutes apart,
+        // because one profile's store held 8041 chars of change history and the other's
+        // held nothing. The ungated run looked MORE actionable. Nothing declared it.
+        //
+        // Same-day changes: the logged snapshots end at yesterday on the first run of a
+        // day (the read precedes the auto-log write), so the logged diff alone cannot see
+        // a change applied this morning. The overlay closes that — and it is device
+        // INDEPENDENT, because it compares the live Nightscout profile against the last
+        // logged Sheets row. Both inputs are server-side. A change applied on the phone
+        // is visible to a desktop rerun minutes later.
+        //
+        // Known blind spot, unchanged from the previous design: a change applied and
+        // reverted the same day, before any log, nets to zero.
+        //
+        // DATE CONVENTION, stated once: every date here is a LOCAL calendar day string
+        // (YYYY-MM-DD) compared via `new Date(s + 'T00:00:00')`. `new Date("2026-07-27")`
+        // parses as UTC midnight and was being compared against local-time cutoffs in
+        // getRecentChanges and getParameterVelocity — the DEF-093 class, in the code this
+        // replaces. It is not carried forward.
+        const localDayStart = (dateLike) => {
+            if (!dateLike) return null;
+            const s = String(dateLike);
+            const ymd = /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10)
+                : (isNaN(new Date(s)) ? null : getLocalDateString(new Date(s)));
+            return ymd ? new Date(ymd + 'T00:00:00') : null;
+        };
+        const deriveChangeRecord = (historyRows, liveSchedules, historyMeta) => {
+            if (!historyMeta || historyMeta.historyAvailable !== true) {
+                return { available: false,
+                    reason: (historyMeta && historyMeta.historyUnavailableReason) || 'history_unavailable',
+                    changes: [], loggedThrough: null, overlayApplied: false };
+            }
+            const rows = (Array.isArray(historyRows) ? historyRows : [])
+                .filter(e => e && e.date)
+                .sort((a, b) => new Date(a.date) - new Date(b.date))
+                .map(e => ({ date: e.date, scheds: {
+                    basal: parseSnapshot(e.basalSchedule),
+                    cr: parseSnapshot(e.crSchedule),
+                    isf: parseSnapshot(e.isfSchedule) } }));
+            const changes = [];
+            for (let i = 1; i < rows.length; i++) {
+                SNAPSHOT_PARAMS.forEach(param => {
+                    diffScheduleSnapshot(rows[i - 1].scheds[param], rows[i].scheds[param])
+                        .changes.forEach(c => changes.push({
+                            param, scheduleTime: c.block,
+                            oldValue: c.oldValue, newValue: c.newValue,
+                            changePercent: c.changePercent,
+                            date: getLocalDateString(new Date(rows[i].date)),
+                            origin: 'logged'
+                        }));
+                });
+            }
+            // Same-day overlay: live profile vs the most recent logged snapshot.
+            let overlayApplied = false;
+            const latest = rows.length ? rows[rows.length - 1] : null;
+            const today = getLocalDateString();
+            if (latest && liveSchedules) {
+                const live = {
+                    basal: scheduleArrayToMap(liveSchedules.basal),
+                    cr: scheduleArrayToMap(liveSchedules.cr),
+                    isf: scheduleArrayToMap(liveSchedules.isf)
+                };
+                SNAPSHOT_PARAMS.forEach(param => {
+                    diffScheduleSnapshot(latest.scheds[param], live[param])
+                        .changes.forEach(c => {
+                            overlayApplied = true;
+                            changes.push({
+                                param, scheduleTime: c.block,
+                                oldValue: c.oldValue, newValue: c.newValue,
+                                changePercent: c.changePercent,
+                                date: today, origin: 'overlay'
+                            });
+                        });
+                });
+            }
+            return { available: true, reason: null, changes,
+                loggedThrough: latest ? latest.date : null, overlayApplied };
+        };
+        // Gate-facing accessors. Same names and shapes the ChangeTracker versions had, so
+        // every consumer changes its SOURCE and not its logic.
+        const ChangeRecord = {
+            _rec: { available: false, reason: 'not_resolved', changes: [] },
+            set(rec) { this._rec = rec || { available: false, reason: 'not_resolved', changes: [] }; },
+            get() { return this._rec; },
+            available() { return this._rec.available === true; },
+            getRecentChanges(days) {
+                if (!this.available()) return [];
+                const cutoff = new Date();
+                cutoff.setDate(cutoff.getDate() - days);
+                cutoff.setHours(0, 0, 0, 0);
+                return this._rec.changes.filter(c => {
+                    const d = localDayStart(c.date);
+                    return d && d >= cutoff;
+                });
+            },
+            getChangesForSlot(param, scheduleTime) {
+                if (!this.available()) return [];
+                return this._rec.changes.filter(c => c.param === param && c.scheduleTime === scheduleTime);
+            },
+            daysSinceChange(param, scheduleTime) {
+                if (!this.available()) return null;
+                const changes = this.getChangesForSlot(param, scheduleTime);
+                if (changes.length === 0) return null;
+                const last = changes[changes.length - 1];
+                const lastD = localDayStart(last.date);
+                const todayD = localDayStart(getLocalDateString());
+                if (!lastD || !todayD) return null;
+                return Math.floor((todayD - lastD) / (1000 * 60 * 60 * 24));
+            },
+            getParameterVelocity(param, scheduleTime) {
+                const empty = { param, scheduleTime, changesInPeriod: 0, netChangePercent: 0,
+                    consecutiveSameDirection: 0, oscillationDetected: false, history: [] };
+                if (!this.available()) return empty;
+                const cutoff = new Date();
+                cutoff.setDate(cutoff.getDate() - CONFIG.oscillationLookbackDays);
+                cutoff.setHours(0, 0, 0, 0);
+                const recent = this.getChangesForSlot(param, scheduleTime)
+                    .filter(c => { const d = localDayStart(c.date); return d && d >= cutoff; });
+                if (recent.length === 0) return empty;
+                const netChangePercent = recent.reduce((s, c) => s + (c.changePercent || 0), 0);
+                let consecutive = 1, maxRun = 1;
+                for (let i = 1; i < recent.length; i++) {
+                    const prev = Math.sign(recent[i - 1].changePercent || 0);
+                    const cur = Math.sign(recent[i].changePercent || 0);
+                    if (cur !== 0 && cur === prev) { consecutive++; maxRun = Math.max(maxRun, consecutive); }
+                    else consecutive = 1;
+                }
+                const signs = recent.map(c => Math.sign(c.changePercent || 0)).filter(Boolean);
+                const reversals = signs.reduce((n, s, i) => n + (i > 0 && s !== signs[i - 1] ? 1 : 0), 0);
+                return { param, scheduleTime, changesInPeriod: recent.length, netChangePercent,
+                    consecutiveSameDirection: maxRun,
+                    oscillationDetected: reversals > 0 && Math.abs(netChangePercent) < 5,
+                    history: recent };
+            },
+            detectOscillation(param, scheduleTime) {
+                return this.getParameterVelocity(param, scheduleTime).oscillationDetected;
+            },
+            estimateStableDays() {
+                if (!this.available()) return null;
+                const recent = this.getRecentChanges(30);
+                if (recent.length === 0) return 30;
+                const last = recent[recent.length - 1];
+                const lastD = localDayStart(last.date);
+                const todayD = localDayStart(getLocalDateString());
+                if (!lastD || !todayD) return 30;
+                return Math.floor((todayD - lastD) / (1000 * 60 * 60 * 24));
+            }
+        };
+        // [CHANGE-RECORD-END]
+
         // [INSTR2-OSC-START] INSTR-2b: Schedule Oscillation Index, percent basis.
         // Pure derived trend over the stored basal/cr/isf snapshots — no detector,
         // no gating, no schedule mutation, no stored column. Path efficiency per
@@ -2901,21 +2910,13 @@
             for (let i = 1; i < sessions.length; i++) {
                 const deltas = [];
                 let structural = 0;
+                // v3.6.06: the key walk moved to the shared primitive. unionKeys:true
+                // preserves this walker's add/remove structural tally exactly.
                 OSC_PARAMS.forEach(param => {
-                    const a = sessions[i - 1].scheds[param];
-                    const b = sessions[i].scheds[param];
-                    if (!a || !b) return;
-                    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-                    keys.forEach(k => {
-                        const va = a[k], vb = b[k];
-                        const hasA = typeof va === 'number' && isFinite(va);
-                        const hasB = typeof vb === 'number' && isFinite(vb);
-                        if (hasA !== hasB) { structural++; return; }
-                        if (!hasA) return;
-                        if (Math.abs(va) < OSC_EPS) { structural++; return; } // div-zero guard
-                        const pct = (vb - va) / va * 100;
-                        if (Math.abs(pct) >= OSC_EPS) deltas.push({ param, block: k, delta: pct });
-                    });
+                    const d = diffScheduleSnapshot(sessions[i - 1].scheds[param],
+                                                   sessions[i].scheds[param], { unionKeys: true });
+                    structural += d.structural;
+                    d.changes.forEach(c => deltas.push({ param, block: c.block, delta: c.changePercent }));
                 });
                 pairDeltas.push(deltas);
                 pairStructural.push(structural);
@@ -3069,14 +3070,13 @@
             // Change extraction: consecutive-snapshot diffs, keys numeric in both.
             const changes = [];
             for (let i = 1; i < sessions.length; i++) {
-                ['basal', 'cr', 'isf'].forEach(param => {
-                    const a = sessions[i - 1].scheds[param];
-                    const b = sessions[i].scheds[param];
-                    if (!a || !b) return;
-                    Object.keys(b).forEach(k => {
-                        const va = a[k], vb = b[k];
-                        if (typeof va !== 'number' || !isFinite(va) || typeof vb !== 'number' || !isFinite(vb)) return;
-                        if (Math.abs(vb - va) < LEDGER_EPS || Math.abs(va) < LEDGER_EPS) return;
+                // v3.6.06: the key walk moved to the shared primitive. Default (b-only)
+                // key set preserves this walker's behaviour — a key that vanished has no
+                // post-value to score. `structural` is not consumed here.
+                SNAPSHOT_PARAMS.forEach(param => {
+                    diffScheduleSnapshot(sessions[i - 1].scheds[param],
+                                         sessions[i].scheds[param]).changes.forEach(chg => {
+                        const k = chg.block, va = chg.oldValue, vb = chg.newValue;
                         const hour = parseInt(String(k).split(':')[0], 10);
                         const period = CIRCADIAN_PERIODS.find(p => hour >= p.startHour && hour < p.endHour);
                         // v3.6.02 A2: basal effect is measured on the period the insulin
@@ -7576,7 +7576,7 @@
 
                         let mostRecentChangeDate = null;
                         for (const entry of entriesInPeriod) {
-                            const slotChanges = ChangeTracker.getChangesForSlot('basal', entry.time);
+                            const slotChanges = ChangeRecord.getChangesForSlot('basal', entry.time);
                             const windowChanges = slotChanges.filter(
                                 c => new Date(c.date + 'T00:00:00') >= analysisStart
                             );
@@ -8558,7 +8558,8 @@
                                 covered_by_iob: 'insulin already delivered covers the meal — the dose was not the problem',
                                 iob_stacking: 'one meal produced both a high and a low — spike-then-crash, not a CR error',
                                 state_filtered: 'body state would have removed this finding; retained because it is a safety finding',
-                                recency_resolved: 'a more recent signal at this slot points the other way'
+                                recency_resolved: 'a more recent signal at this slot points the other way',
+                                history_unavailable: 'the tool cannot verify recent changes, lockouts, or body state, so no parameter change is proposed'
                             };
                             output += `- **No change proposed:**\n`;
                             bundle.withheldFindings.forEach(w => {
@@ -8624,7 +8625,7 @@
                 }
                 
                 // Manually logged changes from ChangeTracker
-                const recentChanges = ChangeTracker.getRecentChanges(7);
+                const recentChanges = ChangeRecord.getRecentChanges(7);
                 
                 if (recentChanges.length > 0) {
                     // INSTR-6: the Outcome column renders the LEDGER verdict, never a
@@ -9252,10 +9253,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.05',
-                        // DEF-088 probe build: behaviour is v3.6.05 exactly; only
-                        // [STATE-PROBE] logging was added. 3.6.06 stays unconsumed.
-                        probeBuild: 'DEF-088-state-detector-inputs — INSTRUMENTATION, NOT A RELEASE',
+                            version: '3.6.06',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9621,10 +9619,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.05',
-                        // DEF-088 probe build: behaviour is v3.6.05 exactly; only
-                        // [STATE-PROBE] logging was added. 3.6.06 stays unconsumed.
-                        probeBuild: 'DEF-088-state-detector-inputs — INSTRUMENTATION, NOT A RELEASE',
+                        version: '3.6.06',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9679,7 +9674,16 @@
                         daysInState: bodyState.daysInState,
                         overridePercent: bodyState.overridePercent || null,
                         contributingFactors: bodyState.contributingFactors || [],
-                        basalRatio: basalRatioBlock
+                        basalRatio: basalRatioBlock,
+                        // v3.6.06 Part D (DEF-094): change history is now device-independent.
+                        // Override state is NOT, and the split is declared rather than hidden.
+                        // getActiveOverride asks "is one running right now" — live session
+                        // state. Nightscout carries no override record on this feed (1,725
+                        // treatments, zero override eventTypes; parseProfile reads the STORED
+                        // profile), and the Sheets isOverride column is written FROM
+                        // OVERRIDE_ACTIVE, which derives FROM getActiveOverride — deriving it
+                        // back is a loop. Recovery-from-override IS derivable and moved.
+                        overrideStateSource: 'device_local'
                     } : {
                         available: false,
                         reason: hMeta.historyUnavailableReason || 'history_unavailable',
@@ -10177,114 +10181,9 @@
                 // Auto-detected changes (from delta view or schedule comparison)
                 prompts.sessionContinuity.autoDetected = [];
                 
-                // Manual logged changes (from ChangeTracker)
-                const history = ChangeTracker.getHistory();
-                const pendingChanges = history.changes.filter(c => c.outcome === 'pending');
-                for (const change of pendingChanges.slice(0, 3)) {
-                    const changeDate = new Date(change.date);
-                    const daysAgo = Math.floor((new Date() - changeDate) / (24 * 60 * 60 * 1000));
-                    if (daysAgo >= 1) {
-                        prompts.sessionContinuity.manualLogged.push(
-                            `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} (${change.date}): Applied? What happened?`
-                        );
-                    }
-                }
-
-                // Auto-detected applied changes — show as "confirm effect" follow-ups
-                const cutoff3d = new Date();
-                cutoff3d.setDate(cutoff3d.getDate() - 3);
-                const autoApplied = history.changes.filter(c =>
-                    c.source === 'auto_detected' &&
-                    c.outcome === OutcomeType.APPLIED &&
-                    new Date(c.date) >= cutoff3d
-                );
-                for (const change of autoApplied.slice(0, 3)) {
-                    prompts.sessionContinuity.manualLogged.push(
-                        `${change.scheduleTime} ${change.param} ${change.oldValue}→${change.newValue} detected ${change.date}: Confirm effect visible in today's data.`
-                    );
-                }
-                
-                // Period TIR trends
-                if (historyEntries.length >= 3) {
-                    const last5 = historyEntries.slice(-5);
-                    const periods = ['Deep Sleep', 'Dawn', 'Morning', 'Afternoon', 'Evening', 'Sleep Onset'];
-                    const tirFieldMap = {
-                        'Deep Sleep': 'tirDeepSleep',
-                        'Dawn': 'tirDawn',
-                        'Morning': 'tirMorning',
-                        'Afternoon': 'tirAfternoon',
-                        'Evening': 'tirEvening',
-                        'Sleep Onset': 'tirSleepOnset'
-                    };
-                    
-                    for (const period of periods) {
-                        const field = tirFieldMap[period];
-                        const values = last5.map(e => e[field] ? parseFloat(e[field]) : null).filter(v => v !== null);
-                        
-                        if (values.length >= 2) {
-                            const first = values[0];
-                            const last = values[values.length - 1];
-                            const trend = last > first + 5 ? 'improving ↑' : (last < first - 5 ? 'worsening ↓' : 'stable →');
-                            const delta = last - first;
-                            
-                            prompts.sessionContinuity.periodTrends.push({
-                                period,
-                                values,
-                                trend,
-                                delta: delta.toFixed(0)
-                            });
-                        }
-                    }
-                }
-                
-                // ===== DECISION MAP =====
-                for (const period of problemPeriods) {
-                    const decisionNode = {
-                        period: period.period,
-                        tir: period.avgTIR,
-                        branches: []
-                    };
-                    
-                    const periodData = signalAnalysis?.periods?.find(p => p.name === period.period);
-                    const hasDivergence = periodData?.divergence;
-                    
-                    if (hasDivergence) {
-                        decisionNode.branches.push({
-                            condition: 'Signal/AGP divergence present',
-                            action: periodData.divergence.recommendation,
-                            path: 'This is likely a meal/timing issue, not basal'
-                        });
-                    }
-                    
-                    // Find relevant bundles
-                    const periodBundles = bundles.filter(b => {
-                        const mappedPeriod = mapTimeBlockToPeriod(b.timeBlock);
-                        return mappedPeriod === period.period && b.priority === 'PRIMARY';
-                    });
-                    
-                    for (const bundle of periodBundles) {
-                        if (bundle.blockedBy?.includes('basal ratio')) {
-                            decisionNode.branches.push({
-                                condition: 'Recommendations blocked by basal ratio',
-                                action: 'Reduce basal rates to improve ratio',
-                                path: `Expected: 2-3 day path to unlock ${bundle.name.split(' ')[0]} adjustments`
-                            });
-                        }
-                    }
-                    
-                    if (decisionNode.branches.length > 0) {
-                        prompts.decisionMap.push(decisionNode);
-                    }
-                }
-                
-                // Add decision log line
-                prompts.decisionMap.push({
-                    isLogLine: true,
-                    template: `Decision log: "Worst period: ${problemPeriods[0]?.period || 'N/A'} (${problemPeriods[0]?.avgTIR || '?'}% TIR). Rerun: ________."`
-                });
-                
-                console.log('=== Final prompts structure ===');
-                console.log('turn1ContextByPeriod count:', prompts.turn1ContextByPeriod.length);
+                // v3.6.06 (DEF-094): the manual-logged branch is removed with the
+                // change queue it read. Auto-detected follow-ups above are now
+                // derived from the Sheets record and are device-independent.
                 console.log('sessionContinuity.manualLogged count:', prompts.sessionContinuity.manualLogged.length);
                 console.log('sessionContinuity.periodTrends count:', prompts.sessionContinuity.periodTrends.length);
                 console.log('decisionMap count:', prompts.decisionMap.length);
@@ -11813,6 +11712,10 @@
             
             // Load dynamic basal target from Google Sheets history
             // Also caches raw entries for reuse by carb-adjusted sensitivity
+            // v3.6.06: set by loadDynamicTarget, consumed by the change-record derivation
+            // later in the same run. Reset per run so a failed fetch cannot serve stale rows.
+            let resolvedHistoryForRun = { rows: [], meta: { historyAvailable: false,
+                historyEntryCount: 0, historyUnavailableReason: 'not_resolved', historySource: null } };
             const loadDynamicTarget = async () => {
                 console.log('=== loadDynamicTarget called ===');
                 
@@ -11833,6 +11736,13 @@
                     
                     // Cache entries for reuse by carb-adjusted sensitivity calculation
                     setCachedSheetsEntries(data.entries);
+                    // v3.6.06 (DEF-094): the change record derives from these rows.
+                    // React state is stale within the same tick, so the resolved rows are
+                    // handed over directly. This is data the run already awaited — no new
+                    // fetch and no reordering, which is what made Part C's blocker dissolve.
+                    resolvedHistoryForRun = { rows: data.entries,
+                        meta: { historyAvailable: true, historyEntryCount: data.entries.length,
+                                historyUnavailableReason: null, historySource: 'dynamic_target_fetch' } };
                     console.log('Dynamic target: Cached', data.entries.length, 'entries for reuse');
                     
                     // Filter out override rows and rows without signalPercent
@@ -11981,39 +11891,12 @@
                     
                 } catch (error) {
                     console.error('Dynamic target: Error loading', error);
-                    return null;
-                }
-            };
-            
-            // Fetch yesterday's schedule for change detection (FEATURE-004)
-            const loadYesterdaySchedule = async () => {
-                console.log('=== loadYesterdaySchedule called ===');
-                
-                if (!sheetsWebAppUrl) {
-                    console.log('Yesterday schedule: No Sheets URL configured');
-                    return null;
-                }
-                
-                try {
-                    const data = await jsonpFetch(`${sheetsWebAppUrl}?action=yesterday_schedule`);
-                    console.log('Yesterday schedule: Received', data);
-                    
-                    if (!data.success || !data.basal) {
-                        console.log('Yesterday schedule: No previous data');
-                        return null;
-                    }
-                    
-                    return {
-                        date: data.date,
-                        schedules: {
-                            basal: data.basal,
-                            cr: data.cr,
-                            isf: data.isf
-                        }
-                    };
-                    
-                } catch (error) {
-                    console.error('Yesterday schedule: Error loading', error);
+                    // v3.6.06: three conditions no longer collapse to one null — the change
+                    // record needs to know WHY, and "not configured" is not "fetch failed".
+                    resolvedHistoryForRun = { rows: [], meta: { historyAvailable: false,
+                        historyEntryCount: 0,
+                        historyUnavailableReason: 'fetch_failed: ' + (error && error.message),
+                        historySource: null } };
                     return null;
                 }
             };
@@ -12313,11 +12196,6 @@
                 setTargetLoadError(null);
                 
                 try {
-                    // [STATE-PROBE] DEF-088: run-entry store snapshot. The premise under
-                    // test is that localStorage was static across runs — verified, not assumed.
-                    console.log('[STATE-PROBE] store@run-entry',
-                        (localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL').length,
-                        'chars |', localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL');
                     // Load dynamic basal target from history (BUG-018)
                     console.log('Loading dynamic target...');
                     let effectiveBasalTarget = basalTDDPercent;
@@ -12327,16 +12205,7 @@
                     const dynamicResult = await loadDynamicTarget();
                     console.log('Dynamic target result:', dynamicResult);
                     
-                    // Load yesterday's schedule for change detection (FEATURE-004)
-                    console.log('Loading yesterday schedule for change detection...');
-                    const yesterdayScheduleResult = await loadYesterdaySchedule();
-                    if (yesterdayScheduleResult) {
-                        setYesterdayScheduleDate(yesterdayScheduleResult.date);
-                        console.log('Yesterday schedule loaded from:', yesterdayScheduleResult.date);
-                    } else {
-                        console.log('No yesterday schedule available (first run or no schedule columns)');
-                    }
-                    
+
                     if (dynamicResult && dynamicResult.value !== null && !dynamicResult.noRecentData) {
                         effectiveBasalTarget = dynamicResult.value;
                         effectiveTargetSource = 'dynamic';
@@ -12399,35 +12268,36 @@
                         console.warn('No profile found in Nightscout, using default schedules');
                     }
                     
-                    // Detect schedule changes (FEATURE-004)
-                    let pendingDetectedChanges = [];
+                    // [CHANGE-RECORD-RESOLVE] v3.6.06 (DEF-094). The change record is built
+                    // HERE — before StateDetector.detect, before createBundles — from the
+                    // Sheets rows loadDynamicTarget already awaited plus the live profile.
+                    // Nothing downstream reads localStorage for changes any more.
+                    //
+                    // This is also why v3.6.05's Part C blocker dissolved: availability is
+                    // known before bundles are built, so `history_unavailable` reaches
+                    // findingToRecommendation by the front door rather than needing a
+                    // post-bundle mutation or a hoisted fetch.
+                    const changeRecord = deriveChangeRecord(
+                        resolvedHistoryForRun.rows, activeSchedules, resolvedHistoryForRun.meta);
+                    ChangeRecord.set(changeRecord);
+                    console.log('[CHANGE-RECORD]', JSON.stringify({
+                        available: changeRecord.available, reason: changeRecord.reason,
+                        total: changeRecord.changes.length,
+                        loggedThrough: changeRecord.loggedThrough,
+                        overlayApplied: changeRecord.overlayApplied,
+                        overlay: changeRecord.changes.filter(c => c.origin === 'overlay')
+                            .map(c => c.param + '@' + c.scheduleTime)
+                    }));
 
-                    if (yesterdayScheduleResult?.schedules) {
-                        const todaySchedules = {
-                            basal: scheduleToObject(activeSchedules.basal),
-                            cr: scheduleToObject(activeSchedules.cr),
-                            isf: scheduleToObject(activeSchedules.isf)
-                        };
-                        const changes = detectScheduleChanges(todaySchedules, yesterdayScheduleResult.schedules);
-                        if (changes.length > 0) {
-                            console.log('Detected schedule changes:', changes);
-                            changes.forEach(c => {
-                                ChangeTracker.registerAutoDetected({
-                                    param: c.type,
-                                    scheduleTime: c.time,
-                                    oldValue: c.from,
-                                    newValue: c.to,
-                                    changePercent: c.changePercent
-                                });
-                            });
-                            setDetectedChanges(changes);
-                            pendingDetectedChanges = changes;
-                        } else {
-                            console.log('No schedule changes detected');
-                            setDetectedChanges([]);
-                        }
-                    }
-                    
+                    // The same-day overlay replaces what detectScheduleChanges + the
+                    // yesterday_schedule endpoint used to produce, from server-side inputs.
+                    const pendingDetectedChanges = changeRecord.changes
+                        .filter(c => c.origin === 'overlay')
+                        .map(c => ({ type: c.param, time: c.scheduleTime,
+                            from: c.oldValue, to: c.newValue, changePercent: c.changePercent }));
+                    setDetectedChanges(pendingDetectedChanges);
+
+
                     // Calculate basal ratio (BUG-003 fix)
                     basalRatioInfo = calculateBasalRatio(activeSchedules.basal);
                     
@@ -13073,30 +12943,6 @@
                         carbAdjSensitivity || null,
                         sensitivityHistoryLocal
                     );
-                    // [STATE-PROBE-RESULT-START] DEF-088 MEASUREMENT ONLY — v3.6.06-probe.
-                    // The three fetches the block reaches, logged beside the outcome so a
-                    // healthy/blocked diff shows which input moved, not just that one did.
-                    console.log('[STATE-PROBE-RESULT]', JSON.stringify({
-                        branch: detectedState.__probeBranch,
-                        state: detectedState.state,
-                        daysInState: detectedState.daysInState,
-                        contributingFactors: detectedState.contributingFactors,
-                        fetch_dynamicTarget_365: dynamicResult === null ? 'null(threw or none)'
-                            : { value: dynamicResult.value, noRecentData: !!dynamicResult.noRecentData,
-                                insufficientEntries: !!dynamicResult.insufficientEntries,
-                                hasGap: !!dynamicResult.hasGap, daysOfData: dynamicResult.daysOfData,
-                                totalDaysAvailable: dynamicResult.totalDaysAvailable },
-                        fetch_yesterdaySchedule: yesterdayScheduleResult === null ? 'null'
-                            : { date: yesterdayScheduleResult.date },
-                        fetch_carbAdj_14: sensitivityHistoryLocal === null ? 'null'
-                            : (Array.isArray(sensitivityHistoryLocal) ? sensitivityHistoryLocal.length : typeof sensitivityHistoryLocal),
-                        carbAdjSensitivity: carbAdjSensitivity,
-                        effectiveTargetSource: effectiveTargetSource,
-                        detectedChanges_thisRun: pendingDetectedChanges.length
-                    }));
-                    console.log('[STATE-PROBE] store@detect-exit',
-                        (localStorage.getItem(ChangeTracker.STORAGE_KEY) || 'NULL').length, 'chars');
-                    // [STATE-PROBE-RESULT-END]
                     
                     // Spec 2A / v3.5.68: Stamp sessionSensitivity on findings using
                     // date-keyed lookup against Sheets history entries. OLD findings get
@@ -13144,7 +12990,7 @@
                         if (!f.primaryParameter || !f.scheduleTime || !f.eventTime) return;
 
                         const findingTime = new Date(f.eventTime);
-                        const slotChanges = ChangeTracker.getChangesForSlot(
+                        const slotChanges = ChangeRecord.getChangesForSlot(
                             f.primaryParameter, f.scheduleTime
                         );
 
@@ -13828,7 +13674,7 @@
                             if (!scheduleTime) return;
 
                             // Get ISF changes at this slot within the window
-                            const allChanges = ChangeTracker.getChangesForSlot('isf', scheduleTime);
+                            const allChanges = ChangeRecord.getChangesForSlot('isf', scheduleTime);
                             const windowCutoff = new Date();
                             windowCutoff.setDate(windowCutoff.getDate() - PRE_CHANGE_WINDOW_DAYS);
                             windowCutoff.setHours(0, 0, 0, 0); // date-level boundary: midnight
@@ -14288,19 +14134,6 @@
                 }
             };
             
-            // Log a change
-            const logAppliedChange = (recommendation) => {
-                ChangeTracker.logChange({
-                    param: recommendation.param,
-                    scheduleTime: recommendation.scheduleTime,
-                    oldValue: recommendation.currentValue,
-                    newValue: recommendation.newValue,
-                    changePercent: recommendation.changePercent,
-                    reason: 'Tool recommendation',
-                    source: 'tool_recommendation'
-                });
-            };
-            
             // State badge component
             const StateBadge = ({ state }) => {
                 const colors = {
@@ -14351,7 +14184,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.05 — State-Aware Recommendations</p>
+                                    <p className="text-gray-400 text-sm">v3.6.06 — Device-Independent Change Record</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -14959,12 +14792,14 @@
                                                                 {bundle.signalConflict && (
                                                                     <p className="text-orange-400 text-xs mt-1">{bundle.signalConflict}</p>
                                                                 )}
-                                                                <button
-                                                                    onClick={() => bundle.recommendations.forEach(logAppliedChange)}
-                                                                    className="mt-2 px-3 py-1 bg-green-600/20 hover:bg-green-600/30 text-green-400 border border-green-500/30 rounded text-xs transition-colors"
-                                                                >
-                                                                    Apply This One
-                                                                </button>
+                                                                {/* v3.6.06 (DEF-094): "Apply This One" removed with the manual
+                                                                    change queue. It wrote outcome:PENDING to localStorage, and
+                                                                    logOutcome — the only path that could clear it — was defined
+                                                                    and never called. One click would have produced a permanent
+                                                                    "Applied? What happened?" prompt with no dismissal. Superseded
+                                                                    by the change-effectiveness ledger (INSTR-6); 0 of 95 production
+                                                                    entries ever used it. Changes are now observed from the
+                                                                    schedule, not declared. */}
                                                             </div>
                                                         ))}
                                                     </div>
