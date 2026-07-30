@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.08</title>
+    <title>Daily Insulin Settings Review v3.6.09</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -60,7 +60,7 @@
     <script type="text/babel">
         const { useState, useRef, useEffect, useMemo, useCallback } = React;
 
-        // [ABSENT-FLOOR-DEF-START] v3.6.08 (DEF-096). Shared resolution rule.
+        // [ABSENT-FLOOR-DEF-START] v3.6.09 (DEF-096). Shared resolution rule.
         // tableFloor: the least favourable value a factor table can produce.
         // factorFor:  present key -> its value; absent/unknown key -> the floor.
         // The floor is derived from the table at call time, so adding an entry
@@ -85,7 +85,7 @@
             RECOVERY: 'recovery',
             OVERRIDE_ACTIVE: 'override_active',
             HIGH_VARIABILITY: 'high_variability',
-            // v3.6.08 (DEF-099). NOT a body state — the absence of one. Every branch
+            // v3.6.09 (DEF-099). NOT a body state — the absence of one. Every branch
             // below `detect`'s override check reads history; when history is unreadable
             // they all fail quietly and the fallthrough returns STABLE, the most
             // permissive value in the enum. UNDETERMINED separates "we looked and the
@@ -351,7 +351,7 @@
                 }
             },
             
-            // v3.6.08 (DEF-094): daysSinceChange / getParameterVelocity /
+            // v3.6.09 (DEF-094): daysSinceChange / getParameterVelocity /
             // getChangesForSlot moved to ChangeRecord (Sheets-derived). They survived
             // the first pass of this build with zero callers — the same superseded-but-
             // live shape as yesterday_schedule and logOutcome. Structural test T1b
@@ -398,7 +398,7 @@
                 }
 
                 // Check for many recent changes (recovery)
-                // v3.6.08 (DEF-094): Sheets-derived, not localStorage. Same test.
+                // v3.6.09 (DEF-094): Sheets-derived, not localStorage. Same test.
                 const recentChanges = ChangeRecord.getRecentChanges(CONFIG.recoveryDays);
                 if (recentChanges.length >= 3) {
                     return {
@@ -497,7 +497,7 @@
                     }
                 }
                 
-                // v3.6.08 (DEF-099). Reached both when the body is genuinely stable and
+                // v3.6.09 (DEF-099). Reached both when the body is genuinely stable and
                 // when nothing was readable. `ChangeRecord.available()` is the discriminator
                 // and needs no new plumbing — the RECOVERY branch above already calls
                 // ChangeRecord directly, so it is in scope at this point. It is false
@@ -596,7 +596,7 @@
             },
             
             estimateStableDays(changeHistory) {
-                // v3.6.08: delegates to the derived record (one date convention).
+                // v3.6.09: delegates to the derived record (one date convention).
                 return ChangeRecord.estimateStableDays() ?? 30;
             }
         };
@@ -713,7 +713,7 @@
                 let filteredFindings = this.filterByState(validFindings, bodyState);
                 pipelineCensus.afterStateFilter = censusOf(filteredFindings);
 
-                // [HISTORY-UNAVAILABLE-WITHHOLD] v3.6.08 Part C (DEF-094).
+                // [HISTORY-UNAVAILABLE-WITHHOLD] v3.6.09 Part C (DEF-094).
                 // With the change record derived from Sheets, "history unavailable" and
                 // "no change record" are the SAME condition — and it is known here,
                 // before findingToRecommendation runs. That is why this needed no second
@@ -1061,7 +1061,7 @@
 
                     case BodyStateType.OVERRIDE_ACTIVE:
                     case BodyStateType.UNDETERMINED:
-                        // v3.6.08: UNDETERMINED shares this branch rather than copying it —
+                        // v3.6.09: UNDETERMINED shares this branch rather than copying it —
                         // retain everything, withhold every recommendation. Sharing the case
                         // label is deliberate: a near-copy omitting __srcRef would make every
                         // finding look dropped at the safety-retention boundary.
@@ -1127,7 +1127,14 @@
             // suite and leaves production wrong.
 
             calculateConfidence(finding, bodyState) {
-                let base = finding.severity || 0.5;
+                // v3.6.09 Part D (DEF-103). Emitter survey: 32 finding-construction sites,
+                // 29 set severity explicitly and 3 are divergence records that never reach
+                // this function. No emitter can produce a finding without severity, so the
+                // fallback was unreachable — and `||` was wrong regardless, because
+                // `severity: Math.min(Math.abs(deviation) / 20, 0.95)` can evaluate to 0 and
+                // `0 || 0.5` promotes a zero-severity finding to mid-range. Same
+                // absent-versus-empty conflation as the rest of this build. Deleted, asserted.
+                let base = finding.severity;
                 
                 // Structural findings (basal signals, ratio warnings) skip recency penalties
                 if (finding.isStructural) {
@@ -1139,7 +1146,7 @@
                     // only thin evidence falls, floored at 0.5 so a thin-but-real
                     // signal is demoted, never erased. Unknown evidence is not
                     // penalized — no discount is invented from absent data.
-                    // [ABSENT-FLOOR-START] v3.6.08 (DEF-096). ONE resolution rule for
+                    // [ABSENT-FLOOR-START] v3.6.09 (DEF-096). ONE resolution rule for
                     // every factor table. An input the tool could not read must never
                     // resolve to a value more favourable than any input it CAN read —
                     // the degraded run may not out-score the gated one. Floor is taken
@@ -1228,7 +1235,7 @@
                         finding.scheduleTime
                     );
                     if (velocity.available === false || velocity.oscillationDetected) {
-                        base *= 0.6;  // v3.6.08: unreadable velocity takes the penalty too
+                        base *= 0.6;  // v3.6.09: unreadable velocity takes the penalty too
                     }
                 }
                 
@@ -2084,6 +2091,21 @@
                         // AGPPERSIST will evaluate the AGP and clear isStale if warranted.
                     }
                     
+                    // v3.6.09 Part C (DEF-102). Neither PRIMARY site consulted whether the
+                    // bundle still carries a lever. A fully-withheld bundle reaching the
+                    // actions array is what the v3.6.09 census invariant surfaced; that
+                    // invariant STAYS ARMED — this fixes the cause, not the detector.
+                    // Mirrors the established `urgencyWithheld` shape: the classification
+                    // is withheld and says so, rather than being silently downgraded.
+                    const hasLever = Array.isArray(bundle.recommendations) && bundle.recommendations.length > 0;
+                    if (!hasLever) {
+                        bundle.priority = 'REFERENCE';
+                        bundle.priorityWithheld = bundle.recommendationWithheld
+                            || (bundle.withheldFindings || []).map(w => w && w.reason).filter(Boolean)[0]
+                            || 'no_recommendation';
+                        return;
+                    }
+
                     // URGENT always becomes PRIMARY
                     if (bundle.isUrgent) {
                         bundle.priority = 'PRIMARY';
@@ -2338,7 +2360,7 @@
             return 'other';
         };
         const computeGateCost = (bundles) => {
-            // v3.6.08 (DEF-098). `generated` counts bundles that still CARRY a
+            // v3.6.09 (DEF-098). `generated` counts bundles that still CARRY a
             // recommendation. Withheld findings never entered the census, so on every
             // run — not just a degraded one — the census silently understated what the
             // pipeline produced. `withheld` makes the arithmetic visible and closable:
@@ -2358,10 +2380,10 @@
                 blocked[bucket] = (blocked[bucket] || 0) + 1;
                 if (bucket === 'other') otherReasons.push(String(st.status || ''));
             });
-            // v3.6.08: read the reason from the SAME source the serializer reads.
+            // v3.6.09: read the reason from the SAME source the serializer reads.
             // `recommendationWithheld` is synthesised at serialization time from
             // withheldFindings — it does not exist on the bundle at this point, so
-            // v3.6.08 bucketed every withheld finding as 'unclassified' in production
+            // v3.6.09 bucketed every withheld finding as 'unclassified' in production
             // while its fixture pre-stamped the field and passed.
             withheldBundles.forEach(b => {
                 const reasons = [...new Set((Array.isArray(b.withheldFindings) ? b.withheldFindings : [])
@@ -2377,7 +2399,7 @@
             };
             if (otherReasons.length > 0) out.otherReasons = otherReasons;
             // Permanent invariant. `generated: 0` beside a non-empty actions array is a
-            // contradiction the tool must not emit silently — the degraded v3.6.08 run
+            // contradiction the tool must not emit silently — the degraded v3.6.09 run
             // published exactly that pair. Surfaced, never swallowed.
             const primaryCount = all.filter(b => b.priority === 'PRIMARY').length;
             const blockedSum = Object.values(blocked).reduce((a, n) => a + n, 0);
@@ -2752,7 +2774,7 @@
         };
         // [INSTR3-HELPERS-END]
 
-        // [SNAPSHOT-DIFF-START] v3.6.08 (DEF-094). ONE implementation of the question
+        // [SNAPSHOT-DIFF-START] v3.6.09 (DEF-094). ONE implementation of the question
         // "what moved between two schedule snapshots". Three consumers: the
         // change-effectiveness ledger, the oscillation walker, and the device-independent
         // change record. Previously the first two carried near-identical private copies;
@@ -2801,7 +2823,7 @@
         };
         // [SNAPSHOT-DIFF-END]
 
-        // [CHANGE-RECORD-START] v3.6.08 (DEF-094). The change record is DERIVED FROM
+        // [CHANGE-RECORD-START] v3.6.09 (DEF-094). The change record is DERIVED FROM
         // SHEETS, not from localStorage.
         //
         // Every safety gate used to read ChangeTracker, which is localStorage, which is
@@ -3000,7 +3022,7 @@
             for (let i = 1; i < sessions.length; i++) {
                 const deltas = [];
                 let structural = 0;
-                // v3.6.08: the key walk moved to the shared primitive. unionKeys:true
+                // v3.6.09: the key walk moved to the shared primitive. unionKeys:true
                 // preserves this walker's add/remove structural tally exactly.
                 OSC_PARAMS.forEach(param => {
                     const d = diffScheduleSnapshot(sessions[i - 1].scheds[param],
@@ -3160,7 +3182,7 @@
             // Change extraction: consecutive-snapshot diffs, keys numeric in both.
             const changes = [];
             for (let i = 1; i < sessions.length; i++) {
-                // v3.6.08: the key walk moved to the shared primitive. Default (b-only)
+                // v3.6.09: the key walk moved to the shared primitive. Default (b-only)
                 // key set preserves this walker's behaviour — a key that vanished has no
                 // post-value to score. `structural` is not consumed here.
                 SNAPSHOT_PARAMS.forEach(param => {
@@ -7656,7 +7678,12 @@
                     // identically to a genuine anchor-at-window-start — both {used: N, dropped: 0}.
                     // The console distinguished them; the JSON did not. Introduced in v3.5.97 B.
                     let splitApplied     = false;
-                    let splitSkipReason  = null;
+                    // v3.6.09 Part B (DEF-101). Extends the v3.5.98 B5 pattern one level out.
+                    // B5 separated "nothing to discard" from "split abandoned" at the INNER
+                    // case; `populationSplit === false` still collapsed "no change to split
+                    // on" with "the change record was unavailable". Same fix, same field.
+                    let splitSkipReason  = ChangeRecord.available()
+                        ? null : 'change_record_unavailable';
 
                     if (basalSchedule && basalSchedule.length > 0) {
                         const entriesInPeriod = basalSchedule.filter(entry => {
@@ -7681,6 +7708,9 @@
                             }
                         }
 
+                        if (!mostRecentChangeDate && ChangeRecord.available()) {
+                            splitSkipReason = splitSkipReason || 'no_change_in_window';
+                        }
                         if (mostRecentChangeDate) {
                             splitChangeDate = mostRecentChangeDate;
                             const postChangeWindows = windowsInPeriod.filter(
@@ -8763,7 +8793,16 @@
                 
                 // Show message if no changes at all
                 if ((!detectedChanges || detectedChanges.length === 0) && recentChanges.length === 0) {
-                    output += `No recent changes detected or logged.\n\n`;
+                    // v3.6.09 Part A (DEF-100). "No recent changes" is a claim about the
+                    // record. When the record could not be read the tool has not looked,
+                    // and this line is the field a reviewer uses to decide whether a
+                    // lockout is in force. Declaring beats asserting.
+                    output += ChangeRecord.available()
+                        ? `No recent changes detected or logged.\n\n`
+                        : `**⚠️ RECENT CHANGES UNAVAILABLE** — the change record could not be read ` +
+                          `(\`${ChangeRecord.get().reason || 'history unavailable'}\`). ` +
+                          `Whether parameters were changed recently is **unknown, not none** — ` +
+                          `lockouts and recency gates could not be evaluated this session.\n\n`;
                 }
                 
                 output += `---\n\n`;
@@ -9347,7 +9386,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.08',
+                            version: '3.6.09',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9608,6 +9647,8 @@
                     // the evidence base without labelling the split would invite the same
                     // misreading at twice the scale.
                     effectiveWindowCount: period.effectiveWindowCount ?? period.cleanWindowCount ?? 0,
+                    // v3.6.09 Part B: a false split is no longer a bare null — it declares
+                    // whether there was nothing to split on, or nothing to split WITH.
                     populationSplit: period.populationSplit
                         ? {
                             changeDate: period.splitChangeDate
@@ -9621,7 +9662,14 @@
                             applied: period.splitApplied === true,
                             skipReason: period.splitSkipReason ?? null
                         }
-                        : null,
+                        : (period.splitSkipReason
+                            ? { applied: false, changeDate: null,
+                                skipReason: period.splitSkipReason,
+                                note: period.splitSkipReason === 'change_record_unavailable'
+                                    ? 'The change record could not be read, so no split was attempted. ' +
+                                      'The unsplit population is reported — absent, not inapplicable.'
+                                    : 'No parameter change falls in this window; the full population applies.' }
+                            : null),
                     // v3.5.98 B6: measurement only — what this period would report with no
                     // split. Nothing downstream consumes these; they exist so the split's
                     // cost is visible nightly rather than reconstructed after the fact.
@@ -9713,7 +9761,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.08',
+                        version: '3.6.09',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9769,7 +9817,7 @@
                         overridePercent: bodyState.overridePercent || null,
                         contributingFactors: bodyState.contributingFactors || [],
                         basalRatio: basalRatioBlock,
-                        // v3.6.08 Part D (DEF-094): change history is now device-independent.
+                        // v3.6.09 Part D (DEF-094): change history is now device-independent.
                         // Override state is NOT, and the split is declared rather than hidden.
                         // getActiveOverride asks "is one running right now" — live session
                         // state. Nightscout carries no override record on this feed (1,725
@@ -10275,7 +10323,7 @@
                 // Auto-detected changes (from delta view or schedule comparison)
                 prompts.sessionContinuity.autoDetected = [];
                 
-                // v3.6.08 (DEF-094): the manual-logged branch is removed with the
+                // v3.6.09 (DEF-094): the manual-logged branch is removed with the
                 // change queue it read. Auto-detected follow-ups above are now
                 // derived from the Sheets record and are device-independent.
                 console.log('sessionContinuity.manualLogged count:', prompts.sessionContinuity.manualLogged.length);
@@ -11806,7 +11854,7 @@
             
             // Load dynamic basal target from Google Sheets history
             // Also caches raw entries for reuse by carb-adjusted sensitivity
-            // v3.6.08: set by loadDynamicTarget, consumed by the change-record derivation
+            // v3.6.09: set by loadDynamicTarget, consumed by the change-record derivation
             // later in the same run. Reset per run so a failed fetch cannot serve stale rows.
             let resolvedHistoryForRun = { rows: [], meta: { historyAvailable: false,
                 historyEntryCount: 0, historyUnavailableReason: 'not_resolved', historySource: null } };
@@ -11830,7 +11878,7 @@
                     
                     // Cache entries for reuse by carb-adjusted sensitivity calculation
                     setCachedSheetsEntries(data.entries);
-                    // v3.6.08 (DEF-094): the change record derives from these rows.
+                    // v3.6.09 (DEF-094): the change record derives from these rows.
                     // React state is stale within the same tick, so the resolved rows are
                     // handed over directly. This is data the run already awaited — no new
                     // fetch and no reordering, which is what made Part C's blocker dissolve.
@@ -11985,7 +12033,7 @@
                     
                 } catch (error) {
                     console.error('Dynamic target: Error loading', error);
-                    // v3.6.08: three conditions no longer collapse to one null — the change
+                    // v3.6.09: three conditions no longer collapse to one null — the change
                     // record needs to know WHY, and "not configured" is not "fetch failed".
                     resolvedHistoryForRun = { rows: [], meta: { historyAvailable: false,
                         historyEntryCount: 0,
@@ -12362,7 +12410,7 @@
                         console.warn('No profile found in Nightscout, using default schedules');
                     }
                     
-                    // [CHANGE-RECORD-RESOLVE] v3.6.08 (DEF-094). The change record is built
+                    // [CHANGE-RECORD-RESOLVE] v3.6.09 (DEF-094). The change record is built
                     // HERE — before StateDetector.detect, before createBundles — from the
                     // Sheets rows loadDynamicTarget already awaited plus the live profile.
                     // Nothing downstream reads localStorage for changes any more.
@@ -14278,7 +14326,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.08 — Device-Independent Change Record</p>
+                                    <p className="text-gray-400 text-sm">v3.6.09 — Device-Independent Change Record</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -14888,7 +14936,7 @@
                                                                 {bundle.signalConflict && (
                                                                     <p className="text-orange-400 text-xs mt-1">{bundle.signalConflict}</p>
                                                                 )}
-                                                                {/* v3.6.08 (DEF-094): "Apply This One" removed with the manual
+                                                                {/* v3.6.09 (DEF-094): "Apply This One" removed with the manual
                                                                     change queue. It wrote outcome:PENDING to localStorage, and
                                                                     logOutcome — the only path that could clear it — was defined
                                                                     and never called. One click would have produced a permanent
