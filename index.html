@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.06</title>
+    <title>Daily Insulin Settings Review v3.6.07</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -59,6 +59,20 @@
     
     <script type="text/babel">
         const { useState, useRef, useEffect, useMemo, useCallback } = React;
+
+        // [ABSENT-FLOOR-DEF-START] v3.6.07 (DEF-096). Shared resolution rule.
+        // tableFloor: the least favourable value a factor table can produce.
+        // factorFor:  present key -> its value; absent/unknown key -> the floor.
+        // The floor is derived from the table at call time, so adding an entry
+        // cannot silently move the absent-input answer.
+        const tableFloor = (table) => {
+            const vals = Object.values(table || {}).filter(v => typeof v === 'number' && isFinite(v));
+            return vals.length ? Math.min(...vals) : 0;
+        };
+        const factorFor = (table, key) =>
+            (key != null && Object.prototype.hasOwnProperty.call(table || {}, key))
+                ? table[key] : tableFloor(table);
+        // [ABSENT-FLOOR-DEF-END]
 
         // =========================================================================
         // ENUMS AND CONSTANTS
@@ -331,7 +345,7 @@
                 }
             },
             
-            // v3.6.06 (DEF-094): daysSinceChange / getParameterVelocity /
+            // v3.6.07 (DEF-094): daysSinceChange / getParameterVelocity /
             // getChangesForSlot moved to ChangeRecord (Sheets-derived). They survived
             // the first pass of this build with zero callers — the same superseded-but-
             // live shape as yesterday_schedule and logOutcome. Structural test T1b
@@ -378,7 +392,7 @@
                 }
 
                 // Check for many recent changes (recovery)
-                // v3.6.06 (DEF-094): Sheets-derived, not localStorage. Same test.
+                // v3.6.07 (DEF-094): Sheets-derived, not localStorage. Same test.
                 const recentChanges = ChangeRecord.getRecentChanges(CONFIG.recoveryDays);
                 if (recentChanges.length >= 3) {
                     return {
@@ -558,7 +572,7 @@
             },
             
             estimateStableDays(changeHistory) {
-                // v3.6.06: delegates to the derived record (one date convention).
+                // v3.6.07: delegates to the derived record (one date convention).
                 return ChangeRecord.estimateStableDays() ?? 30;
             }
         };
@@ -675,7 +689,7 @@
                 let filteredFindings = this.filterByState(validFindings, bodyState);
                 pipelineCensus.afterStateFilter = censusOf(filteredFindings);
 
-                // [HISTORY-UNAVAILABLE-WITHHOLD] v3.6.06 Part C (DEF-094).
+                // [HISTORY-UNAVAILABLE-WITHHOLD] v3.6.07 Part C (DEF-094).
                 // With the change record derived from Sheets, "history unavailable" and
                 // "no change record" are the SAME condition — and it is known here,
                 // before findingToRecommendation runs. That is why this needed no second
@@ -1096,6 +1110,14 @@
                     // only thin evidence falls, floored at 0.5 so a thin-but-real
                     // signal is demoted, never erased. Unknown evidence is not
                     // penalized — no discount is invented from absent data.
+                    // [ABSENT-FLOOR-START] v3.6.07 (DEF-096). ONE resolution rule for
+                    // every factor table. An input the tool could not read must never
+                    // resolve to a value more favourable than any input it CAN read —
+                    // the degraded run may not out-score the gated one. Floor is taken
+                    // from the table itself rather than a named UNDETERMINED constant so
+                    // it cannot drift when a table gains an entry.
+                    // EVIDENCE_DAY_FACTOR's `?? EVIDENCE_DAY_FACTOR[1]` was the in-tree
+                    // precedent; this generalises it.
                     const EVIDENCE_FLOOR = 0.5;
                     const EVIDENCE_DAY_FACTOR = { 1: 0.6, 2: 0.8, 3: 0.9 }; // 4+ days → 1.0
                     const EVIDENCE_WINDOW_THIN = 20;      // < 20 windows → 0.8
@@ -1104,13 +1126,14 @@
                         ?? finding.signalSupport?.contributingDayCount ?? null;
                     const evWindows = finding.events?.[0]?.cleanWindows
                         ?? finding.signalSupport?.cleanWindows ?? null;
-                    const dayFactor = evDays == null ? 1.0
+                    const dayFactor = evDays == null ? tableFloor(EVIDENCE_DAY_FACTOR)
                         : evDays >= 4 ? 1.0
-                        : (EVIDENCE_DAY_FACTOR[evDays] ?? EVIDENCE_DAY_FACTOR[1]);
-                    const windowFactor = evWindows == null ? 1.0
-                        : evWindows < EVIDENCE_WINDOW_THIN ? 0.8
-                        : evWindows < EVIDENCE_WINDOW_MODERATE ? 0.9
-                        : 1.0;
+                        : (EVIDENCE_DAY_FACTOR[evDays] ?? tableFloor(EVIDENCE_DAY_FACTOR));
+                    const WINDOW_FACTOR = { thin: 0.8, moderate: 0.9, full: 1.0 };
+                    const windowFactor = evWindows == null ? tableFloor(WINDOW_FACTOR)
+                        : evWindows < EVIDENCE_WINDOW_THIN ? WINDOW_FACTOR.thin
+                        : evWindows < EVIDENCE_WINDOW_MODERATE ? WINDOW_FACTOR.moderate
+                        : WINDOW_FACTOR.full;
                     const evidenceFactor = Math.min(1.0, Math.max(EVIDENCE_FLOOR, dayFactor * windowFactor));
                     base *= evidenceFactor;
                     // [CONF1-END]
@@ -1124,7 +1147,7 @@
                         [BodyStateType.TRANSIENT_SENSITIVITY]: 0.9,
                         [BodyStateType.OVERRIDE_ACTIVE]: 0.85
                     };
-                    base *= stateMultipliers[bodyState.state] || 1.0;
+                    base *= factorFor(stateMultipliers, bodyState && bodyState.state);
                     return Math.min(base, 1.0);
                 }
                 
@@ -1133,7 +1156,7 @@
                 // RECENT (1-3 days): 50% weight
                 // STALE (3-7 days): 20% weight
                 // EXPIRED (>7 days): effectively 0
-                const recencyTier = finding.recencyTier || 'UNKNOWN';
+                const recencyTier = finding.recencyTier;
                 const recencyMultipliers = {
                     'CURRENT': 1.0,    // Full priority
                     'RECENT': 0.5,     // Include but defer to CURRENT
@@ -1141,7 +1164,7 @@
                     'EXPIRED': 0.05,   // Essentially ignore
                     'UNKNOWN': 0.5     // Fallback
                 };
-                base *= recencyMultipliers[recencyTier] || 0.5;
+                base *= factorFor(recencyMultipliers, recencyTier);
                 
                 // Bonus for having recent events even if older events exist
                 if (finding.eventsLast24h > 0) {
@@ -1175,8 +1198,8 @@
                         finding.primaryParameter, 
                         finding.scheduleTime
                     );
-                    if (velocity.oscillationDetected) {
-                        base *= 0.6;  // Significant penalty for oscillation
+                    if (velocity.available === false || velocity.oscillationDetected) {
+                        base *= 0.6;  // v3.6.07: unreadable velocity takes the penalty too
                     }
                 }
                 
@@ -1189,7 +1212,7 @@
                     [BodyStateType.TRANSIENT_SENSITIVITY]: 0.9,
                     [BodyStateType.OVERRIDE_ACTIVE]: 0.85
                 };
-                base *= stateMultipliers[bodyState.state] || 1.0;
+                base *= factorFor(stateMultipliers, bodyState && bodyState.state);
                 
                 return Math.min(base, 1.0);
             },
@@ -2286,9 +2309,17 @@
             return 'other';
         };
         const computeGateCost = (bundles) => {
-            const withRecs = (Array.isArray(bundles) ? bundles : [])
-                .filter(b => b && Array.isArray(b.recommendations) && b.recommendations.length > 0);
+            // v3.6.07 (DEF-098). `generated` counts bundles that still CARRY a
+            // recommendation. Withheld findings never entered the census, so on every
+            // run — not just a degraded one — the census silently understated what the
+            // pipeline produced. `withheld` makes the arithmetic visible and closable:
+            //     generated === actionable + sum(blocked)
+            //     generated + withheld === bundlesConsidered
+            const all = (Array.isArray(bundles) ? bundles : []).filter(Boolean);
+            const withRecs = all.filter(b => Array.isArray(b.recommendations) && b.recommendations.length > 0);
+            const withheldBundles = all.filter(b => !(Array.isArray(b.recommendations) && b.recommendations.length > 0));
             const blocked = {};
+            const withheldBy = {};
             const otherReasons = [];
             let actionable = 0;
             withRecs.forEach(b => {
@@ -2298,8 +2329,30 @@
                 blocked[bucket] = (blocked[bucket] || 0) + 1;
                 if (bucket === 'other') otherReasons.push(String(st.status || ''));
             });
-            const out = { generated: withRecs.length, actionable, blocked };
+            withheldBundles.forEach(b => {
+                const r = b.recommendationWithheld || 'unclassified';
+                withheldBy[r] = (withheldBy[r] || 0) + 1;
+            });
+            const out = {
+                generated: withRecs.length,
+                withheld: withheldBundles.length,
+                bundlesConsidered: all.length,
+                actionable, blocked, withheldBy
+            };
             if (otherReasons.length > 0) out.otherReasons = otherReasons;
+            // Permanent invariant. `generated: 0` beside a non-empty actions array is a
+            // contradiction the tool must not emit silently — the degraded v3.6.07 run
+            // published exactly that pair. Surfaced, never swallowed.
+            const primaryCount = all.filter(b => b.priority === 'PRIMARY').length;
+            const blockedSum = Object.values(blocked).reduce((a, n) => a + n, 0);
+            const problems = [];
+            if (out.generated === 0 && primaryCount > 0)
+                problems.push(`generated=0 with ${primaryCount} PRIMARY bundle(s)`);
+            if (out.generated !== actionable + blockedSum)
+                problems.push(`generated ${out.generated} != actionable ${actionable} + blocked ${blockedSum}`);
+            if (out.generated + out.withheld !== out.bundlesConsidered)
+                problems.push(`generated+withheld != bundlesConsidered`);
+            if (problems.length) out.censusInvariantViolated = problems;
             return out;
         };
         // [BASAL-EFFECT-START] v3.6.01 Part C (DEF-080). READ-ONLY.
@@ -2663,7 +2716,7 @@
         };
         // [INSTR3-HELPERS-END]
 
-        // [SNAPSHOT-DIFF-START] v3.6.06 (DEF-094). ONE implementation of the question
+        // [SNAPSHOT-DIFF-START] v3.6.07 (DEF-094). ONE implementation of the question
         // "what moved between two schedule snapshots". Three consumers: the
         // change-effectiveness ledger, the oscillation walker, and the device-independent
         // change record. Previously the first two carried near-identical private copies;
@@ -2712,7 +2765,7 @@
         };
         // [SNAPSHOT-DIFF-END]
 
-        // [CHANGE-RECORD-START] v3.6.06 (DEF-094). The change record is DERIVED FROM
+        // [CHANGE-RECORD-START] v3.6.07 (DEF-094). The change record is DERIVED FROM
         // SHEETS, not from localStorage.
         //
         // Every safety gate used to read ChangeTracker, which is localStorage, which is
@@ -2829,8 +2882,9 @@
             },
             getParameterVelocity(param, scheduleTime) {
                 const empty = { param, scheduleTime, changesInPeriod: 0, netChangePercent: 0,
-                    consecutiveSameDirection: 0, oscillationDetected: false, history: [] };
-                if (!this.available()) return empty;
+                    consecutiveSameDirection: 0, oscillationDetected: false, history: [],
+                    available: true };
+                if (!this.available()) return { ...empty, available: false };
                 const cutoff = new Date();
                 cutoff.setDate(cutoff.getDate() - CONFIG.oscillationLookbackDays);
                 cutoff.setHours(0, 0, 0, 0);
@@ -2910,7 +2964,7 @@
             for (let i = 1; i < sessions.length; i++) {
                 const deltas = [];
                 let structural = 0;
-                // v3.6.06: the key walk moved to the shared primitive. unionKeys:true
+                // v3.6.07: the key walk moved to the shared primitive. unionKeys:true
                 // preserves this walker's add/remove structural tally exactly.
                 OSC_PARAMS.forEach(param => {
                     const d = diffScheduleSnapshot(sessions[i - 1].scheds[param],
@@ -3070,7 +3124,7 @@
             // Change extraction: consecutive-snapshot diffs, keys numeric in both.
             const changes = [];
             for (let i = 1; i < sessions.length; i++) {
-                // v3.6.06: the key walk moved to the shared primitive. Default (b-only)
+                // v3.6.07: the key walk moved to the shared primitive. Default (b-only)
                 // key set preserves this walker's behaviour — a key that vanished has no
                 // post-value to score. `structural` is not consumed here.
                 SNAPSHOT_PARAMS.forEach(param => {
@@ -8950,7 +9004,7 @@
                             
                             if (hourData.length === 0) return;
                             
-                            const avgTIR = periodTIRMap.get(periodName) ?? 100;
+                            const avgTIR = periodTIRMap.has(periodName) ? periodTIRMap.get(periodName) : 0;
                             
                             // Find worst hour (correctly tracking original hour)
                             let worstHour = hours[0];
@@ -9253,7 +9307,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.06',
+                            version: '3.6.07',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9619,7 +9673,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.06',
+                        version: '3.6.07',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -9675,7 +9729,7 @@
                         overridePercent: bodyState.overridePercent || null,
                         contributingFactors: bodyState.contributingFactors || [],
                         basalRatio: basalRatioBlock,
-                        // v3.6.06 Part D (DEF-094): change history is now device-independent.
+                        // v3.6.07 Part D (DEF-094): change history is now device-independent.
                         // Override state is NOT, and the split is declared rather than hidden.
                         // getActiveOverride asks "is one running right now" — live session
                         // state. Nightscout carries no override record on this feed (1,725
@@ -10181,7 +10235,7 @@
                 // Auto-detected changes (from delta view or schedule comparison)
                 prompts.sessionContinuity.autoDetected = [];
                 
-                // v3.6.06 (DEF-094): the manual-logged branch is removed with the
+                // v3.6.07 (DEF-094): the manual-logged branch is removed with the
                 // change queue it read. Auto-detected follow-ups above are now
                 // derived from the Sheets record and are device-independent.
                 console.log('sessionContinuity.manualLogged count:', prompts.sessionContinuity.manualLogged.length);
@@ -11712,7 +11766,7 @@
             
             // Load dynamic basal target from Google Sheets history
             // Also caches raw entries for reuse by carb-adjusted sensitivity
-            // v3.6.06: set by loadDynamicTarget, consumed by the change-record derivation
+            // v3.6.07: set by loadDynamicTarget, consumed by the change-record derivation
             // later in the same run. Reset per run so a failed fetch cannot serve stale rows.
             let resolvedHistoryForRun = { rows: [], meta: { historyAvailable: false,
                 historyEntryCount: 0, historyUnavailableReason: 'not_resolved', historySource: null } };
@@ -11736,7 +11790,7 @@
                     
                     // Cache entries for reuse by carb-adjusted sensitivity calculation
                     setCachedSheetsEntries(data.entries);
-                    // v3.6.06 (DEF-094): the change record derives from these rows.
+                    // v3.6.07 (DEF-094): the change record derives from these rows.
                     // React state is stale within the same tick, so the resolved rows are
                     // handed over directly. This is data the run already awaited — no new
                     // fetch and no reordering, which is what made Part C's blocker dissolve.
@@ -11891,7 +11945,7 @@
                     
                 } catch (error) {
                     console.error('Dynamic target: Error loading', error);
-                    // v3.6.06: three conditions no longer collapse to one null — the change
+                    // v3.6.07: three conditions no longer collapse to one null — the change
                     // record needs to know WHY, and "not configured" is not "fetch failed".
                     resolvedHistoryForRun = { rows: [], meta: { historyAvailable: false,
                         historyEntryCount: 0,
@@ -12268,7 +12322,7 @@
                         console.warn('No profile found in Nightscout, using default schedules');
                     }
                     
-                    // [CHANGE-RECORD-RESOLVE] v3.6.06 (DEF-094). The change record is built
+                    // [CHANGE-RECORD-RESOLVE] v3.6.07 (DEF-094). The change record is built
                     // HERE — before StateDetector.detect, before createBundles — from the
                     // Sheets rows loadDynamicTarget already awaited plus the live profile.
                     // Nothing downstream reads localStorage for changes any more.
@@ -14184,7 +14238,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.06 — Device-Independent Change Record</p>
+                                    <p className="text-gray-400 text-sm">v3.6.07 — Device-Independent Change Record</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -14792,7 +14846,7 @@
                                                                 {bundle.signalConflict && (
                                                                     <p className="text-orange-400 text-xs mt-1">{bundle.signalConflict}</p>
                                                                 )}
-                                                                {/* v3.6.06 (DEF-094): "Apply This One" removed with the manual
+                                                                {/* v3.6.07 (DEF-094): "Apply This One" removed with the manual
                                                                     change queue. It wrote outcome:PENDING to localStorage, and
                                                                     logOutcome — the only path that could clear it — was defined
                                                                     and never called. One click would have produced a permanent
