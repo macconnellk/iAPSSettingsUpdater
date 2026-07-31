@@ -9581,6 +9581,7 @@
                         rootCause: bundle.rootCause || null,
                         urgentReason: bundle.urgentReason || null,
                         urgencyWithheld: bundle.urgencyWithheld || null,
+                        priorityWithheld: bundle.priorityWithheld ?? null,
                         // v3.5.95 Part C: urgencyWithheld's sibling. Its absence is why every
                         // withhold — slot_conflict, covered_by_iob, iob_stacking,
                         // state_filtered — was invisible to the reviewer regardless of
@@ -9944,7 +9945,7 @@
                         } : null,
                         problemHours
                     },
-                    recentChanges: {
+                    recentChanges: ChangeRecord.available() ? {
                         autoDetected: (detectedChanges || []).map(c => ({
                             time: c.time,
                             parameter: c.type,
@@ -9953,7 +9954,7 @@
                             changePercent: c.changePercent,
                             detectedDate: new Date().toISOString().split('T')[0]
                         }))
-                    },
+                    } : UNAVAILABLE('recentChanges'),
                     schedules: {
                         cr: schedules.cr || [],
                         isf: schedules.isf || [],
