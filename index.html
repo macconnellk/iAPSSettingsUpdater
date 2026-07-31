@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.09</title>
+    <title>Daily Insulin Settings Review v3.6.12</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -65,6 +65,59 @@
         // factorFor:  present key -> its value; absent/unknown key -> the floor.
         // The floor is derived from the table at call time, so adding an entry
         // cannot silently move the absent-input answer.
+        // [TODAY-ROW-START] v3.6.12 (DEF-095). Today's log row is WRITE-ONLY.
+        // Every run reads the log as history ending yesterday and supplies today from
+        // its own live computation. Two helpers because the two corollaries are
+        // different operations and picking wrong must be type-visible:
+        //   lastRowBefore  -> the newest logged row strictly before today (SUBSTITUTE)
+        //   excludeToday   -> the series population minus today   (EXCLUDE, caller appends live)
+        // A series builder handed lastRowBefore loses its history; a live-value consumer
+        // handed excludeToday gets an array where it wanted a row. Both fail loudly.
+        //
+        // Strict `<` on the LOCAL day, taking the form from the persistence-escalation
+        // precedent. The yesterdayEntry precedent uses `!==`, which also returns a
+        // future-dated or out-of-order row; `<` cannot.
+        const isBeforeToday = (d) => {
+            const k = gapLocalDateKey(d);
+            return !!k && k < getLocalDateString();
+        };
+        const lastRowBefore = (rows, dateOf = (r) => r && (r.date || r.timestamp)) => {
+            const a = Array.isArray(rows) ? rows : [];
+            for (let i = a.length - 1; i >= 0; i--) if (isBeforeToday(dateOf(a[i]))) return a[i];
+            return null;
+        };
+        const excludeToday = (rows, dateOf = (r) => r && (r.date || r.timestamp)) =>
+            (Array.isArray(rows) ? rows : []).filter(r => isBeforeToday(dateOf(r)));
+
+        // Extracted from the auto-log payload so the crash alert and the log write
+        // derive today's slots from ONE implementation rather than two.
+        const deriveSafetyLowSlots = (findings) => {
+            try {
+                return [...new Set((findings || [])
+                    .filter(f => (f.events || []).some(e => ((e.lowBG ?? e.bg) < 60)))
+                    .map(f => f.scheduleTime).filter(Boolean))];
+            } catch (e) { return []; }
+        };
+        // [TODAY-ROW-END]
+
+        // [LEVER-PREDICATE-START] v3.6.10 (DEF-097). ONE definition, two consumers.
+        // Extracted from detectSlotConflicts, where it was a local const and therefore
+        // NOT in scope at filterByState (sibling method, same object). Extracted rather
+        // than copied: a second copy of a predicate is how diffScheduleSnapshot reached
+        // three implementations.
+        //
+        // "Carries a lever" is the same question for both consumers. Conflict detection
+        // asks it to decide whether a finding can contradict another; state filtering
+        // asks it to decide whether filtering the finding prevents anything. A finding
+        // that proposes nothing can do neither.
+        //
+        // The predicate is "has a lever ON THIS RUN", not "by construction":
+        // direct_meal_high@17:30 was lever-less on Jul 30 only, via covered_by_iob.
+        const joinsConflictSide = (f) =>
+            f.primaryParameter != null && f.scheduleTime != null &&
+            f.suggestedChangePercent != null && !f.recommendationWithheld;
+        // [LEVER-PREDICATE-END]
+
         const tableFloor = (table) => {
             const vals = Object.values(table || {}).filter(v => typeof v === 'number' && isFinite(v));
             return vals.length ? Math.min(...vals) : 0;
@@ -704,6 +757,32 @@
                     return acc;
                 }, {});
                 const pipelineCensus = { emitted: censusOf(findings) };
+                // v3.6.12 (DEF-095 consumer #6). A SECOND projection of the same live
+                // population at the same stage, keyed the way persistence keys — not
+                // derived from `emitted`, which has already collapsed slotless findings
+                // into `type@-` and cannot be un-collapsed.
+                //
+                // Slot-bearing subset ONLY. `persistenceKey`'s fallback is
+                // `name:<normalised>` and no finding carries a name (verified: 29
+                // emitters, none), so a slotless finding cannot be given persistence-grade
+                // identity here. The remainder is COUNTED and named rather than silently
+                // omitted — a reviewer seeing "reconciled 14 of 22, 8 slotless" knows the
+                // shape of what was not checked.
+                //
+                // Sufficient because the defect this reconciles against is whole-population:
+                // if today's tally is sourced from a logged row instead of live findings,
+                // EVERY count is wrong, and the slot-bearing subset detects that at once.
+                pipelineCensus.emittedPersistence = (() => {
+                    const keyed = {}; let slotless = 0;
+                    (findings || []).forEach(f => {
+                        if (!f) return;
+                        if (!f.type || !f.scheduleTime) { slotless++; return; }
+                        const k = persistenceKey({ detector: f.type, scheduleTime: f.scheduleTime });
+                        keyed[k] = (keyed[k] || 0) + 1;
+                    });
+                    return { keyed, slotless, reconcilable: Object.keys(keyed).length,
+                             total: (findings || []).length };
+                })();
 
                 // Step 0: Detect same-slot conflicts before filtering (BUG-008)
                 const { validFindings, slotConflicts } = this.detectSlotConflicts(findings);
@@ -898,9 +977,8 @@
                 // types (REBOUND_HIGH, RESISTANT_*) and coverage-withheld highs as
                 // a class, not by name; excluded from the sides, never from the
                 // output. The predicate can only reduce quarantine.
-                const joinsConflictSide = (f) =>
-                    f.primaryParameter != null && f.scheduleTime != null &&
-                    f.suggestedChangePercent != null && !f.recommendationWithheld;
+                // v3.6.10: moved to module scope — filterByState needs the same
+                // predicate and could not see it from here.
                 // Membership is decided ONCE, before any mutation: the quarantine
                 // branch sets recommendationWithheld on side members, so re-running
                 // the predicate afterward would double-emit them via the
@@ -1036,16 +1114,44 @@
                 const kept = this.filterByStateInner(findings, bodyState);
                 const keptSet = new Set(kept.map(f => f.__srcRef || f));
                 kept.forEach(f => { delete f.__srcRef; });
-                const rescued = findings.filter(f => this.isSafetyFinding(f) && !keptSet.has(f));
+                // v3.6.10 (DEF-097). TWO reasons to rescue, both AT THE BOUNDARY so every
+                // filtering state is covered by construction rather than by remembering to
+                // patch each branch:
+                //   (a) safety type — the low-side allowlist, unchanged;
+                //   (b) NO LEVER — a finding that proposes nothing cannot drive an action,
+                //       and RECOVERY exists to limit action. Filtering it removes evidence
+                //       and prevents nothing. Definitional, not clinical.
+                // (b) is what deleted rebound_high@07:00 while the direct_meal_low it
+                // contradicted was promoted to PRIMARY on a 40 mg/dL event.
+                const rescued = findings.filter(f =>
+                    (this.isSafetyFinding(f) || !joinsConflictSide(f)) && !keptSet.has(f));
                 if (rescued.length > 0) {
-                    console.log(`[SAFETY-RETAIN] ${rescued.length} safety finding(s) retained ` +
-                        `against ${bodyState.state} filtering: ${rescued.map(f => f.type + '@' + f.scheduleTime).join(', ')}`);
+                    const detail = rescued.map(f =>
+                        `${f.type}@${f.scheduleTime}${joinsConflictSide(f) ? '' : ' (no lever)'}`);
+                    console.log(`[SAFETY-RETAIN] ${rescued.length} finding(s) retained ` +
+                        `against ${bodyState.state} filtering: ${detail.join(', ')}`);
                 }
                 // Rescued findings keep their evidence and lose only their lever — the
                 // same "withhold the action, keep the evidence" contract as quarantine.
-                return [...kept, ...rescued.map(f => Object.assign(f, {
-                    recommendationWithheld: f.recommendationWithheld || 'state_filtered',
-                    stateFilterReason: bodyState.state
+                // v3.6.10 A2. `recommendationWithheld: 'state_filtered'` asserts a lever was
+                // suppressed. On a lever-less finding no lever existed, so the claim is false
+                // — the exact class this family has spent six versions closing. Stamped only
+                // where a lever actually existed; an existing reason (covered_by_iob,
+                // budget_indeterminate) is preserved untouched either way.
+                // v3.6.10 A2b (DEF-063). The rescue no longer mutates the originals.
+                // Verified safe before changing: `keptSet` is built from originals BEFORE
+                // this line and the `!keptSet.has(f)` filter runs on the original `f`, so
+                // identity is decided before any copy exists; `__srcRef` is created,
+                // consumed and deleted inside filterByStateInner and never crosses here;
+                // and after this point `process` reads only `filteredFindings`, which
+                // Step 2 copies again immediately. Nothing downstream holds the original.
+                return [...kept, ...rescued.map(f => ({
+                    ...f,
+                    ...(joinsConflictSide(f)
+                        ? { recommendationWithheld: f.recommendationWithheld || 'state_filtered' }
+                        : {}),
+                    stateFilterReason: bodyState.state,
+                    retentionReason: joinsConflictSide(f) ? 'safety_type' : 'no_lever'
                 }))];
             },
 
@@ -1057,7 +1163,11 @@
 
                     case BodyStateType.TRANSIENT_SENSITIVITY:
                         // Filter out all weakening
-                        return findings.filter(f => this.isStrengthening(f) || f.type === FindingType.REBOUND_HIGH);
+                        // v3.6.10 A3: `|| f.type === REBOUND_HIGH` removed as redundant.
+                        // REBOUND_HIGH is lever-less by construction (primaryParameter null),
+                        // so the boundary now retains it here and in every filtering state.
+                        // Leaving it would be superseded-but-live — four instances this week.
+                        return findings.filter(f => this.isStrengthening(f));
 
                     case BodyStateType.OVERRIDE_ACTIVE:
                     case BodyStateType.UNDETERMINED:
@@ -3780,7 +3890,20 @@
         // record → null, never a forward record.
         const IOB_LOOKUP_WINDOW_MS = 15 * 60 * 1000;
         const lookupIOB = (deviceStatus, targetTime, opts = {}) => {
-            const direction = opts.direction || 'nearest';
+            // v3.6.11 (DEF-032). `direction` is REQUIRED and the only legal value is
+            // 'before'. The deleted 'nearest' branch matched on Math.abs(), so it could
+            // select a devicestatus record written AFTER the meal bolus — reproduced
+            // exactly against the Jul 24 feed: at the 15:13:41Z bolus it returns 3.32U
+            // (record 15:15:46, +2.1 min) where 'before' returns 0.951U (record 15:10:23),
+            // and 0.951U is the owner's Nightscout ground truth. The difference, 2.37U,
+            // is the meal bolus itself. It had no callers and was the DEFAULT, which is
+            // the vestigial-gate class with a confirmed clinical failure behind it.
+            // Fails loudly rather than defaulting to the branch that produced 3.32U.
+            if (opts.direction !== 'before') {
+                throw new Error("lookupIOB/findDeviceStatusAt: direction must be 'before'"
+                    + " — got " + JSON.stringify(opts.direction)
+                    + ". Forward-matching produced DEF-032 (3.32U vs 0.951U actual).");
+            }
             const empty = { value: null, sourceTime: null, ageMinutes: null };
             if (!deviceStatus || deviceStatus.length === 0) return empty;
             const targetMs = targetTime instanceof Date
@@ -3791,26 +3914,18 @@
                 if (!status || !status.created_at) return;
                 const iob = extractIOB(status);
                 if (iob == null) return;
-                if (direction === 'before') {
-                    const internal = status.openaps?.iob?.time;
-                    let ts = internal ? new Date(internal).getTime() : NaN;
-                    if (isNaN(ts)) ts = new Date(status.created_at).getTime();
-                    if (isNaN(ts) || ts > targetMs) return;
-                    const lastBolus = status.openaps?.iob?.lastBolusTime;
-                    if (lastBolus != null) {
-                        const lb = new Date(lastBolus).getTime();
-                        if (!isNaN(lb) && lb >= targetMs) return;
-                    }
-                    const delta = targetMs - ts;
-                    if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) {
-                        bestDelta = delta; best = { value: iob, ts };
-                    }
-                } else {
-                    const ts = new Date(status.created_at).getTime();
-                    const delta = Math.abs(ts - targetMs);
-                    if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) {
-                        bestDelta = delta; best = { value: iob, ts };
-                    }
+                const internal = status.openaps?.iob?.time;
+                let ts = internal ? new Date(internal).getTime() : NaN;
+                if (isNaN(ts)) ts = new Date(status.created_at).getTime();
+                if (isNaN(ts) || ts > targetMs) return;
+                const lastBolus = status.openaps?.iob?.lastBolusTime;
+                if (lastBolus != null) {
+                    const lb = new Date(lastBolus).getTime();
+                    if (!isNaN(lb) && lb >= targetMs) return;
+                }
+                const delta = targetMs - ts;
+                if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) {
+                    bestDelta = delta; best = { value: iob, ts };
                 }
             });
             if (!best) return empty;
@@ -3822,7 +3937,20 @@
         };
         // Record-form lookup with the same direction contract (netIobAtNadir path).
         const findDeviceStatusAt = (deviceStatus, targetTime, opts = {}) => {
-            const direction = opts.direction || 'nearest';
+            // v3.6.11 (DEF-032). `direction` is REQUIRED and the only legal value is
+            // 'before'. The deleted 'nearest' branch matched on Math.abs(), so it could
+            // select a devicestatus record written AFTER the meal bolus — reproduced
+            // exactly against the Jul 24 feed: at the 15:13:41Z bolus it returns 3.32U
+            // (record 15:15:46, +2.1 min) where 'before' returns 0.951U (record 15:10:23),
+            // and 0.951U is the owner's Nightscout ground truth. The difference, 2.37U,
+            // is the meal bolus itself. It had no callers and was the DEFAULT, which is
+            // the vestigial-gate class with a confirmed clinical failure behind it.
+            // Fails loudly rather than defaulting to the branch that produced 3.32U.
+            if (opts.direction !== 'before') {
+                throw new Error("lookupIOB/findDeviceStatusAt: direction must be 'before'"
+                    + " — got " + JSON.stringify(opts.direction)
+                    + ". Forward-matching produced DEF-032 (3.32U vs 0.951U actual).");
+            }
             if (!deviceStatus || !deviceStatus.length) return null;
             const targetMs = targetTime instanceof Date
                 ? targetTime.getTime() : new Date(targetTime).getTime();
@@ -3830,22 +3958,17 @@
             let best = null, bestDelta = Infinity;
             deviceStatus.forEach(status => {
                 if (!status || !status.created_at) return;
-                if (direction === 'before') {
-                    const internal = status.openaps?.iob?.time;
-                    let ts = internal ? new Date(internal).getTime() : NaN;
-                    if (isNaN(ts)) ts = new Date(status.created_at).getTime();
-                    if (isNaN(ts) || ts > targetMs) return;
-                    const lastBolus = status.openaps?.iob?.lastBolusTime;
-                    if (lastBolus != null) {
-                        const lb = new Date(lastBolus).getTime();
-                        if (!isNaN(lb) && lb >= targetMs) return;
-                    }
-                    const delta = targetMs - ts;
-                    if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) { bestDelta = delta; best = status; }
-                } else {
-                    const delta = Math.abs(new Date(status.created_at).getTime() - targetMs);
-                    if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) { bestDelta = delta; best = status; }
+                const internal = status.openaps?.iob?.time;
+                let ts = internal ? new Date(internal).getTime() : NaN;
+                if (isNaN(ts)) ts = new Date(status.created_at).getTime();
+                if (isNaN(ts) || ts > targetMs) return;
+                const lastBolus = status.openaps?.iob?.lastBolusTime;
+                if (lastBolus != null) {
+                    const lb = new Date(lastBolus).getTime();
+                    if (!isNaN(lb) && lb >= targetMs) return;
                 }
+                const delta = targetMs - ts;
+                if (delta <= IOB_LOOKUP_WINDOW_MS && delta < bestDelta) { bestDelta = delta; best = status; }
             });
             return best;
         };
@@ -9386,7 +9509,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.09',
+                            version: '3.6.12',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9762,7 +9885,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.09',
+                        version: '3.6.12',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -10733,7 +10856,12 @@
             },
             
             // SPEC 2: Generate trend section from Sheets history
-            generateTrendSection(historyEntries, currentData, fullHistoryForOsc = null) {
+            // v3.6.12: `emittedCensus` is passed explicitly rather than folded into
+            // currentData. currentData is post-filter by nature; a pre-filter field inside
+            // it would be a number labelled with a population it was not computed from —
+            // the DEF-052e class, filed four times. The stage is in the parameter name.
+            generateTrendSection(historyEntries, currentData, fullHistoryForOsc = null,
+                                 emittedCensus = null) {
                 if (!historyEntries || historyEntries.length === 0) {
                     return '# TREND CONTEXT (14-day history)\n\n_No history available. Trends will populate after 2+ logged sessions._\n\n---\n\n';
                 }
@@ -10922,10 +11050,51 @@
                 // "nothing persistent" from "instrument broken" at a glance.
                 {
                     output += '## Item Persistence\n\n';
-                    const parsedRows = entries.filter(e =>
+                    // v3.6.12 (DEF-095 consumer #6). TODAY'S LOG ROW IS WRITE-ONLY.
+                    // Prior sessions come from logged rows with today excluded; today comes
+                    // from this run's live emitted findings.
+                    //
+                    // MEMBERSHIP is pre-filter, CLASSIFICATION is post-filter. The pre-filter
+                    // sourcing guards against findings VANISHING — RECOVERY deletes low-severity
+                    // findings, and counting post-filter would erase the recurrence record
+                    // exactly when RECOVERY fired. Nothing vanishes here: every emitted key is
+                    // counted. Only which of the two tallies it lands in comes from priority.
+                    //
+                    // ORPHANS — emitted but never bundled, i.e. deleted at the state filter —
+                    // fall to watch items BY CONSTRUCTION, because watch is the complement of
+                    // primary over the emitted key set rather than a second positive list.
+                    // They exist: the Jul 30 RECOVERY run lost 8 at the state filter, 5 of
+                    // them levered and genuinely deleted. Watch items is where a
+                    // non-actionable finding belongs, which is the ruling's own logic.
+                    const priorRows = excludeToday(entries);
+                    const todayTallyRow = (emittedCensus && emittedCensus.keyed) ? (() => {
+                        const primaryKeys = new Set((currentData && Array.isArray(currentData.primaryActions)
+                            ? currentData.primaryActions : []).map(persistenceKey));
+                        const asItem = (k) => {
+                            const i = k.lastIndexOf('@');
+                            return i < 0 ? { name: k.replace(/^name:/, '') }
+                                         : { detector: k.slice(0, i), scheduleTime: k.slice(i + 1) };
+                        };
+                        const keys = Object.keys(emittedCensus.keyed);
+                        return {
+                            date: getLocalDateString(),
+                            primaryActions: keys.filter(k => primaryKeys.has(k)).map(asItem),
+                            watchItems: keys.filter(k => !primaryKeys.has(k)).map(asItem)
+                        };
+                    })() : null;
+                    const tallyRows = todayTallyRow ? [...priorRows, todayTallyRow] : priorRows;
+
+                    const parsedRows = tallyRows.filter(e =>
                         Array.isArray(e.primaryActions) || Array.isArray(e.watchItems));
-                    const recentWithActions = entries.filter(e => Array.isArray(e.primaryActions));
-                    const recentWithWatch = entries.filter(e => Array.isArray(e.watchItems));
+                    // v3.6.12: TWO consumers, TWO named populations. Counting needs today
+                    // included; the escalation comparison needs it excluded. One array plus a
+                    // guard made that ambiguous and the guard's purpose had to be re-derived
+                    // twice. Same argument as two named helpers over one with a flag, one
+                    // level up: picking wrong is silent, so let the shape prevent it.
+                    const recentWithActions = tallyRows.filter(e => Array.isArray(e.primaryActions));
+                    const recentWithWatch   = tallyRows.filter(e => Array.isArray(e.watchItems));
+                    const priorWithActions  = priorRows.filter(e => Array.isArray(e.primaryActions));
+                    const priorWithWatch    = priorRows.filter(e => Array.isArray(e.watchItems));
 
                     if (parsedRows.length < 2) {
                         output += `_Persistence check unavailable: fewer than 2 history rows with parsed action/watch arrays (${parsedRows.length} found)._\n\n`;
@@ -11048,7 +11217,7 @@
                                     const n = displayName[k];
                                     nameCount[n] = (nameCount[n] || 0) + 1;
                                 });
-                                output += `**${label}** (3+ sessions, recency-weighted, keyed by detector@slot):\n`;
+                                output += `**${label}** (3+ sessions, recency-weighted, keyed by detector@slot, or by normalised name where a row lacks either field):\n`;
                                 for (const [key, count] of persistent) {
                                     const collides = nameCount[displayName[key]] > 1;
                                     const label2 = collides ? `${displayName[key]} \`[${key}]\`` : displayName[key];
@@ -11061,24 +11230,30 @@
                         };
                         renderTally('Recurring primary actions', recentWithActions, 'primaryActions');
                         renderTally('Recurring watch items', recentWithWatch, 'watchItems');
+                        // The reconciliation is load-bearing: this tally's consumer is a human
+                        // applying a threshold, with no code-level backstop. Slot-bearing subset
+                        // only — a slotless finding has no persistence-grade identity (no finding
+                        // carries a name; 29 emitters verified). The excluded count is NAMED so a
+                        // reviewer knows the shape of what was not checked.
+                        if (emittedCensus) {
+                            output += `_Today reconciled against the emitted census: ` +
+                                `${emittedCensus.reconcilable} of ${emittedCensus.total} findings ` +
+                                `(${emittedCensus.slotless} slotless, not reconcilable). ` +
+                                `Prior sessions are historical and are not reconciled._\n`;
+                        }
                         output += '\n';
 
-                        // Escalation/resolution compare against the most recent row dated
-                        // BEFORE today — after the same-session auto-log, the last row can
-                        // be today's own write, and today-vs-today is structurally empty
-                        // (one of the three Jul 22–24 empty causes).
-                        const todayKey = getLocalDateString();
-                        const priorRowOf = (rows) => {
-                            for (let i = rows.length - 1; i >= 0; i--) {
-                                const k = gapLocalDateKey(rows[i].date || rows[i].timestamp || '');
-                                if (k && k < todayKey) return rows[i];
-                            }
-                            return null;
-                        };
+                        // v3.6.12: the date guard is GONE, and not because it was redundant
+                        // where it stood — it was load-bearing against the synthetic today row.
+                        // It is unnecessary now because this consumer reads `priorRows`, from
+                        // which today is absent BY CONSTRUCTION via excludeToday. Structure
+                        // rather than a check, so nobody re-derives its purpose a third time.
+                        // Today-vs-today was one of the three Jul 22–24 empty causes.
+                        const priorRowOf = (rows) => rows.length ? rows[rows.length - 1] : null;
                         if (!currentData) {
                             output += '_Escalation/resolution check unavailable: no current-session data at this render site._\n\n';
                         } else {
-                            const priorWatchRow = priorRowOf(recentWithWatch);
+                            const priorWatchRow = priorRowOf(priorWithWatch);
                             if (priorWatchRow) {
                                 const priorWatchKeys = (priorWatchRow.watchItems || []).map(persistenceKey);
                                 const escalated = (Array.isArray(currentData.primaryActions) ? currentData.primaryActions : [])
@@ -11093,7 +11268,7 @@
                             } else {
                                 output += '_Escalation check unavailable: no prior-day watch row in history._\n';
                             }
-                            const priorActionRow = priorRowOf(recentWithActions);
+                            const priorActionRow = priorRowOf(priorWithActions);
                             if (priorActionRow) {
                                 const todayAllKeys = [
                                     ...(Array.isArray(currentData.primaryActions) ? currentData.primaryActions : []),
@@ -12262,17 +12437,7 @@
                             })));
                         } catch(e) { return '[]'; }
                     })(),
-                    safetyLowSlots: (() => {
-                        // Collect scheduleTime for any finding with a sub-60 mg/dL event
-                        try {
-                            return [...new Set(
-                                (findings || [])
-                                    .filter(f => (f.events || []).some(e => ((e.lowBG ?? e.bg) < 60)))
-                                    .map(f => f.scheduleTime)
-                                    .filter(Boolean)
-                            )];
-                        } catch(e) { return []; }
-                    })(),
+                    safetyLowSlots: deriveSafetyLowSlots(findings),
                     // INSTR-3: gate-cost + R2 shadow. Fields always present (the Log
                     // Script write guard keys on !== undefined); null metrics fail
                     // safe to empty tallies, never omitted.
@@ -13748,7 +13913,13 @@
                         // v3.6.04: consecutiveCrashAlert is a TIER-1 SAFETY FLAG and was
                         // the fifth casualty — it silently went false on the 10:34 run, and
                         // its absence is indistinguishable from "no consecutive crashes".
-                        const historyForAlert = resolvedHistory;
+                        // v3.6.12 (DEF-095 consumer #8). Prior sessions from the log with
+                        // TODAY EXCLUDED; today from this run's live findings. Reading
+                        // today's own row made a CONSECUTIVE-crash detector able to fire
+                        // only retrospectively — and v5.32 has it override a constraint
+                        // hold, which a day-late alert cannot do in time to matter.
+                        // Second silent failure path for this field; the first was DEF-086.
+                        const historyForAlert = excludeToday(resolvedHistory);
                         const slotSessionCount = {};
                         for (const entry of historyForAlert) {
                             const slots = Array.isArray(entry.safetyLowSlots) ? entry.safetyLowSlots : [];
@@ -13756,6 +13927,11 @@
                                 slotSessionCount[slot] = (slotSessionCount[slot] || 0) + 1;
                             }
                         }
+                        // Today's live contribution. Safety findings survive every state
+                        // filter by construction (v3.6.10 boundary), so the bundled
+                        // population contains all of them.
+                        deriveSafetyLowSlots((bundles || []).flatMap(b => b.findings || []))
+                            .forEach(slot => { slotSessionCount[slot] = (slotSessionCount[slot] || 0) + 1; });
                         const CRASH_ALERT_THRESHOLD = 2;
                         const alertSlots = new Set(
                             Object.entries(slotSessionCount)
@@ -13921,7 +14097,9 @@
                                     status: getBundleStatus(b).status
                                 }))
                             };
-                            trendSection = OutputFormatter.generateTrendSection(recentEntries, currentData, resolvedHistory);
+                            trendSection = OutputFormatter.generateTrendSection(
+                                recentEntries, currentData, resolvedHistory,
+                                analysisResults?.pipelineCensus?.emittedPersistence || null);
                         } catch (trendErr) {
                             console.error('Trend section failed:', trendErr);
                             trendSection = '# TREND CONTEXT\n\n_Error generating trend section_\n\n---\n\n';
@@ -14327,7 +14505,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.09 — Device-Independent Change Record</p>
+                                    <p className="text-gray-400 text-sm">v3.6.12 — Today's Log Row Is Write-Only</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
