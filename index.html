@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.18</title>
+    <title>Daily Insulin Settings Review v3.6.19</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -5208,7 +5208,14 @@
                 
                 signalAnalysis.periods.forEach(period => {
                     if (!period.hasSufficientData) return;
-                    if (period.cleanWindowCount < CONFIG.minEventsHighConfidence) return;
+                    // [SPLIT-READS-START] DEF-115. The split is computed and persisted on
+                    // this same period object; the detector was reading the PRE-split count
+                    // five times and the post-split count zero times. Every read below is the
+                    // effective (post-split) population — the one the deviation was actually
+                    // computed from. No branch: where no split applies the two are equal
+                    // (Dawn 321/321, Morning 90/90), so a conditional would add a path
+                    // without adding a behaviour.
+                    if (period.effectiveWindowCount < CONFIG.minEventsHighConfidence) return;
                     
                     const deviation = period.medianDeviation;
                     if (Math.abs(deviation) <= 10) return;
@@ -5245,23 +5252,34 @@
                         severity: Math.min(Math.abs(deviation) / 20, 0.95),
                         events: [{
                             period: period.name,
-                            cleanWindows: period.cleanWindowCount,
+                            cleanWindows: period.effectiveWindowCount,
                             medianDeviation: deviation,
                             signal: period.signal || (deviation > 10 ? 'HIGH' : deviation < -10 ? 'LOW' : 'NEUTRAL')
                         }],
-                        similarEventsCount: period.cleanWindowCount,
-                        daysWithPattern: Math.round(period.cleanWindowCount / 10),
+                        similarEventsCount: period.effectiveWindowCount,
+                        // DEVIATION FROM THE LITERAL SPEC, reported: substituting
+                        // effectiveWindowCount here does NOT satisfy close gate 3.
+                        // `windows / 10` is not a day count — Deep Sleep is 135 effective
+                        // windows over 7 days (~19/day), so /10 yields 14 inside a 7-day
+                        // analysisWindow. The object already carries the true figure.
+                        daysWithPattern: period.contributingDayCount || 0,
                         primaryParameter: 'basal',
                         suggestedChangePercent: adjustmentPercent,
                         contributingFactors: deviation > 0 ? ['insufficient_basal'] : ['excess_basal'],
                         claimedEventIds: [],
                         conflictsWith: [],
                         recencyWeight: 0.85,
-                        details: `${period.name} (${period.hours}): ${period.cleanWindowCount} clean windows from ${period.contributingDayCount ?? '?'} of ${analysisWindow} days show median deviation ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL from target.`,
+                        // The split IS the finding. Correcting the sentence to the narrow
+                        // population alone would be accurate and would discard the fact that
+                        // a wider body of evidence exists at a different value. Render both.
+                        details: (period.splitApplied && period.unsplitMedianDeviation != null)
+                            ? `${period.name} (${period.hours}): ${period.unsplitMedianDeviation >= 0 ? '+' : ''}${period.unsplitMedianDeviation.toFixed(1)} mg/dL across ${period.unsplitWindowCount} clean windows from ${period.contributingDayCount ?? '?'} of ${analysisWindow} days overall; ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL across the ${period.effectiveWindowCount} windows since ${String(period.splitChangeDate || '').slice(0, 10) || 'the last change'}.`
+                            : `${period.name} (${period.hours}): ${period.effectiveWindowCount} clean windows from ${period.contributingDayCount ?? '?'} of ${analysisWindow} days show median deviation ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL from target.`,
                         windowsByDate: period.windowsByDate || {},
                         contributingDayCount: period.contributingDayCount || 0,
                         ...extra
                     });
+                    // [SPLIT-READS-END]
 
                     // Emit anchor finding (existing behavior unchanged)
                     findings.push(buildFinding(anchorTime));
@@ -9703,7 +9721,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.18',
+                            version: '3.6.19',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -10084,7 +10102,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.18',
+                        version: '3.6.19',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -14773,7 +14791,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.18 — Compound Direction Audit (report-only)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.19 — Split-Population Reads (DEF-115)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
