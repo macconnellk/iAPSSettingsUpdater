@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.12</title>
+    <title>Daily Insulin Settings Review v3.6.18</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -99,6 +99,123 @@
             } catch (e) { return []; }
         };
         // [TODAY-ROW-END]
+
+        // [MONTHLY-OUTCOMES-START] v3.6.16 Part A. MEASUREMENT ONLY — no detector, no
+        // threshold, no gate, and deliberately no trend claim.
+        //
+        // A1: `Low_Pct` IS TBR<70 already — the log payload writes tir.low + tir.veryLow
+        // per the Jul 22 PM ruling. `Very_Low_Pct` (<54) is a SUBSET of it, not a
+        // complement. Summing the two double-counts the <54 band.
+        //
+        // A4: today is excluded. This diverges from v3.6.12's persistence ruling, where
+        // today counts. A persistence count asks "has this appeared", which includes now;
+        // a monthly aggregate is retrospective and today's row is not final.
+        const monthDayCount = (ym) => {
+            const [y, m] = String(ym).split('-').map(Number);
+            return (!y || !m) ? null : new Date(y, m, 0).getDate();
+        };
+        const computeMonthlyOutcomes = (rows) => {
+            const buckets = new Map();
+            excludeToday(rows).forEach(r => {
+                const key = gapLocalDateKey(r && (r.date || r.timestamp));
+                if (!key) return;
+                const ym = key.slice(0, 7);
+                if (!buckets.has(ym)) buckets.set(ym, {
+                    sessions: 0, days: new Set(), tir: [], tbr: [], veryLow: [],
+                    excluded: { tir7d: 0, lowPct: 0, veryLowPct: 0 }
+                });
+                const b = buckets.get(ym);
+                b.sessions++; b.days.add(key);
+                // An absent field is EXCLUDED AND COUNTED, never read as zero.
+                [['tir7d', b.tir], ['lowPct', b.tbr], ['veryLowPct', b.veryLow]]
+                    .forEach(([field, arr]) => {
+                        const v = parseFloat(r[field]);
+                        if (Number.isFinite(v)) arr.push(v); else b.excluded[field]++;
+                    });
+            });
+            const mean = (a) => a.length
+                ? Math.round((a.reduce((s, v) => s + v, 0) / a.length) * 100) / 100 : null;
+            return [...buckets.entries()]
+                .sort((a, b) => a[0] < b[0] ? -1 : 1)
+                .map(([ym, b]) => {
+                    const inMonth = monthDayCount(ym);
+                    const covered = b.days.size;
+                    return {
+                        month: ym,
+                        sessions: b.sessions,
+                        daysCovered: covered,
+                        daysInMonth: inMonth,
+                        // PARTIAL = half or more of the calendar month is UNOBSERVED.
+                        // The first rule was `covered < inMonth`, which fired on almost
+                        // every row — 29 of 31 days marked a month partial — and a marker
+                        // that fires on nearly everything carries no signal. This is the
+                        // failure mode the flag exists for: a figure read as a month when
+                        // the majority of the month was never seen. Feb 14/28 flags (half
+                        // a month, contiguous from the 15th); Aug 2/31 flags; Mar 29/31
+                        // does not. `n` and daysCovered render either way, so the
+                        // underlying data is unchanged — only the flag is narrowed.
+                        partial: inMonth == null ? true : covered * 2 <= inMonth,
+                        meanTIR7d: mean(b.tir),
+                        meanTBRunder70: mean(b.tbr),
+                        meanVeryLow: mean(b.veryLow),
+                        excludedRows: { ...b.excluded }
+                    };
+                });
+        };
+        // [MONTHLY-OUTCOMES-END]
+
+        // [BASAL-DELTA-START] v3.6.16 Part B. NET APPLIED basal change.
+        // Not projected — projectedTotal is a recommendation and may not be applied.
+        // Not gross — oscillation's dailyGross scores +8/−8 as 16% of motion; the gate
+        // this exists to calibrate is about net movement in delivery.
+        // Not from the recommendation set — taken from the same snapshot diff
+        // deriveChangeRecord uses, so "applied" means applied.
+        //
+        // The prior side is lastRowBefore(), not rows[rows.length - 1]: on a second run
+        // of a day the last logged row is today's own write and the delta reads zero.
+        const scheduleMapToArray = (map) => Object.keys(map || {})
+            .sort()
+            .map(t => ({ time: t, value: map[t] }));
+        const computeAppliedBasalDelta = (historyRows, liveBasalSchedule) => {
+            const priorRow = lastRowBefore(historyRows);
+            const priorMap = priorRow ? parseSnapshot(priorRow.basalSchedule) : null;
+            const liveMap = scheduleArrayToMap(liveBasalSchedule);
+            if (!priorMap || !liveMap) {
+                return { available: false,
+                    reason: !priorMap ? 'no_prior_snapshot' : 'no_live_schedule',
+                    deltaUPerDay: null, deltaPercent: null,
+                    priorTotal: null, newTotal: null };
+            }
+            const r3 = (v) => Math.round(v * 1000) / 1000;
+            const priorTotal = computeBasalDailyTotal(scheduleMapToArray(priorMap));
+            const newTotal = computeBasalDailyTotal(scheduleMapToArray(liveMap));
+            const delta = newTotal - priorTotal;
+            return { available: true, reason: null,
+                deltaUPerDay: r3(delta),
+                deltaPercent: priorTotal > 0 ? r3(delta / priorTotal * 100) : null,
+                priorTotal: r3(priorTotal), newTotal: r3(newTotal) };
+        };
+        // [BASAL-DELTA-END]
+
+        // [COMPOUND-AUDIT-START] v3.6.18 (spec v3.6.14 follow-on, DEF-112).
+        // REPORT ONLY. No branch consumes this; the wiring is the next build, which needs
+        // its own production gate because it restatuses nine bundles and both PRIMARYs.
+        //
+        // Rendered ADJACENT to the status it contradicts, not only in the JSON: a reviewer
+        // reading "consider staging" must see, in the same place, that the tool's own
+        // thresholds say blocked. Emitted-only would need an instruction line to be read;
+        // rendered, the output says it.
+        //
+        // ONE definition, three call sites (watch-list status, primary action line, JSON).
+        const compoundAuditNote = (a) => {
+            if (!a || !a.mismatch) return '';
+            const would = a.wouldGradeAs || 'CLEAR';
+            return ` \u26A0 GRADED ON THE WRONG SCALE — these recommendations ADD insulin,`
+                + ` but the sign convention read the total as a weaken and applied the`
+                + ` 10%/20% thresholds. On the strengthening scale (5%/10%) this is ${would}.`
+                + ` [DEF-112, unwired by design]`;
+        };
+        // [COMPOUND-AUDIT-END]
 
         // [LEVER-PREDICATE-START] v3.6.10 (DEF-097). ONE definition, two consumers.
         // Extracted from detectSlotConflicts, where it was a local const and therefore
@@ -1923,6 +2040,11 @@
                 }
                 
                 let effect = 0;
+                // [COMPOUND-FAMILY-START] v3.6.14 Part B (DEF-112). Per-family subtotals
+                // accumulate ALONGSIDE the existing sum — the weights, the literals and the
+                // sign branch below are R3a/R3b's and are left byte-for-byte alone.
+                const byFamily = { basal: 0, crisf: 0 };
+                const present = new Set();
                 
                 bundle.recommendations.forEach(rec => {
                     const change = rec.changePercent || 0;
@@ -1936,10 +2058,13 @@
                     const p = (rec.param || '').toLowerCase();
                     if (p === 'basal') {
                         effect += change * 1.0;
+                        byFamily.basal += change * 1.0; present.add('basal');
                     } else if (p === 'cr') {
                         effect += change * 0.45;
+                        byFamily.crisf += change * 0.45; present.add('crisf');
                     } else if (p === 'isf') {
                         effect += change * 0.25;
+                        byFamily.crisf += change * 0.25; present.add('crisf');
                     }
                 });
                 
@@ -1967,11 +2092,78 @@
                     }
                 }
                 
-                return {
-                    total: effect,
-                    warning,
-                    description: `${effect >= 0 ? '+' : ''}${effect.toFixed(1)}% insulin delivery change`
+                const description = `${effect >= 0 ? '+' : ''}${effect.toFixed(1)}% insulin delivery change`;
+
+                // v3.6.18: what the recommendations actually DO, read per-recommendation
+                // rather than from the sign of the sum — the DEF-112 shape, do not trust
+                // the sum. `gradedAs` is the branch the sign convention selected above.
+                // When the two disagree the cap was applied on the wrong scale.
+                const addsInsulin = (rec) => {
+                    const q = (rec.param || '').toLowerCase();
+                    const c = rec.changePercent || 0;
+                    if (q === 'basal') return c > 0;
+                    if (q === 'cr' || q === 'isf') return c < 0;
+                    return null;
                 };
+                const dirs = bundle.recommendations.map(addsInsulin).filter(v => v !== null);
+                const allStrengthen = dirs.length > 0 && dirs.every(v => v === true);
+                const allWeaken = dirs.length > 0 && dirs.every(v => v === false);
+                const onStrengthenScale = (e) => {
+                    const a = Math.abs(e);
+                    if (a >= blockThresholdPct) return 'BLOCKED';
+                    if (a >= warnThresholdConcentratedPct) return 'HIGH';
+                    return null;
+                };
+                const mismatch = (allStrengthen && effect >= 0) || (allWeaken && effect < 0);
+                const compoundDirectionAudit = {
+                    direction: allStrengthen ? 'strengthen' : (allWeaken ? 'weaken' : 'mixed'),
+                    gradedAs: effect < 0 ? 'strengthen' : 'weaken',
+                    mismatch,
+                    wouldGradeAs: (mismatch && allStrengthen) ? onStrengthenScale(effect) : null
+                };
+
+                // Single-family bundles — every bundle observed to date — return exactly
+                // what v3.6.16 returned. That is scope discipline, NOT evidence the path is
+                // sound: the basal sign inversion (a strengthen graded on the WEAKEN scale,
+                // 10%/20% instead of 5%/10%) is live here and is R3b's to fix.
+                if (present.size < 2) {
+                    return { total: effect, warning, description, compoundDirectionAudit };
+                }
+
+                // Mixed basal + CR/ISF: a basal strengthen is POSITIVE and a CR strengthen
+                // is NEGATIVE, so summing them cancels two changes that both add insulin.
+                // DO NOT SUM. Grade each family on its own and return the more conservative.
+                // The branch shape below repeats the one above deliberately — reusing it
+                // would mean rewriting the block R3a's scope test pins, and R3b deletes
+                // both. One duplication, named, with a shorter life than the alternative.
+                const gradeFamily = (e) => {
+                    const a = Math.abs(e);
+                    if (e < 0) {
+                        if (a >= blockThresholdPct) return 'BLOCKED';
+                        if (a >= warnThresholdConcentratedPct) return 'HIGH';
+                    } else {
+                        if (a >= blockThresholdWeakenPct) return 'BLOCKED';
+                        if (a >= warnThresholdWeakenPct) return 'HIGH';
+                    }
+                    return null;
+                };
+                const rank = (w) => w === 'BLOCKED' ? 2 : (w === 'HIGH' ? 1 : 0);
+                const gBasal = gradeFamily(byFamily.basal), gCrIsf = gradeFamily(byFamily.crisf);
+                const basalGoverns = rank(gBasal) >= rank(gCrIsf);
+                const governing = basalGoverns ? 'basal' : 'crisf';
+                return {
+                    total: byFamily[governing],
+                    warning: basalGoverns ? gBasal : gCrIsf,
+                    description: `${byFamily[governing] >= 0 ? '+' : ''}${byFamily[governing].toFixed(1)}%`
+                        + ` insulin delivery change (mixed bundle — families graded separately, ${governing} governs)`,
+                    summed: false,
+                    families: {
+                        basal: { effect: byFamily.basal, warning: gBasal },
+                        crisf: { effect: byFamily.crisf, warning: gCrIsf }
+                    },
+                    compoundDirectionAudit
+                };
+                // [COMPOUND-FAMILY-END]
             },
             
             applyProtection(bundle, allFindings, signalAnalysis) {
@@ -2372,7 +2564,8 @@
             }
             if (bundle.compoundEffect?.warning === 'HIGH') {
                 return {
-                    status: `Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`,
+                    status: `Compound effect (${Math.abs(bundle.compoundEffect.total).toFixed(1)}%) - consider staging changes`
+                        + compoundAuditNote(bundle.compoundEffect.compoundDirectionAudit),
                     statusReason: 'staged'
                 };
             }
@@ -8745,6 +8938,7 @@
                             if (primaryBundle.compoundEffect.warning) {
                                 output += ` ⚠️ ${primaryBundle.compoundEffect.warning}`;
                             }
+                            output += compoundAuditNote(primaryBundle.compoundEffect.compoundDirectionAudit);
                             output += `\n`;
                         }
                         
@@ -9509,7 +9703,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.12',
+                            version: '3.6.18',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9547,6 +9741,10 @@
                         oscillation: hMeta.historyAvailable ? computeScheduleOscillation(cachedHistory) : UNAVAILABLE('oscillation'),
                         changeEffectiveness: hMeta.historyAvailable ? computeChangeEffectiveness(cachedHistory) : UNAVAILABLE('changeEffectiveness'),
                         requirementGap: hMeta.historyAvailable ? computeRequirementGap(cachedHistory) : UNAVAILABLE('requirementGap'),
+                        // v3.6.16: both surfaces. The markdown renders these in the trend
+                        // section; an unavailable history DECLARES rather than emitting [].
+                        monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
+                        appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal) : UNAVAILABLE('appliedBasalDelta'),
                         currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus)
                     };
                 }
@@ -9739,6 +9937,7 @@
                         evidence,
                         compoundEffect: bundle.compoundEffect?.description ? {
                             totalChangePercent: bundle.compoundEffect.total || 0,
+                            directionAudit: bundle.compoundEffect.compoundDirectionAudit || null,
                             status: bundle.compoundEffect.warning || 'CLEAR'
                         } : null,
                         confidence: bundle.confidence || 0
@@ -9885,7 +10084,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.12',
+                        version: '3.6.18',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -10001,6 +10200,10 @@
                     changeEffectiveness: hMeta.historyAvailable ? computeChangeEffectiveness(cachedHistory) : UNAVAILABLE('changeEffectiveness'),
                     // INSTR-4: dawn provision vs measured requirement, derived
                     requirementGap: hMeta.historyAvailable ? computeRequirementGap(cachedHistory) : UNAVAILABLE('requirementGap'),
+                    // v3.6.16 Part A: monthly aggregates, no trend claim. Part B: NET
+                    // APPLIED basal change, the calibration input v5.55's gate lacks.
+                    monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
+                    appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal) : UNAVAILABLE('appliedBasalDelta'),
                     // v3.5.91: run-time IOB vs the pill — verification aid, no consumer
                     currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus),
                     informationalFindings: (analysisResults.findings || [])
@@ -10708,7 +10911,11 @@
                     tir: 80,        // Target: >=80%
                     gmi: 7,         // Target: <7%
                     cv: 36,         // Target: <36%
-                    low: 3,         // Target: <3%
+                    low: 3,         // Target: <3% — grades the "Low (54-70)" BAND ROW only.
+                                    // NOT retargeted by v3.6.14: the band and total TBR are
+                                    // different quantities and this literal feeds both places.
+                    tbrUnder70: 2,  // Target: <=2% — the owner's stated lows goal, graded
+                                    // against TOTAL below-70. v3.6.14 (DEF-114).
                     veryLow: 1,     // Target: <1%
                     high: 25,       // Target: <25%
                     veryHigh: 5     // Target: <5%
@@ -10723,10 +10930,25 @@
                 output += `**Overall:** ${agp.tir.inRange.toFixed(0)}% TIR (≥${goals.tir}% ${tirStatus}) | GMI ${agp.gmi.toFixed(1)}% (<${goals.gmi}% ${gmiStatus}) | CV ${agp.cv.toFixed(0)}% (<${goals.cv}% ${cvStatus})\n`;
                 
                 // Safety line with goals
-                const lowStatus = agp.tir.low < goals.low ? '✓' : '⚠️';
+                // [SAFETY-LINE-START] v3.6.14 Part A (DEF-114). The headline is TOTAL
+                // TBR<70 — the same quantity the Sheets log calls Low_Pct
+                // (tir.low + tir.veryLow, per the Jul 22 ruling).
+                //
+                // It was `agp.tir.low` alone: the 54-70 SUB-BAND, printed under the word
+                // "Low" — which everywhere else in this project means total below-range —
+                // and graded against goals.low = 3 when the stated goal is <=2%.
+                // Jul 31 rendered "2% Low (<3% ✓)" while the log recorded 3.1 for the same
+                // night. One metric, two numbers, and the smaller one carried the tick.
+                //
+                // goals.low is deliberately NOT retargeted: it still grades the
+                // "Low (54-70)" band row below, a different quantity. So the headline does
+                // not use the word "Low" — if the two must differ they must not share a name.
+                const tbrUnder70 = agp.tir.low + agp.tir.veryLow;
+                const tbrStatus = tbrUnder70 <= goals.tbrUnder70 ? '✓' : '⚠️';
                 const veryLowStatus = agp.tir.veryLow < goals.veryLow ? '✓' : '⚠️';
                 const veryLowDisplay = agp.tir.veryLow < 1 ? '<1' : agp.tir.veryLow.toFixed(0);
-                output += `**Safety:** ${agp.tir.low.toFixed(0)}% Low (<${goals.low}% ${lowStatus}) | ${veryLowDisplay}% Very Low (<${goals.veryLow}% ${veryLowStatus})\n`;
+                output += `**Safety:** ${tbrUnder70.toFixed(1)}% TBR<70 (≤${goals.tbrUnder70}% ${tbrStatus}) — of which ${agp.tir.low.toFixed(1)}% in 54-70, ${veryLowDisplay}% Very Low <54 (<${goals.veryLow}% ${veryLowStatus})\n`;
+                // [SAFETY-LINE-END]
                 
                 // 48h Trend comparison
                 if (agp48h) {
@@ -10867,6 +11089,39 @@
                 }
                 
                 let output = '# TREND CONTEXT (14-day history)\n\n';
+
+                // [MONTHLY-RENDER-START]
+                // v3.6.16 Part A — longitudinal context, placed before the 14-day detail
+                // so the shorter window is read inside the longer one. NO TREND LANGUAGE:
+                // no arrows, no inter-month deltas, no directional adjectives. The tool
+                // has no representation of season and must not imply a direction across
+                // one. Reads the same rows the three existing consumers read.
+                const monthlyOutcomes = computeMonthlyOutcomes(fullHistoryForOsc || historyEntries);
+                if (monthlyOutcomes.length > 0) {
+                    const f1 = (v) => v == null ? '-' : `${v.toFixed(1)}%`;
+                    const f2 = (v) => v == null ? '-' : `${v.toFixed(2)}%`;
+                    output += '## Monthly Outcomes\n\n';
+                    output += '_Each TIR figure is the mean of the 7-day rolling value across sessions in that month — not monthly TIR; overlapping windows are counted more than once. `TBR<70` is `Low_Pct`. `Very low (<54)` is a SUBSET of `TBR<70`, not an addition. `(partial)` marks a month where half or more of the calendar days were never observed._\n\n';
+                    output += '| Month | Sessions | Days covered | Mean TIR_7d | TBR<70 | Very low (<54) |\n';
+                    output += '|-------|----------|--------------|-------------|--------|----------------|\n';
+                    for (const m of monthlyOutcomes) {
+                        const cov = `${m.daysCovered}/${m.daysInMonth == null ? '?' : m.daysInMonth}`
+                            + (m.partial ? ' (partial)' : '');
+                        output += `| ${m.month} | ${m.sessions} | ${cov} | ${f1(m.meanTIR7d)} | ${f2(m.meanTBRunder70)} | ${f2(m.meanVeryLow)} |\n`;
+                    }
+                    const withExclusions = monthlyOutcomes.filter(m =>
+                        Object.values(m.excludedRows).some(v => v > 0));
+                    if (withExclusions.length > 0) {
+                        output += '\n_Rows with an absent field are excluded from that field\'s mean and counted, never read as zero: '
+                            + withExclusions.map(m => `${m.month} (`
+                                + Object.entries(m.excludedRows).filter(([, v]) => v > 0)
+                                    .map(([k, v]) => `${k} ${v}`).join(', ') + ')').join('; ')
+                            + '._\n';
+                    }
+                    output += '\n';
+                }
+                // [MONTHLY-RENDER-END]
+
                 const entries = historyEntries.sort((a, b) => new Date(a.date) - new Date(b.date));
                 const n = entries.length;
                 
@@ -12382,6 +12637,19 @@
                     lowPct: agp7d_auto ? (agp7d_auto.tir.low + agp7d_auto.tir.veryLow).toFixed(1) : '',
                     veryLowPct: agp7d_auto ? agp7d_auto.tir.veryLow.toFixed(1) : '',
                     basalRatio: basalRatioInfo?.ratio ? basalRatioInfo.ratio.toFixed(1) : '',
+                    // v3.6.16 Part B — NET APPLIED basal change, so the next day-level
+                    // gate is derived rather than chosen again. Empty string means the
+                    // prior snapshot was unreadable; '0.000' means no change was applied.
+                    // Those are different states and are not collapsed.
+                    ...(() => {
+                        const d = computeAppliedBasalDelta(
+                            resolvedHistoryForRun.rows, activeSchedules?.basal || basalSchedule);
+                        return {
+                            basalDeltaU: d.available ? d.deltaUPerDay.toFixed(3) : '',
+                            basalDeltaPct: (d.available && d.deltaPercent != null)
+                                ? d.deltaPercent.toFixed(2) : ''
+                        };
+                    })(),
                     // SPEC 2+: Period TIR tracking — all share agp7d_auto, zero additional AGP calls
                     ...(() => {
                         const getTIR = (period) => {
@@ -14505,7 +14773,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.12 — Today's Log Row Is Write-Only</p>
+                                    <p className="text-gray-400 text-sm">v3.6.18 — Compound Direction Audit (report-only)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
