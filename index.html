@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.19</title>
+    <title>Daily Insulin Settings Review v3.6.21</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -891,13 +891,28 @@
                 // EVERY count is wrong, and the slot-bearing subset detects that at once.
                 pipelineCensus.emittedPersistence = (() => {
                     const keyed = {}; let slotless = 0;
+                    // DEF-106: the excluded items are NAMED, not just counted. A reviewer
+                    // told "1 slotless" cannot act on it; told "resistant_high" they can.
+                    const slotlessTypes = {};
+                    let keyedFindings = 0;
                     (findings || []).forEach(f => {
                         if (!f) return;
-                        if (!f.type || !f.scheduleTime) { slotless++; return; }
+                        if (!f.type || !f.scheduleTime) {
+                            slotless++;
+                            const t = f.type || 'untyped';
+                            slotlessTypes[t] = (slotlessTypes[t] || 0) + 1;
+                            return;
+                        }
                         const k = persistenceKey({ detector: f.type, scheduleTime: f.scheduleTime });
                         keyed[k] = (keyed[k] || 0) + 1;
+                        keyedFindings++;
                     });
-                    return { keyed, slotless, reconcilable: Object.keys(keyed).length,
+                    // `reconcilable` is a KEY count and was rendered as a finding count —
+                    // "21 of 25 findings" with 0 slotless does not close as prose. Both are
+                    // now emitted under names that say which they are.
+                    return { keyed, slotless, slotlessTypes,
+                             keyedFindings, distinctKeys: Object.keys(keyed).length,
+                             reconcilable: Object.keys(keyed).length,
                              total: (findings || []).length };
                 })();
 
@@ -8150,10 +8165,29 @@
                 
                 // Calculate overall weighted deviation
                 const validPeriods = periods.filter(p => p.hasSufficientData);
+                // [WEIGHTED-DEV-START] DEF-118. Both terms read the EFFECTIVE (post-split)
+                // population — the one medianDeviation was computed from.
+                //
+                // Was: post-split deviation x PRE-split count, over a PRE-split total. That
+                // weighted every split period by a population its own figure never came from,
+                // and the weight was largest exactly where the evidence was thinnest: on
+                // Aug 3, Sleep Onset's +179 (13 windows) was weighted by 64 and contributed
+                // 36% of the numerator. Emitted 34.43; correct 20.74.
+                //
+                // NOT a display defect. weightedDeviation feeds getTieredAdjustment, whose
+                // step output becomes signalOnlyAnchor = currentBasalPercent + adjustment.
+                // 34.43 lands in the <=40 -> +3 tier; 20.74 lands in <=30 -> +2. The basal
+                // percent-of-TDD signal read 38.46 and should have read 37.46 — a whole tier.
+                //
+                // BOTH terms, not just the numerator: correcting the numerator alone gives
+                // post-split deviations over a pre-split total (15.64), which is further from
+                // correct than the defect and looks closer. No branch — where no split
+                // applies the two counts are equal.
                 const weightedDeviation = validPeriods.length > 0
-                    ? validPeriods.reduce((sum, p) => sum + (p.medianDeviation * p.cleanWindowCount), 0) /
-                      validPeriods.reduce((sum, p) => sum + p.cleanWindowCount, 0)
+                    ? validPeriods.reduce((sum, p) => sum + (p.medianDeviation * p.effectiveWindowCount), 0) /
+                      validPeriods.reduce((sum, p) => sum + p.effectiveWindowCount, 0)
                     : 0;
+                // [WEIGHTED-DEV-END]
                 
                 // Calculate signalOnlyAnchor using tiered nudge approach
                 // More intuitive and produces physiologically meaningful pump changes
@@ -9721,7 +9755,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.19',
+                            version: '3.6.21',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -10102,7 +10136,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.19',
+                        version: '3.6.21',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -11508,12 +11542,29 @@
                         // only — a slotless finding has no persistence-grade identity (no finding
                         // carries a name; 29 emitters verified). The excluded count is NAMED so a
                         // reviewer knows the shape of what was not checked.
+                        // [CENSUS-RECON-START] DEF-106. Renders WHENEVER a census exists —
+                        // including when slotless is 0. A disclosure that appears only on
+                        // exception teaches the reviewer to read its absence as "nothing was
+                        // excluded", which is exactly what three builds of silence trained.
                         if (emittedCensus) {
-                            output += `_Today reconciled against the emitted census: ` +
-                                `${emittedCensus.reconcilable} of ${emittedCensus.total} findings ` +
-                                `(${emittedCensus.slotless} slotless, not reconcilable). ` +
-                                `Prior sessions are historical and are not reconciled._\n`;
+                            const kf = emittedCensus.keyedFindings
+                                ?? (emittedCensus.total - (emittedCensus.slotless || 0));
+                            const named = Object.entries(emittedCensus.slotlessTypes || {})
+                                .map(([t, n]) => n > 1 ? `${t} x${n}` : t).join(', ');
+                            output += `_Today reconciled against the emitted census: `
+                                + `${kf} of ${emittedCensus.total} findings counted across `
+                                + `${emittedCensus.distinctKeys ?? emittedCensus.reconcilable} detector@slot `
+                                + `key${(emittedCensus.distinctKeys ?? emittedCensus.reconcilable) === 1 ? '' : 's'}; `
+                                + (emittedCensus.slotless
+                                    ? `${emittedCensus.slotless} excluded for having no slot`
+                                      + (named ? ` (${named})` : '') + `. `
+                                    : `none excluded. `)
+                                + `Prior sessions are historical and are not reconciled._\n`;
+                        } else {
+                            output += `_Census unavailable — today's tally could not be `
+                                + `reconciled against the emitted findings._\n`;
                         }
+                        // [CENSUS-RECON-END]
                         output += '\n';
 
                         // v3.6.12: the date guard is GONE, and not because it was redundant
@@ -14383,9 +14434,19 @@
                                     status: getBundleStatus(b).status
                                 }))
                             };
+                            // [CENSUS-WIRE-START] DEF-106. `analysisResults.pipelineCensus` is
+                            // never assigned — the census is assembled into the JSON from
+                            // RecommendationEngine.lastPipelineCensus. So this read resolved
+                            // undefined, `|| null` turned that into a valid-looking absence,
+                            // and the reconciliation line silently never rendered. Three
+                            // builds; nobody saw a missing sentence.
+                            // Read the source the JSON reads.
                             trendSection = OutputFormatter.generateTrendSection(
                                 recentEntries, currentData, resolvedHistory,
-                                analysisResults?.pipelineCensus?.emittedPersistence || null);
+                                RecommendationEngine.lastPipelineCensus?.emittedPersistence
+                                    ?? analysisResults?.pipelineCensus?.emittedPersistence
+                                    ?? null);
+                            // [CENSUS-WIRE-END]
                         } catch (trendErr) {
                             console.error('Trend section failed:', trendErr);
                             trendSection = '# TREND CONTEXT\n\n_Error generating trend section_\n\n---\n\n';
@@ -14791,7 +14852,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.19 — Split-Population Reads (DEF-115)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.21 — Census Reconciliation Renders (DEF-106)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -15721,8 +15782,17 @@
                                                             : 'N/A'
                                                         }
                                                     </div>
+                                                    {/* DEF-118: the card renders medianDeviation
+                                                        (post-split) directly above this count.
+                                                        Pairing it with cleanWindowCount was the
+                                                        same impossible sentence v3.6.19 removed
+                                                        from the markdown, still live in the UI. */}
                                                     <div className="text-gray-500 text-xs">
-                                                        {period.cleanWindowCount} windows
+                                                        {period.effectiveWindowCount ?? period.cleanWindowCount} windows
+                                                        {period.splitApplied && period.unsplitMedianDeviation != null
+                                                            ? ` since ${String(period.splitChangeDate || '').slice(0, 10)}`
+                                                            + ` \u00b7 ${period.unsplitMedianDeviation >= 0 ? '+' : ''}${period.unsplitMedianDeviation.toFixed(1)} across ${period.unsplitWindowCount} overall`
+                                                            : ''}
                                                     </div>
                                                     {period.signal === 'INSUFFICIENT' && (
                                                         <div className="text-gray-500 text-xs mt-1 italic">
