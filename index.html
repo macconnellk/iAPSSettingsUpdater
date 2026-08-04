@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.22</title>
+    <title>Daily Insulin Settings Review v3.6.23</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -1400,8 +1400,23 @@
                     const EVIDENCE_DAY_FACTOR = { 1: 0.6, 2: 0.8, 3: 0.9 }; // 4+ days → 1.0
                     const EVIDENCE_WINDOW_THIN = 20;      // < 20 windows → 0.8
                     const EVIDENCE_WINDOW_MODERATE = 50;  // < 50 windows → 0.9; else 1.0
-                    const evDays = finding.contributingDayCount
-                        ?? finding.signalSupport?.contributingDayCount ?? null;
+                    // [EVDAYS-START] DEF-126. Was contributingDayCount — the PRE-split
+                    // day count. DEF-115 corrected `windows / 10` to a real day count and
+                    // substituted one pre-split field for another; the bound invariant
+                    // (`daysWithPattern <= window`) passed on the wrong answer, which is
+                    // why nothing caught it. Sleep Onset is a ONE-day finding that was
+                    // credited with six and scored dayFactor 1.0.
+                    //
+                    // The `== null` test is load-bearing and stays loose: it must catch
+                    // BOTH null and undefined. A 0 reaching here would test false, skip
+                    // the floor, and index EVIDENCE_DAY_FACTOR[0] — undefined — which the
+                    // `??` would silently absorb into the same floor by a different path.
+                    // Same value, wrong route, and it stops being the same value the
+                    // moment the table gains a 0 entry. Absent stays absent: the sources
+                    // below are `?? null`, never `|| 0`.
+                    const evDays = finding.effectiveContributingDayCount
+                        ?? finding.signalSupport?.effectiveContributingDayCount ?? null;
+                    // [EVDAYS-END]
                     const evWindows = finding.events?.[0]?.cleanWindows
                         ?? finding.signalSupport?.cleanWindows ?? null;
                     const dayFactor = evDays == null ? tableFloor(EVIDENCE_DAY_FACTOR)
@@ -2341,6 +2356,11 @@
                 });
                 
                 // Step 2: Sort by urgency, then tier, then recency, then confidence
+                // [PRIORITY-SORT-START] DEF-126 marked this, unchanged, so the PRIMARY
+                // assignment can be REPLAYED from source rather than reasoned about.
+                // Confidence is the LAST term, and this sort feeds the first-come-wins
+                // one-per-block selection below — so a confidence movement can reassign
+                // PRIMARY wherever two bundles in a block tie on every earlier term.
                 bundles.sort((a, b) => {
                     // Urgent first
                     if (a.isUrgent !== b.isUrgent) return a.isUrgent ? -1 : 1;
@@ -2352,6 +2372,7 @@
                     // Then by confidence
                     return b.confidence - a.confidence;
                 });
+                // [PRIORITY-SORT-END]
                 
                 // Step 3: Check for blockers
                 const hasBasalRatioWarning = bundles.some(b => b.isBasalRatioWarning);
@@ -5289,7 +5310,12 @@
                         // `windows / 10` is not a day count — Deep Sleep is 135 effective
                         // windows over 7 days (~19/day), so /10 yields 14 inside a 7-day
                         // analysisWindow. The object already carries the true figure.
-                        daysWithPattern: period.contributingDayCount || 0,
+                        // DEF-126. Repointed WITH evDays, not after it. Moving only the
+                        // confidence input would leave the displayed day count and the
+                        // scored one disagreeing again — in the opposite direction from
+                        // v3.6.22, which is worse than the original disagreement because
+                        // the display would then be the stale half.
+                        daysWithPattern: period.effectiveContributingDayCount ?? null,
                         primaryParameter: 'basal',
                         suggestedChangePercent: adjustmentPercent,
                         contributingFactors: deviation > 0 ? ['insufficient_basal'] : ['excess_basal'],
@@ -5309,7 +5335,11 @@
                         splitApplied: period.splitApplied === true,
                         splitChangeDate: period.splitChangeDate || null,
                         effectiveWindowsByDate: period.effectiveWindowsByDate || {},
-                        effectiveContributingDayCount: period.effectiveContributingDayCount || 0,
+                        // DEF-126: `|| 0` here, shipped in v3.6.22 when nothing read this
+                        // field. It is now a confidence input, and 0 is a value the factor
+                        // table has no entry for while null is the value the floor path
+                        // tests for. Absent must stay absent.
+                        effectiveContributingDayCount: period.effectiveContributingDayCount ?? null,
                         ...extra
                     });
                     // [SPLIT-READS-END]
@@ -9821,7 +9851,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.22',
+                            version: '3.6.23',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -10230,7 +10260,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.22',
+                        version: '3.6.23',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -15001,7 +15031,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.22 — Population Legibility (DEF-120, DEF-124)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.23 — Confidence Reads the Split Population (DEF-126)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
