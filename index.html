@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.21</title>
+    <title>Daily Insulin Settings Review v3.6.22</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2028,17 +2028,29 @@
                     let detail = f.details || 'No details available';
 
                     // Append window distribution line for basal signal findings
+                    // [DIST-RENDER-START] DEF-120. Both populations or neither. Printing the
+                    // pre-split distribution under a post-split deviation is worse than
+                    // printing the pre-split pair, because the two look reconciled.
                     if ((f.type === 'basal_signal_high' || f.type === 'basal_signal_low') &&
                         f.windowsByDate && Object.keys(f.windowsByDate).length > 0) {
-                        const distStr = Object.entries(f.windowsByDate)
+                        const fmtDist = (m) => Object.entries(m)
                             .sort(([a], [b]) => a.localeCompare(b))
                             .map(([date, count]) => {
                                 const d = new Date(date + 'T12:00:00');
                                 return `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} (${count})`;
                             })
                             .join(', ');
-                        detail += ` | Distribution: ${distStr}`;
+                        const hasSplitDist = f.splitApplied === true && f.effectiveWindowsByDate
+                            && Object.keys(f.effectiveWindowsByDate).length > 0;
+                        if (hasSplitDist) {
+                            const since = String(f.splitChangeDate || '').slice(0, 10) || 'the last change';
+                            detail += ` | Distribution overall: ${fmtDist(f.windowsByDate)}`
+                                + ` | Distribution since ${since}: ${fmtDist(f.effectiveWindowsByDate)}`;
+                        } else {
+                            detail += ` | Distribution: ${fmtDist(f.windowsByDate)}`;
+                        }
                     }
+                    // [DIST-RENDER-END]
 
                     return {
                         icon,
@@ -5288,10 +5300,16 @@
                         // population alone would be accurate and would discard the fact that
                         // a wider body of evidence exists at a different value. Render both.
                         details: (period.splitApplied && period.unsplitMedianDeviation != null)
-                            ? `${period.name} (${period.hours}): ${period.unsplitMedianDeviation >= 0 ? '+' : ''}${period.unsplitMedianDeviation.toFixed(1)} mg/dL across ${period.unsplitWindowCount} clean windows from ${period.contributingDayCount ?? '?'} of ${analysisWindow} days overall; ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL across the ${period.effectiveWindowCount} windows since ${String(period.splitChangeDate || '').slice(0, 10) || 'the last change'}.`
+                            ? `${period.name} (${period.hours}): ${period.unsplitMedianDeviation >= 0 ? '+' : ''}${period.unsplitMedianDeviation.toFixed(1)} mg/dL across ${period.unsplitWindowCount} clean windows from ${period.contributingDayCount ?? '?'} of ${analysisWindow} days overall; ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL across the ${period.effectiveWindowCount} windows from ${period.effectiveContributingDayCount ?? '?'} day${period.effectiveContributingDayCount === 1 ? '' : 's'} since ${String(period.splitChangeDate || '').slice(0, 10) || 'the last change'}.`
                             : `${period.name} (${period.hours}): ${period.effectiveWindowCount} clean windows from ${period.contributingDayCount ?? '?'} of ${analysisWindow} days show median deviation ${deviation >= 0 ? '+' : ''}${deviation.toFixed(1)} mg/dL from target.`,
                         windowsByDate: period.windowsByDate || {},
                         contributingDayCount: period.contributingDayCount || 0,
+                        // DEF-120. The distribution renderer reads these to print the split
+                        // population's dates beside the split population's deviation.
+                        splitApplied: period.splitApplied === true,
+                        splitChangeDate: period.splitChangeDate || null,
+                        effectiveWindowsByDate: period.effectiveWindowsByDate || {},
+                        effectiveContributingDayCount: period.effectiveContributingDayCount || 0,
                         ...extra
                     });
                     // [SPLIT-READS-END]
@@ -8105,6 +8123,40 @@
                         median < -10 ? 'LOW' : 'NEUTRAL';
                     // [MEDIAN-END]
 
+                    // [SPLIT-DIST-START] DEF-120. The split was applied to the window count
+                    // and to nothing else. Every distribution field above is computed from
+                    // windowsInPeriod, BEFORE the split block opens — pre-split by
+                    // construction, not by oversight. On Aug 3 that printed a 64-window
+                    // distribution over six dates beneath a 13-window figure from one date,
+                    // on a PRIMARY driving a basal strengthen. A post-split figure over a
+                    // pre-split distribution is worse than the pre-split pair: it looks
+                    // reconciled.
+                    //
+                    // These are ADDITIONS. The pre-split fields keep their values and their
+                    // names, because two of them are ruled correct where they stand:
+                    // windowsByDate feeds evaluateVoidCoverage, and contributingDayCount
+                    // feeds confidence via evDays and is carried out of this build as
+                    // DEF-126. Repointing one and not the other would leave
+                    // Object.keys(windowsByDate).length !== contributingDayCount.
+                    //
+                    // No branch: where no split applies effectiveWindows IS windowsInPeriod,
+                    // so every field below is identical to its pre-split twin.
+                    const effectiveWindowsByDate = {};
+                    effectiveWindows.forEach(w => {
+                        if (w.date) effectiveWindowsByDate[w.date] = (effectiveWindowsByDate[w.date] || 0) + 1;
+                    });
+                    const effectiveContributingDates = Object.keys(effectiveWindowsByDate).sort();
+                    const effectiveContributingDayCount = effectiveContributingDates.length;
+                    const effectiveDayCounts = Object.values(effectiveWindowsByDate);
+                    const effectiveMaxDayCount = effectiveDayCounts.length > 0 ? Math.max(...effectiveDayCounts) : 0;
+                    const effectiveMaxDayShare = effectiveWindows.length > 0
+                        ? parseFloat((effectiveMaxDayCount / effectiveWindows.length).toFixed(4))
+                        : null;
+                    const effectiveMaxDayDate = effectiveMaxDayCount > 0
+                        ? (effectiveContributingDates.find(d => effectiveWindowsByDate[d] === effectiveMaxDayCount) || null)
+                        : null;
+                    // [SPLIT-DIST-END]
+
                     const hasSufficientData = effectiveWindows.length >= CONFIG.minEventsHighConfidence;
                     const deviations = effectiveWindows.map(w => w.deviation).sort((a, b) => a - b);
                     const medianDeviation = hasSufficientData ? medianOf(deviations) : null;
@@ -8149,10 +8201,24 @@
                         windowsByDate,
                         contributingDates,
                         contributingDayCount,
+                        effectiveWindowsByDate,
+                        effectiveContributingDates,
+                        effectiveContributingDayCount,
                         // INSTR-5 Part B — measurement only, consumed by nothing.
-                        maxDayShare,
-                        maxDayDate,
-                        maxDayCount,
+                        //
+                        // DEF-120: these three are the guard against a single day dominating
+                        // a finding, and the finding IS the split population. Computed on the
+                        // discarded population they reported Sleep Onset — one day, thirteen
+                        // windows — at maxDayShare 0.3438, well distributed. They are
+                        // repointed here and NOT elsewhere because a zero-consumer field can
+                        // be repointed without a behavioural change; that is the line the
+                        // A3 sweep drew, and it is the whole reason the sweep was run.
+                        maxDayShare: effectiveMaxDayShare,
+                        maxDayDate: effectiveMaxDayDate,
+                        maxDayCount: effectiveMaxDayCount,
+                        unsplitMaxDayShare: maxDayShare,
+                        unsplitMaxDayDate: maxDayDate,
+                        unsplitMaxDayCount: maxDayCount,
                         ceilingPerDay,
                         ceilingUtilization,
                         ceilingExceeded,
@@ -9755,7 +9821,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.21',
+                            version: '3.6.22',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9910,6 +9976,16 @@
                                     cleanWindows: evt0.cleanWindows ?? null,
                                     contributingDayCount: matchingPeriod?.contributingDayCount ?? f.contributingDayCount ?? null,
                                     windowsByDate: matchingPeriod?.windowsByDate ?? f.windowsByDate ?? null,
+                                    // DEF-120. `deviation` and `cleanWindows` above are both
+                                    // post-split; the two fields above them are not. The pair
+                                    // rides alongside rather than replacing, because
+                                    // contributingDayCount here is what evDays reads and
+                                    // moving it is DEF-126, not this build.
+                                    splitApplied: matchingPeriod?.splitApplied === true,
+                                    effectiveContributingDayCount: matchingPeriod?.effectiveContributingDayCount
+                                        ?? f.effectiveContributingDayCount ?? null,
+                                    effectiveWindowsByDate: matchingPeriod?.effectiveWindowsByDate
+                                        ?? f.effectiveWindowsByDate ?? null,
                                 };
                             }
                         });
@@ -10051,7 +10127,15 @@
                     unsplit: {
                         medianDeviation: period.unsplitMedianDeviation ?? null,
                         signal: period.unsplitSignal ?? 'INSUFFICIENT',
-                        windows: period.unsplitWindowCount ?? 0
+                        windows: period.unsplitWindowCount ?? 0,
+                        // DEF-120: the pre-split concentration lives here, with the other
+                        // pre-split measurements, rather than beside its split twin in
+                        // `concentration`. The v3.5.98 B6 scope guard is right that every
+                        // unsplit field belongs in one declared measurement block, and this
+                        // is that block.
+                        maxDayShare: period.unsplitMaxDayShare ?? null,
+                        maxDayDate: period.unsplitMaxDayDate ?? null,
+                        maxDayCount: period.unsplitMaxDayCount ?? 0
                     },
                     // INSTR-5 Part B — concentration and ceiling. Measurement only; the
                     // floor reported is the EXISTING one, not a second competing notion.
@@ -10061,10 +10145,20 @@
                     // to be starved — were exactly the ones you could not check.
                     windowsByDate: period.windowsByDate || {},
                     contributingDayCount: period.contributingDayCount ?? 0,
+                    effectiveWindowsByDate: period.effectiveWindowsByDate || {},
+                    effectiveContributingDayCount: period.effectiveContributingDayCount ?? 0,
                     concentration: {
+                        // DEF-120: these three now describe the population medianDeviation
+                        // was computed from. The unsplit twins ride alongside — both
+                        // populations or neither, same shape as unsplitMedianDeviation.
                         maxDayShare: period.maxDayShare ?? null,
                         maxDayDate: period.maxDayDate ?? null,
                         maxDayCount: period.maxDayCount ?? 0,
+                        // Collection integrity, NOT finding evidence — ruled correctly
+                        // pre-split by the DEF-120 A3 sweep and must not be substituted.
+                        // These detect duplicate SGVs against a physical per-day ceiling
+                        // over the FULL analysis window; narrowing them to the split
+                        // population destroys what they detect.
                         ceilingPerDay: period.ceilingPerDay ?? null,
                         ceilingUtilization: period.ceilingUtilization ?? null,
                         ceilingExceeded: period.ceilingExceeded === true,
@@ -10136,7 +10230,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.21',
+                        version: '3.6.22',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -11377,11 +11471,26 @@
                     const todayTallyRow = (emittedCensus && emittedCensus.keyed) ? (() => {
                         const primaryKeys = new Set((currentData && Array.isArray(currentData.primaryActions)
                             ? currentData.primaryActions : []).map(persistenceKey));
+                        // [ASITEM-NAME-START] DEF-124. asItem rebuilt items from census keys
+                        // and emitted no `name`. Today is the last row the tally iterates, so
+                        // `displayName[key] = item.name || key` fell through to the raw key
+                        // for every key today carried — the primary tally printed
+                        // `basal_signal_high@00:00` while the watch tally printed
+                        // `00:00 Basal - Rising Pattern` for the same key, because today
+                        // carried it in one field and not the other.
+                        const nameByKey = {};
+                        ['primaryActions', 'watchItems'].forEach(fld => {
+                            const arr = (currentData && Array.isArray(currentData[fld])) ? currentData[fld] : [];
+                            arr.forEach(b => { const k = persistenceKey(b); if (b && b.name) nameByKey[k] = b.name; });
+                        });
                         const asItem = (k) => {
                             const i = k.lastIndexOf('@');
-                            return i < 0 ? { name: k.replace(/^name:/, '') }
-                                         : { detector: k.slice(0, i), scheduleTime: k.slice(i + 1) };
+                            const base = i < 0 ? { name: k.replace(/^name:/, '') }
+                                               : { detector: k.slice(0, i), scheduleTime: k.slice(i + 1) };
+                            if (i >= 0 && nameByKey[k]) base.name = nameByKey[k];
+                            return base;
                         };
+                        // [ASITEM-NAME-END]
                         const keys = Object.keys(emittedCensus.keyed);
                         return {
                             date: getLocalDateString(),
@@ -11466,24 +11575,36 @@
                         };
                         const tally = (rows, field) => {
                             const freq = {}, weighted = {}, displayName = {}, distinctSessions = {};
+                            // DEF-124 B2: which SESSIONS a key appeared in, not just how many.
+                            // The union across the two fields cannot be recovered from the two
+                            // counts alone without assuming the fields are disjoint per session
+                            // — true today by construction, but an assumption, and this build
+                            // exists because an assumption about population went unchecked.
+                            const sessionsByKey = {};
                             const { alias, ambiguous } = buildKeyAliasMap(rows, field);
                             const unresolvedKeys = new Set();
                             let rawItemCount = 0;
                             for (const e of rows) {
                                 const items = Array.isArray(e[field]) ? e[field] : [];
-                                const w = sessionRecencyWeight(gapLocalDateKey(e.date || e.timestamp || '') || '');
+                                const sessionId = gapLocalDateKey(e.date || e.timestamp || '') || '';
+                                const w = sessionRecencyWeight(sessionId);
                                 const seenThisSession = new Set();
                                 for (const item of items) {
                                     rawItemCount++;
                                     const rawKey = persistenceKey(item);
                                     const key = alias[rawKey] || rawKey;
                                     if (key.startsWith('name:')) unresolvedKeys.add(key);
-                                    displayName[key] = item.name || key; // most recent variant wins
+                                    // DEF-124: most recent NAMED variant wins. A nameless item
+                                    // must not clobber a name an earlier row supplied — the
+                                    // fallback to `key` is for keys no row ever named, not for
+                                    // the last row happening to omit it.
+                                    displayName[key] = item.name || displayName[key] || key;
                                     if (seenThisSession.has(key)) continue;   // one session, one count
                                     seenThisSession.add(key);
                                     freq[key] = (freq[key] || 0) + 1;
                                     weighted[key] = (weighted[key] || 0) + w;
                                     distinctSessions[key] = (distinctSessions[key] || 0) + 1;
+                                    (sessionsByKey[key] = sessionsByKey[key] || new Set()).add(sessionId);
                                 }
                             }
                             // A counter and its denominator must be structurally unable to diverge.
@@ -11500,7 +11621,7 @@
                                 console.log('[PERSIST-AMBIGUOUS] ' + JSON.stringify(ambiguous));
                             }
                             return {
-                                freq, weighted, displayName, distinctSessions,
+                                freq, weighted, displayName, distinctSessions, sessionsByKey,
                                 unresolvedKeys: [...unresolvedKeys], ambiguousNames: ambiguous,
                                 rawItemCount
                             };
@@ -11508,8 +11629,32 @@
                         // [PERSIST-TALLY-END]
                         const PERSIST_RAW_THRESHOLD = 3;
                         const PERSIST_WEIGHTED_THRESHOLD = 1.5;
-                        const renderTally = (label, rows, field) => {
-                            const { freq, weighted, displayName } = tally(rows, field);
+                        // [PERSIST-UNION-START] DEF-124 B2. A key's appearances are split
+                        // across two disjoint sections and their total was never printed.
+                        // On Aug 3 `00:00 Basal - Rising Pattern` read 7/14 in the primary
+                        // tally and 4/14 in the watch tally: eleven sessions of persistence,
+                        // and six sessions of clinical argument rested on the seven.
+                        //
+                        // Counted over SESSIONS, not summed from the two figures — the fields
+                        // are disjoint per session by construction, and this does not rely on
+                        // that. Denominator is parsedRows: sessions carrying either array.
+                        const actionsTally = tally(recentWithActions, 'primaryActions');
+                        const watchTally   = tally(recentWithWatch, 'watchItems');
+                        const unionDenom   = parsedRows.length;
+                        const unionOf = (key) => {
+                            const a = actionsTally.sessionsByKey[key];
+                            const w = watchTally.sessionsByKey[key];
+                            if (!a && !w) return null;
+                            const all = new Set([...(a || []), ...(w || [])]);
+                            return {
+                                total: all.size,
+                                asPrimary: a ? a.size : 0,
+                                asWatch: w ? w.size : 0
+                            };
+                        };
+                        // [PERSIST-UNION-END]
+                        const renderTally = (label, rows, field, pre) => {
+                            const { freq, weighted, displayName } = pre || tally(rows, field);
                             const persistent = Object.entries(freq).filter(([k, v]) =>
                                 v >= PERSIST_RAW_THRESHOLD && (weighted[k] || 0) >= PERSIST_WEIGHTED_THRESHOLD);
                             if (persistent.length > 0) {
@@ -11524,19 +11669,23 @@
                                     const n = displayName[k];
                                     nameCount[n] = (nameCount[n] || 0) + 1;
                                 });
-                                output += `**${label}** (3+ sessions, recency-weighted, keyed by detector@slot, or by normalised name where a row lacks either field):\n`;
+                                output += `**${label}** (3+ sessions IN THIS SECTION, recency-weighted, keyed by detector@slot, or by normalised name where a row lacks either field; the count shown is total appearances across both sections):\n`;
                                 for (const [key, count] of persistent) {
                                     const collides = nameCount[displayName[key]] > 1;
                                     const label2 = collides ? `${displayName[key]} \`[${key}]\`` : displayName[key];
-                                    output += `- ${label2}: ${count}/${rows.length} sessions (weighted: ${(weighted[key] || 0).toFixed(1)})\n`;
+                                    const u = unionOf(key);
+                                    const unionStr = u
+                                        ? `${u.total}/${unionDenom} sessions total — ${u.asPrimary} as primary, ${u.asWatch} as watch`
+                                        : `${count}/${rows.length} sessions`;
+                                    output += `- ${label2}: ${unionStr} (weighted here: ${(weighted[key] || 0).toFixed(1)})\n`;
                                 }
                                 output += '\n';
                             } else {
                                 output += `_No ${label.toLowerCase()} met thresholds (${rows.length} sessions scanned, threshold ${PERSIST_RAW_THRESHOLD})._\n`;
                             }
                         };
-                        renderTally('Recurring primary actions', recentWithActions, 'primaryActions');
-                        renderTally('Recurring watch items', recentWithWatch, 'watchItems');
+                        renderTally('Recurring primary actions', recentWithActions, 'primaryActions', actionsTally);
+                        renderTally('Recurring watch items', recentWithWatch, 'watchItems', watchTally);
                         // The reconciliation is load-bearing: this tally's consumer is a human
                         // applying a threshold, with no code-level backstop. Slot-bearing subset
                         // only — a slotless finding has no persistence-grade identity (no finding
@@ -14852,7 +15001,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.21 — Census Reconciliation Renders (DEF-106)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.22 — Population Legibility (DEF-120, DEF-124)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
