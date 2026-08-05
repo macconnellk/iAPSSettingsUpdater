@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.23</title>
+    <title>Daily Insulin Settings Review v3.6.24</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3206,6 +3206,73 @@
                 : (isNaN(new Date(s)) ? null : getLocalDateString(new Date(s)));
             return ymd ? new Date(ymd + 'T00:00:00') : null;
         };
+        // [AVAILABILITY-START] DEF-137. Per-fetch availability existed; document-level
+        // availability did not. On Aug 4 17:36 fetch #1 (365d) failed and fetch #3 (14d)
+        // succeeded, so `historyAvailable: true` was true of #3 while 24 findings cited
+        // `history_unavailable` from #1. Both locally correct. Jointly, the document said
+        // "no change record" and "14 history entries" in one breath, and every longitudinal
+        // section recomputed on a ninth of the record without a word.
+        //
+        // ONE statement, computed once, consumed by every section that reads history. The
+        // sections do not each decide what happened — they inherit it.
+        //
+        // It renders on healthy runs too. A disclosure that appears only on failure teaches
+        // the reviewer to read its absence as "everything loaded", which is exactly what
+        // three builds of silence did to the census line (DEF-106 T7).
+        const FULL_HISTORY_WINDOW_DAYS = 365;
+        const buildAvailability = (historyMeta, changeRecordAvailable) => {
+            const m = historyMeta || {};
+            const win = m.historyWindowDays ?? null;
+            const rows = m.historyEntryCount ?? null;
+            if (m.historyAvailable !== true) {
+                return {
+                    status: 'unavailable', historySource: m.historySource ?? null,
+                    windowDays: null, rows: rows ?? 0, changeRecordAvailable: changeRecordAvailable === true,
+                    longitudinalBasis: 'none',
+                    statement: 'History could not be read (`'
+                        + (m.historyUnavailableReason || 'history_unavailable')
+                        + '`). Every longitudinal section below is unavailable, not empty.'
+                };
+            }
+            // The substitution: a COMPLETE answer to a NARROWER question. Not a truncation —
+            // the rows are all there, for a window nobody asked the reader to notice.
+            if (win !== null && win < FULL_HISTORY_WINDOW_DAYS) {
+                return {
+                    status: 'reduced_window', historySource: m.historySource ?? null,
+                    windowDays: win, rows, changeRecordAvailable: changeRecordAvailable === true,
+                    longitudinalBasis: 'partial_window',
+                    statement: 'History was read over a REDUCED WINDOW of ' + win + ' days ('
+                        + rows + ' rows, source `' + (m.historySource || 'unknown') + '`) because the '
+                        + FULL_HISTORY_WINDOW_DAYS + '-day read did not complete. '
+                        + 'Every longitudinal section below is computed on those ' + win + ' days only. '
+                        + 'This is a limit of the READ, not of the record — earlier sessions exist and were not retrieved.'
+                };
+            }
+            return {
+                status: 'full', historySource: m.historySource ?? null,
+                windowDays: win, rows, changeRecordAvailable: changeRecordAvailable === true,
+                longitudinalBasis: 'full_window',
+                statement: 'History read in full: ' + (rows ?? '?') + ' rows over '
+                    + (win ?? FULL_HISTORY_WINDOW_DAYS) + ' days (source `'
+                    + (m.historySource || 'unknown') + '`). Longitudinal sections below are '
+                    + 'computed on the complete retrieved record.'
+            };
+        };
+        // [AVAILABILITY-END]
+        // [SECTION-INHERIT-START] DEF-137. Each longitudinal heading inherits the ONE
+        // statement rather than recomputing what it thinks happened. MODULE SCOPE, not a
+        // closure inside generateTrendSection: the render blocks it decorates are all
+        // extracted and executed in isolation by the harness, so a closed-over helper
+        // makes every one of those slices throw. Same reason snapshotDiffSrc lives here.
+        const sectionQualifier = (availability) => {
+            if (!availability) return ' _(extent unverified)_';
+            if (availability.status === 'reduced_window')
+                return ` _(${availability.windowDays}-day read only — see Data availability)_`;
+            if (availability.status === 'unavailable') return ' _(history unreadable)_';
+            return '';
+        };
+        // [SECTION-INHERIT-END]
+
         const deriveChangeRecord = (historyRows, liveSchedules, historyMeta) => {
             if (!historyMeta || historyMeta.historyAvailable !== true) {
                 return { available: false,
@@ -9851,7 +9918,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.23',
+                            version: '3.6.24',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9885,6 +9952,14 @@
                         shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
                         historyAvailable: hMeta.historyAvailable,
                         historyEntryCount: hMeta.historyEntryCount ?? (cachedHistory || []).length,
+                        // DEF-137: the count never travelled with the window it covers.
+                        // Both are emitted now, and `dataAvailability` states what the pair
+                        // means for every section below it — on healthy runs as well.
+                        historyWindowDays: hMeta.historyWindowDays ?? null,
+                        historySource: hMeta.historySource ?? null,
+                        dataAvailability: buildAvailability(hMeta,
+                            analysisResults?.changeRecord?.available === true
+                            || ChangeRecord.available() === true),
                         ...(hMeta.historyAvailable ? {} : { historyUnavailableReason: hMeta.historyUnavailableReason }),
                         oscillation: hMeta.historyAvailable ? computeScheduleOscillation(cachedHistory) : UNAVAILABLE('oscillation'),
                         changeEffectiveness: hMeta.historyAvailable ? computeChangeEffectiveness(cachedHistory) : UNAVAILABLE('changeEffectiveness'),
@@ -10260,7 +10335,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.23',
+                        version: '3.6.24',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -11259,12 +11334,25 @@
             // it would be a number labelled with a population it was not computed from —
             // the DEF-052e class, filed four times. The stage is in the parameter name.
             generateTrendSection(historyEntries, currentData, fullHistoryForOsc = null,
-                                 emittedCensus = null) {
+                                 emittedCensus = null, availability = null) {
                 if (!historyEntries || historyEntries.length === 0) {
                     return '# TREND CONTEXT (14-day history)\n\n_No history available. Trends will populate after 2+ logged sessions._\n\n---\n\n';
                 }
                 
                 let output = '# TREND CONTEXT (14-day history)\n\n';
+
+                // [AVAILABILITY-RENDER-START] DEF-137. Stated ONCE, before any longitudinal
+                // figure, and stated on healthy runs too — a disclosure that appears only on
+                // failure trains the reader to treat its absence as an all-clear.
+                if (availability) {
+                    const icon = availability.status === 'full' ? '\u2713'
+                        : availability.status === 'reduced_window' ? '\u26A0\uFE0F' : '\u26D4';
+                    output += `_${icon} **Data availability:** ${availability.statement}_\n\n`;
+                } else {
+                    output += '_\u26D4 **Data availability:** not established for this run — '
+                        + 'read the longitudinal sections below as unverified in extent._\n\n';
+                }
+                // [AVAILABILITY-RENDER-END]
 
                 // [MONTHLY-RENDER-START]
                 // v3.6.16 Part A — longitudinal context, placed before the 14-day detail
@@ -11276,13 +11364,29 @@
                 if (monthlyOutcomes.length > 0) {
                     const f1 = (v) => v == null ? '-' : `${v.toFixed(1)}%`;
                     const f2 = (v) => v == null ? '-' : `${v.toFixed(2)}%`;
-                    output += '## Monthly Outcomes\n\n';
-                    output += '_Each TIR figure is the mean of the 7-day rolling value across sessions in that month — not monthly TIR; overlapping windows are counted more than once. `TBR<70` is `Low_Pct`. `Very low (<54)` is a SUBSET of `TBR<70`, not an addition. `(partial)` marks a month where half or more of the calendar days were never observed._\n\n';
+                    output += '## Monthly Outcomes' + sectionQualifier(availability) + '\n\n';
+                    // [PARTIAL-CAUSE-START] DEF-137. `(partial)` asserts a CAUSE — "these
+                    // calendar days were never observed". On Aug 4 it rendered
+                    // `2026-07 | 10 | 10/31 (partial)` for a month with 30 logged sessions,
+                    // because the read covered 14 days, not because July went unobserved.
+                    // The disclosure mechanism named the wrong cause, which is worse than
+                    // no disclosure: the reviewer draws a false conclusion about the DATA
+                    // instead of an accurate one about the FETCH.
+                    //
+                    // On a reduced window, coverage cannot be established at all, so the
+                    // flag says that instead of guessing. Same evidence, honest label.
+                    const windowLimited = !!availability && availability.status === 'reduced_window';
+                    output += '_Each TIR figure is the mean of the 7-day rolling value across sessions in that month — not monthly TIR; overlapping windows are counted more than once. `TBR<70` is `Low_Pct`. `Very low (<54)` is a SUBSET of `TBR<70`, not an addition. '
+                        + (windowLimited
+                            ? '`(window-limited)` marks a month whose coverage CANNOT BE ESTABLISHED because the history read covered only '
+                              + availability.windowDays + ' days — it does NOT mean those days went unobserved._\n\n'
+                            : '`(partial)` marks a month where half or more of the calendar days were never observed._\n\n');
+                    // [PARTIAL-CAUSE-END]
                     output += '| Month | Sessions | Days covered | Mean TIR_7d | TBR<70 | Very low (<54) |\n';
                     output += '|-------|----------|--------------|-------------|--------|----------------|\n';
                     for (const m of monthlyOutcomes) {
                         const cov = `${m.daysCovered}/${m.daysInMonth == null ? '?' : m.daysInMonth}`
-                            + (m.partial ? ' (partial)' : '');
+                            + (windowLimited ? ' (window-limited)' : (m.partial ? ' (partial)' : ''));
                         output += `| ${m.month} | ${m.sessions} | ${cov} | ${f1(m.meanTIR7d)} | ${f2(m.meanTBRunder70)} | ${f2(m.meanVeryLow)} |\n`;
                     }
                     const withExclusions = monthlyOutcomes.filter(m =>
@@ -11361,7 +11465,7 @@
                 {
                     const gap = computeRequirementGap(fullHistoryForOsc || historyEntries);
                     if (gap.series.length > 0 || gap.changes.length > 0) {
-                        output += '## Dawn Requirement Trend (native days — scheduled provision vs measured requirement)\n\n';
+                        output += '## Dawn Requirement Trend (native days — scheduled provision vs measured requirement)' + sectionQualifier(availability) + '\n\n';
                         // Plain YYYY-MM-DD keys compare lexically; parse only for labels.
                         const label = (key) => {
                             const pp = String(key).split('-').map(Number);
@@ -11425,7 +11529,7 @@
                 {
                     const osc = computeScheduleOscillation(fullHistoryForOsc || historyEntries);
                     if (osc.perBlock.length > 0 || osc.perSession.length > 0) {
-                        output += '## Schedule Oscillation (0 = converging, 1 = thrashing; percent basis)\n\n';
+                        output += '## Schedule Oscillation (0 = converging, 1 = thrashing; percent basis)' + sectionQualifier(availability) + '\n\n';
                         if (osc.perBlock.length > 0) {
                             output += `_Top blocks, trailing ${osc.blockWindowSessions}-session window` +
                                 (osc.structuralChanges > 0 ? `; ${osc.structuralChanges} structural/zero-prior step(s) excluded_` : '_') + '\n\n';
@@ -11457,7 +11561,7 @@
                     const eff = computeChangeEffectiveness(fullHistoryForOsc || historyEntries);
                     if (eff.ledger.length > 0) {
                         const s = eff.summary;
-                        output += '## Change Effectiveness\n\n';
+                        output += '## Change Effectiveness' + sectionQualifier(availability) + '\n\n';
                         output += `_${eff.ledger.length} change(s), trailing ${eff.horizon} sessions — ` +
                             `improved ${s.improved} · worsened ${s.worsened} · neutral ${s.neutral} · ` +
                             `caused-low ${s.causedLow} · reverted ${s.reverted} · voided ${s.voided} · ` +
@@ -11480,7 +11584,7 @@
                 // empty contract: never a bare header — a safety review must tell
                 // "nothing persistent" from "instrument broken" at a glance.
                 {
-                    output += '## Item Persistence\n\n';
+                    output += '## Item Persistence' + sectionQualifier(availability) + '\n\n';
                     // v3.6.12 (DEF-095 consumer #6). TODAY'S LOG ROW IS WRITE-ONLY.
                     // Prior sessions come from logged rows with today excluded; today comes
                     // from this run's live emitted findings.
@@ -12502,22 +12606,48 @@
             };
             
             // Reusable JSONP fetch for Google Apps Script GET requests (bypasses CORS)
+            // [LATE-RESPONSE-START] DEF-140. The timeout used to `delete window[cb]`, so a
+            // response arriving one second late called a function that no longer existed and
+            // surfaced as `Uncaught ReferenceError: _jsonpCb_… is not defined` — the single
+            // most diagnostic line in the whole corpus, thrown away as noise.
+            //
+            // A late arrival is the proof that the endpoint answered, and how late it was is
+            // the ONLY measurement in the system that can size the timeout correctly. It is
+            // recorded here rather than reasoned about later.
+            const jsonpLateArrivals = [];
+            // Every attempt, its outcome, and how many it took. This is the numerator and
+            // denominator of the failure rate that nothing counted before this build — the
+            // 10-of-20 figure had to be reconstructed from console logs after the fact.
+            const jsonpAttemptLog = [];
+            // [LATE-RESPONSE-END]
             const jsonpFetch = (url, timeoutMs = 10000) => {
                 return new Promise((resolve, reject) => {
                     const callbackName = '_jsonpCb_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+                    const issuedAt = Date.now();
                     const timeout = setTimeout(() => {
-                        delete window[callbackName];
+                        // Tombstone, NOT delete. A late response now lands somewhere that
+                        // measures it instead of throwing. It must not resolve the promise —
+                        // the run has already moved on and a late resolve would be worse
+                        // than a late log.
+                        window[callbackName] = () => {
+                            const lateBy = Date.now() - issuedAt;
+                            jsonpLateArrivals.push({ url, timeoutMs, arrivedAfterMs: lateBy });
+                            console.warn('[JSONP-LATE] response arrived ' + lateBy + 'ms after issue ('
+                                + (lateBy - timeoutMs) + 'ms past a ' + timeoutMs + 'ms budget) — '
+                                + 'the endpoint answered, the handler had already been torn down: ' + url);
+                            delete window[callbackName];
+                        };
                         if (script.parentNode) script.parentNode.removeChild(script);
                         reject(new Error('JSONP timeout (' + (timeoutMs/1000) + 's)'));
                     }, timeoutMs);
-                    
+
                     window[callbackName] = (data) => {
                         clearTimeout(timeout);
                         delete window[callbackName];
                         if (script.parentNode) script.parentNode.removeChild(script);
                         resolve(data);
                     };
-                    
+
                     const separator = url.includes('?') ? '&' : '?';
                     const script = document.createElement('script');
                     script.src = `${url}${separator}callback=${callbackName}`;
@@ -12530,7 +12660,39 @@
                     document.head.appendChild(script);
                 });
             };
-            
+
+            // [JSONP-RETRY-START] DEF-140. Fetch #1 (`days=365`) has failed in 10 of 20
+            // logged runs and is the ONLY fetch that has ever failed alone — the largest
+            // request against a cold-starting Apps Script. In both observed failure modes
+            // the endpoint answered; it was late, not absent, and a refresh eleven minutes
+            // later on the same URL returned cleanly.
+            //
+            // Bounded, not indefinite, and never blocking: two attempts, the second with a
+            // longer budget, then give up and let the v3.6.05/06/07 absence path run
+            // exactly as it does today. This build makes the absence rarer. It must not
+            // make it fatal, and it must not make the session wait on it.
+            const JSONP_ATTEMPT_BUDGETS_MS = [10000, 20000];
+            const jsonpFetchWithRetry = async (url) => {
+                let lastErr = null;
+                for (let i = 0; i < JSONP_ATTEMPT_BUDGETS_MS.length; i++) {
+                    try {
+                        const data = await jsonpFetch(url, JSONP_ATTEMPT_BUDGETS_MS[i]);
+                        if (i > 0) console.log('[JSONP-RETRY] attempt ' + (i + 1) + ' succeeded after '
+                            + i + ' failure(s): ' + (lastErr && lastErr.message));
+                        jsonpAttemptLog.push({ url, attempts: i + 1, outcome: 'ok' });
+                        return data;
+                    } catch (e) {
+                        lastErr = e;
+                        console.warn('[JSONP-RETRY] attempt ' + (i + 1) + ' of '
+                            + JSONP_ATTEMPT_BUDGETS_MS.length + ' failed (' + e.message + ')');
+                    }
+                }
+                jsonpAttemptLog.push({ url, attempts: JSONP_ATTEMPT_BUDGETS_MS.length,
+                    outcome: 'failed', reason: lastErr && lastErr.message });
+                throw lastErr;
+            };
+            // [JSONP-RETRY-END]
+
             // Load dynamic basal target from Google Sheets history
             // Also caches raw entries for reuse by carb-adjusted sensitivity
             // v3.6.09: set by loadDynamicTarget, consumed by the change-record derivation
@@ -12547,7 +12709,10 @@
                 
                 try {
                     // Fetch ALL available data (use large day count) via JSONP
-                    const data = await jsonpFetch(`${sheetsWebAppUrl}?action=read&days=365`);
+                    // DEF-140: retry lives on fetch #1 only — it is the only fetch that has
+                    // ever failed alone, and widening the retry to the others would spend
+                    // budget on a mode never observed.
+                    const data = await jsonpFetchWithRetry(`${sheetsWebAppUrl}?action=read&days=365`);
                     console.log('Dynamic target: Received data', data);
                     
                     if (!data.success || !data.entries || data.entries.length === 0) {
@@ -12562,7 +12727,11 @@
                     // handed over directly. This is data the run already awaited — no new
                     // fetch and no reordering, which is what made Part C's blocker dissolve.
                     resolvedHistoryForRun = { rows: data.entries,
+                        // DEF-137: the WINDOW travels with the count. 199 rows means one
+                        // thing against 365 days and something else entirely against 14,
+                        // and until this build the document carried the count without it.
                         meta: { historyAvailable: true, historyEntryCount: data.entries.length,
+                                historyWindowDays: 365,
                                 historyUnavailableReason: null, historySource: 'dynamic_target_fetch' } };
                     console.log('Dynamic target: Cached', data.entries.length, 'entries for reuse');
                     
@@ -12715,7 +12884,7 @@
                     // v3.6.09: three conditions no longer collapse to one null — the change
                     // record needs to know WHY, and "not configured" is not "fetch failed".
                     resolvedHistoryForRun = { rows: [], meta: { historyAvailable: false,
-                        historyEntryCount: 0,
+                        historyEntryCount: 0, historyWindowDays: null,
                         historyUnavailableReason: 'fetch_failed: ' + (error && error.message),
                         historySource: null } };
                     return null;
@@ -13331,9 +13500,29 @@
                     });
                     if (sheetsWebAppUrl && tdd24h && totalCarbs24h > 0) {
                         try {
-                            // Use cached entries from loadDynamicTarget (avoids redundant JSONP call)
-                            let historyEntries = cachedSheetsEntries;
-                            
+                            // [FETCH2-ELIDE-START] DEF-142. Was `cachedSheetsEntries`, a React
+                            // useState value that loadDynamicTarget sets in this same
+                            // synchronous pass — so it is ALWAYS null here and the fallback
+                            // fetch has fired on every run in the corpus, including every
+                            // clean one. The comment claimed it "avoids redundant JSONP call";
+                            // it never has.
+                            //
+                            // `resolvedHistoryForRun` is the v3.6.09 hand-over built for
+                            // exactly this: same rows, same run, no React round trip, already
+                            // consumed by the change-record derivation twelve lines below.
+                            // Using it here removes a whole 10s fetch budget from the run
+                            // before any retry is written — which is the point of doing this
+                            // inside the reliability build rather than after it.
+                            //
+                            // The React value is kept as a second source, not dropped: at the
+                            // EXPORT site it does populate (later render), and a source that
+                            // works somewhere must not be deleted on the strength of a site
+                            // where it does not.
+                            let historyEntries = (Array.isArray(resolvedHistoryForRun.rows)
+                                && resolvedHistoryForRun.rows.length > 0)
+                                ? resolvedHistoryForRun.rows
+                                : cachedSheetsEntries;
+
                             if (!historyEntries) {
                                 // Fallback: fetch if cache is empty (loadDynamicTarget may have failed)
                                 console.log('Carb-Adjusted: No cached entries, fetching via JSONP...');
@@ -13343,6 +13532,7 @@
                             } else {
                                 console.log(`Carb-Adjusted: Using ${historyEntries.length} cached entries from loadDynamicTarget`);
                             }
+                            // [FETCH2-ELIDE-END]
                             
                             // Capture for StateDetector — cachedSheetsEntries React state not yet propagated at detect() call
                             sensitivityHistoryLocal = historyEntries;
@@ -14340,17 +14530,26 @@
                 // this build is that the two must not serialise identically.
                 let resolvedHistory = [];
                 let historyMeta = { historyAvailable: false, historyEntryCount: 0,
+                                    historyWindowDays: null,
                                     historyUnavailableReason: null, historySource: null };
                 if (Array.isArray(cachedSheetsEntries) && cachedSheetsEntries.length > 0) {
                     resolvedHistory = cachedSheetsEntries;
                     historyMeta = { historyAvailable: true, historyEntryCount: resolvedHistory.length,
+                                    historyWindowDays: 365,
                                     historyUnavailableReason: null, historySource: 'state_cache' };
                 } else if (sheetsWebAppUrl) {
                     try {
                         const historyData = await jsonpFetch(`${sheetsWebAppUrl}?action=read&days=14`);
                         if (historyData && historyData.success && Array.isArray(historyData.entries)) {
                             resolvedHistory = historyData.entries;
+                            // DEF-137: this is the SUBSTITUTION. On Aug 4 17:36 it served 14
+                            // rows over 14 days where the healthy path serves 199 over 365 —
+                            // both complete, both correct for what was asked, and the document
+                            // labelled both `historyAvailable: true` with no window named.
+                            // Every longitudinal figure then recomputed on a ninth of the record
+                            // and said nothing.
                             historyMeta = { historyAvailable: true, historyEntryCount: resolvedHistory.length,
+                                            historyWindowDays: 14,
                                             historyUnavailableReason: null, historySource: 'fetch' };
                         } else {
                             historyMeta.historyUnavailableReason = 'fetch_returned_no_entries';
@@ -14624,7 +14823,10 @@
                                 recentEntries, currentData, resolvedHistory,
                                 RecommendationEngine.lastPipelineCensus?.emittedPersistence
                                     ?? analysisResults?.pipelineCensus?.emittedPersistence
-                                    ?? null);
+                                    ?? null,
+                                // DEF-137: the trend section is where every longitudinal
+                                // figure lives, so it is where the reconciliation belongs.
+                                buildAvailability(historyMeta, ChangeRecord.available() === true));
                             // [CENSUS-WIRE-END]
                         } catch (trendErr) {
                             console.error('Trend section failed:', trendErr);
@@ -15031,7 +15233,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.23 — Confidence Reads the Split Population (DEF-126)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.24 — Fetch Reliability &amp; Document Availability (DEF-137, 140, 142)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
