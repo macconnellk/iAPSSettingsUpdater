@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.24</title>
+    <title>Daily Insulin Settings Review v3.6.25</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -207,12 +207,31 @@
         // rendered, the output says it.
         //
         // ONE definition, three call sites (watch-list status, primary action line, JSON).
+        // DEF-147 (v3.6.25). The note was written for ONE direction and fired verbatim on
+        // the other. On Aug 4 it attached to the session's only URGENT safety action — an
+        // 18:00 basal CUT of -12.5% — and told the reviewer "these recommendations ADD
+        // insulin". The JSON was right (`direction: 'weaken'`); only the prose was wrong,
+        // on the one item a reader could least afford to misread.
+        //
+        // And `wouldGradeAs || 'CLEAR'` FABRICATED A VERDICT. On that same action
+        // wouldGradeAs was null — no grade was computed — and the sentence still ended
+        // "this is CLEAR". A default whose correctness depends entirely on who reads it,
+        // chosen without asking, and the value chosen was the PERMISSIVE one: it reported
+        // an ungraded safety change as cleared. DEF-135's family, in the direction that
+        // costs the most. A null grade now says it was not computed.
         const compoundAuditNote = (a) => {
             if (!a || !a.mismatch) return '';
-            const would = a.wouldGradeAs || 'CLEAR';
-            return ` \u26A0 GRADED ON THE WRONG SCALE — these recommendations ADD insulin,`
-                + ` but the sign convention read the total as a weaken and applied the`
-                + ` 10%/20% thresholds. On the strengthening scale (5%/10%) this is ${would}.`
+            const adds = a.direction === 'strengthen';
+            const effect = adds ? 'ADD insulin' : 'REMOVE insulin';
+            const misread = adds ? 'a weaken' : 'a strengthen';
+            const correctScale = adds ? 'strengthening scale (5%/10%)' : 'weakening scale (10%/20%)';
+            const appliedScale = adds ? '10%/20%' : '5%/10%';
+            const verdict = a.wouldGradeAs == null
+                ? 'the grade is NOT COMPUTED — which is not the same as clear'
+                : `this is ${a.wouldGradeAs}`;
+            return ` \u26A0 GRADED ON THE WRONG SCALE — these recommendations ${effect},`
+                + ` but the sign convention read the total as ${misread} and applied the`
+                + ` ${appliedScale} thresholds. On the ${correctScale} ${verdict}.`
                 + ` [DEF-112, unwired by design]`;
         };
         // [COMPOUND-AUDIT-END]
@@ -9918,7 +9937,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.24',
+                            version: '3.6.25',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -10335,7 +10354,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.24',
+                        version: '3.6.25',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -10445,6 +10464,19 @@
                     // INSTR-2: derived from history snapshots every run (auto-backfilling)
                     historyAvailable: hMeta.historyAvailable,
                     historyEntryCount: hMeta.historyEntryCount ?? (cachedHistory || []).length,
+                    // DEF-146. THIS is the object that ships. v3.6.24 added the availability
+                    // fields to the OTHER `historyAvailable:` object in this same function —
+                    // same fields, same hMeta, unique three-line match, and not the one
+                    // emitted. The markdown reconciliation reached production; the JSON one
+                    // did not, and the production-supply gate certified it because the gate
+                    // asserted the field EXISTS IN SOURCE rather than that it reaches the
+                    // document. Both objects carry it now, and DEF-137-T12 evaluates every
+                    // emitter rather than grepping for one.
+                    historyWindowDays: hMeta.historyWindowDays ?? null,
+                    historySource: hMeta.historySource ?? null,
+                    dataAvailability: buildAvailability(hMeta,
+                        analysisResults?.changeRecord?.available === true
+                        || ChangeRecord.available() === true),
                     ...(hMeta.historyAvailable ? {} : { historyUnavailableReason: hMeta.historyUnavailableReason }),
                     oscillation: hMeta.historyAvailable ? computeScheduleOscillation(cachedHistory) : UNAVAILABLE('oscillation'),
                     // INSTR-6: honest per-change verdicts, derived + auto-backfilling
@@ -15233,7 +15265,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.24 — Fetch Reliability &amp; Document Availability (DEF-137, 140, 142)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.25 — Shipped Emitter &amp; Direction-Derived Audit (DEF-146, DEF-147)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
