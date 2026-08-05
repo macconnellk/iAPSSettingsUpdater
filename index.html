@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.25</title>
+    <title>Daily Insulin Settings Review v3.6.26</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -9893,7 +9893,7 @@
             },
             
             // Generate structured JSON export for Claude analysis
-            generateStructuredExport(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], yesterdayEntry = null, cachedHistory = [], historyMeta = null) {
+            generateStructuredExport(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], yesterdayEntry = null, cachedHistory = [], historyMeta = null, fetchTelemetry = null) {
                 // v3.6.04 Part C: availability is derived from the RESOLVED source, never
                 // from the raw state — otherwise the flag reads false above a trend block
                 // showing 26 rows. Absent meta = legacy caller; infer conservatively.
@@ -9906,9 +9906,34 @@
                 // meaningful and false. UNAVAILABLE is the value; null is not a value.
                 const UNAVAILABLE = (section) => ({ unavailable: true, section,
                     reason: hMeta.historyUnavailableReason || 'history_unavailable' });
+                // [FETCH-TELEMETRY-START] v3.6.26 (DEF-148). Absent-vs-empty governs the
+                // instrument exactly as it governs the record the instrument measures: a
+                // caller that supplied no telemetry is UNAVAILABLE, while a run that made
+                // attempts and saw no late arrival is a genuine reading of zero. Collapsing
+                // those two into the same serialisation would rebuild the defect one layer
+                // up — the reader could not tell "nothing was late" from "nothing counted".
+                //
+                // The counts are derived here rather than at read time so the JSON answers
+                // the sizing question directly; the raw arrays travel alongside so a
+                // derived count can never be the only surviving version of the reading.
+                const fTel = fetchTelemetry ? (() => {
+                    const attempts = fetchTelemetry.attempts || [];
+                    const lateArrivals = fetchTelemetry.lateArrivals || [];
+                    return {
+                        attempts,
+                        lateArrivals,
+                        attemptCount: attempts.length,
+                        failedCount: attempts.filter(a => a && a.outcome === 'failed').length,
+                        lateArrivalCount: lateArrivals.length,
+                        // The budget schedule in force when these were measured. A duration
+                        // without the budget it was measured against cannot size anything.
+                        budgetsMs: fetchTelemetry.budgetsMs || null
+                    };
+                })() : UNAVAILABLE('fetchTelemetry');
+                // [FETCH-TELEMETRY-END]
                 // Calculate AGP (same as formatForClaude)
-                const agp7day = analysisResults.nightscoutData?.glucose 
-                    ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7) 
+                const agp7day = analysisResults.nightscoutData?.glucose
+                    ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7)
                     : null;
                 const agp48h = analysisResults.nightscoutData?.glucose
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
@@ -9937,7 +9962,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.25',
+                            version: '3.6.26',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -9979,6 +10004,9 @@
                         dataAvailability: buildAvailability(hMeta,
                             analysisResults?.changeRecord?.available === true
                             || ChangeRecord.available() === true),
+                        // DEF-148. BOTH emitters carry it, from the first build that adds
+                        // it — DEF-146 was one emitter of two, shipped to the wrong one.
+                        fetchTelemetry: fTel,
                         ...(hMeta.historyAvailable ? {} : { historyUnavailableReason: hMeta.historyUnavailableReason }),
                         oscillation: hMeta.historyAvailable ? computeScheduleOscillation(cachedHistory) : UNAVAILABLE('oscillation'),
                         changeEffectiveness: hMeta.historyAvailable ? computeChangeEffectiveness(cachedHistory) : UNAVAILABLE('changeEffectiveness'),
@@ -10354,7 +10382,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.25',
+                        version: '3.6.26',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -10477,6 +10505,9 @@
                     dataAvailability: buildAvailability(hMeta,
                         analysisResults?.changeRecord?.available === true
                         || ChangeRecord.available() === true),
+                    // DEF-148. BOTH emitters carry it, from the first build that adds it —
+                    // DEF-146 was one emitter of two, shipped to the wrong one.
+                    fetchTelemetry: fTel,
                     ...(hMeta.historyAvailable ? {} : { historyUnavailableReason: hMeta.historyUnavailableReason }),
                     oscillation: hMeta.historyAvailable ? computeScheduleOscillation(cachedHistory) : UNAVAILABLE('oscillation'),
                     // INSTR-6: honest per-change verdicts, derived + auto-backfilling
@@ -12652,10 +12683,24 @@
             // 10-of-20 figure had to be reconstructed from console logs after the fact.
             const jsonpAttemptLog = [];
             // [LATE-RESPONSE-END]
-            const jsonpFetch = (url, timeoutMs = 10000) => {
+            const jsonpFetch = (url, timeoutMs = 10000, attemptNo = 1) => {
                 return new Promise((resolve, reject) => {
                     const callbackName = '_jsonpCb_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
                     const issuedAt = Date.now();
+                    // [ATTEMPT-RECORD-START] v3.6.26 (DEF-148). Recorded HERE, per attempt,
+                    // and NOT in the retry wrapper where it used to live. The wrapper only
+                    // wraps fetch #1, so a log written there counts one fetch of three while
+                    // reading as the whole picture. A census that covers a subset while
+                    // looking complete is the exact defect class this build exists to name,
+                    // and leaving it inside the instrument would be the third instance this
+                    // week. The budget is recorded because a duration without the budget it
+                    // was measured against cannot size anything.
+                    const record = (outcome, reason) => {
+                        jsonpAttemptLog.push({ url, attempt: attemptNo, budgetMs: timeoutMs,
+                            outcome, elapsedMs: Date.now() - issuedAt,
+                            ...(reason ? { reason } : {}) });
+                    };
+                    // [ATTEMPT-RECORD-END]
                     const timeout = setTimeout(() => {
                         // Tombstone, NOT delete. A late response now lands somewhere that
                         // measures it instead of throwing. It must not resolve the promise —
@@ -12670,6 +12715,7 @@
                             delete window[callbackName];
                         };
                         if (script.parentNode) script.parentNode.removeChild(script);
+                        record('failed', 'JSONP timeout (' + (timeoutMs/1000) + 's)');
                         reject(new Error('JSONP timeout (' + (timeoutMs/1000) + 's)'));
                     }, timeoutMs);
 
@@ -12677,6 +12723,7 @@
                         clearTimeout(timeout);
                         delete window[callbackName];
                         if (script.parentNode) script.parentNode.removeChild(script);
+                        record('ok');
                         resolve(data);
                     };
 
@@ -12687,6 +12734,7 @@
                         clearTimeout(timeout);
                         delete window[callbackName];
                         if (script.parentNode) script.parentNode.removeChild(script);
+                        record('failed', 'JSONP script load failed');
                         reject(new Error('JSONP script load failed'));
                     };
                     document.head.appendChild(script);
@@ -12708,10 +12756,9 @@
                 let lastErr = null;
                 for (let i = 0; i < JSONP_ATTEMPT_BUDGETS_MS.length; i++) {
                     try {
-                        const data = await jsonpFetch(url, JSONP_ATTEMPT_BUDGETS_MS[i]);
+                        const data = await jsonpFetch(url, JSONP_ATTEMPT_BUDGETS_MS[i], i + 1);
                         if (i > 0) console.log('[JSONP-RETRY] attempt ' + (i + 1) + ' succeeded after '
                             + i + ' failure(s): ' + (lastErr && lastErr.message));
-                        jsonpAttemptLog.push({ url, attempts: i + 1, outcome: 'ok' });
                         return data;
                     } catch (e) {
                         lastErr = e;
@@ -12719,8 +12766,12 @@
                             + JSONP_ATTEMPT_BUDGETS_MS.length + ' failed (' + e.message + ')');
                     }
                 }
-                jsonpAttemptLog.push({ url, attempts: JSONP_ATTEMPT_BUDGETS_MS.length,
-                    outcome: 'failed', reason: lastErr && lastErr.message });
+                // v3.6.26 (DEF-148): the two summary pushes that stood here are gone, not
+                // lost. They recorded per CALL where the array is named per ATTEMPT, they
+                // omitted the budget, and they covered only the one fetch this wrapper
+                // wraps. Every attempt is now recorded one level down, in one shape.
+                // Two shapes in one array is the count-class error, and a reader cannot
+                // tell a summary row from an attempt row once they are mixed.
                 throw lastErr;
             };
             // [JSONP-RETRY-END]
@@ -14539,6 +14590,39 @@
             const copyForClaudeReview = async () => {
                 console.log('=== copyForClaudeReview called ===');
 
+                // [CLIPBOARD-GESTURE-START] v3.6.26 (DEF-149). REGISTERED HERE, BEFORE THE
+                // FIRST AWAIT, and that placement is the whole fix.
+                //
+                // Safari grants the clipboard only while transient user activation is live.
+                // The history resolve immediately below awaits the network, and a network
+                // await outlives that activation every time it actually goes to the wire.
+                // So the `writeText` further down could never succeed on the one run shape
+                // it mattered for: `historySource: "fetch"` IS the slow-365 run, and the
+                // slow-365 run is what produces the reduced_window document. The tool built
+                // a disclosure for fragment reads and then could not hand it over on one.
+                //
+                // Passing a PROMISE to ClipboardItem is the documented shape for content
+                // that is not ready at gesture time. REGISTRATION needs the activation;
+                // resolution does not.
+                let deferredCopy = null;
+                if (typeof ClipboardItem !== 'undefined'
+                    && navigator.clipboard && typeof navigator.clipboard.write === 'function') {
+                    let settle, fail;
+                    const pending = new Promise((res, rej) => { settle = res; fail = rej; });
+                    const written = navigator.clipboard.write([
+                        new ClipboardItem({ 'text/plain': pending })
+                    ]);
+                    written.catch(() => {});
+                    deferredCopy = {
+                        written,
+                        resolve: (text) => settle(new Blob([text], { type: 'text/plain' })),
+                        // An abandoned registration leaves the browser holding a promise the
+                        // run never settles. Every early return below aborts it by name.
+                        abort: (why) => fail(new Error('copy aborted: ' + why))
+                    };
+                }
+                // [CLIPBOARD-GESTURE-END]
+
                 // [HISTORY-RESOLVE-START] v3.6.04 Part B (DEF-086).
                 //
                 // HOIST THE FALLBACK, NOT THE VARIABLE. cachedSheetsEntries was null for
@@ -14599,16 +14683,19 @@
                 
                 if (!analysisResults) {
                     console.error('copyForClaudeReview: Missing analysisResults');
+                    if (deferredCopy) deferredCopy.abort('missing analysisResults');
                     alert('Analysis not complete. Please run analysis first.');
                     return;
                 }
                 if (!bodyState) {
                     console.error('copyForClaudeReview: Missing bodyState');
+                    if (deferredCopy) deferredCopy.abort('missing bodyState');
                     alert('Body state not detected. Please run analysis first.');
                     return;
                 }
                 if (!bundles) {
                     console.error('copyForClaudeReview: Missing bundles');
+                    if (deferredCopy) deferredCopy.abort('missing bundles');
                     alert('Recommendations not generated. Please run analysis first.');
                     return;
                 }
@@ -14789,7 +14876,12 @@
                             detectedChanges,
                             yesterdayEntry,
                             resolvedHistory,
-                            historyMeta
+                            historyMeta,
+                            // DEF-148: the readout. Written since v3.6.24, read by nothing
+                            // until here — the run that recorded `timeout (20s)` measured
+                            // its own lateness and discarded it at end of scope.
+                            { attempts: jsonpAttemptLog, lateArrivals: jsonpLateArrivals,
+                              budgetsMs: JSONP_ATTEMPT_BUDGETS_MS }
                         );
                         structuredJSON = '# STRUCTURED DATA (for Claude analysis)\n\n```json\n' + 
                             JSON.stringify(structured, null, 2) + '\n```\n\n---\n\n';
@@ -14886,12 +14978,34 @@
                     
                     if (!output) {
                         console.error('copyForClaudeReview: formatForClaude returned empty');
+                        if (deferredCopy) deferredCopy.abort('formatForClaude returned empty');
                         alert('Failed to generate report. Check console for details.');
                         return;
                     }
                     
                     console.log('Output generated, markdown length:', output.length, 'total length:', combinedOutput.length);
                     
+                    // [CLIPBOARD-SETTLE-START] v3.6.26 (DEF-149). Settle the registration
+                    // made during the gesture. The legacy paths below are UNCHANGED and are
+                    // not removed: they fail on iOS, but what they still cover elsewhere is
+                    // unestablished, and an unestablished coverage claim is not grounds for
+                    // deleting a fallback.
+                    let gestureCopied = false;
+                    if (deferredCopy) {
+                        try {
+                            deferredCopy.resolve(combinedOutput);
+                            await deferredCopy.written;
+                            gestureCopied = true;
+                        } catch (gestureErr) {
+                            console.error('Deferred clipboard write failed:', gestureErr);
+                        }
+                    }
+                    if (gestureCopied) {
+                        setCopyStatus('copied');
+                        setTimeout(() => setCopyStatus('idle'), 2000);
+                        return;
+                    }
+                    // [CLIPBOARD-SETTLE-END]
                     try {
                         // Try modern Clipboard API first
                         if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -14929,6 +15043,7 @@
                 } catch (err) {
                     console.error('copyForClaudeReview error:', err);
                     console.error('Error stack:', err.stack);
+                    if (deferredCopy) deferredCopy.abort(err.message);
                     setCopyStatus('idle');
                     alert('Error generating report: ' + err.message + '\n\nCheck browser console for details.');
                 }
@@ -15265,7 +15380,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.25 — Shipped Emitter &amp; Direction-Derived Audit (DEF-146, DEF-147)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.26 — Clipboard Gesture &amp; Fetch Telemetry (DEF-149, DEF-148)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
