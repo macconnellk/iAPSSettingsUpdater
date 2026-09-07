@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.26</title>
+    <title>Daily Insulin Settings Review v3.6.28</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -369,6 +369,16 @@
             compoundWarnStrengthenSpread: 0.08,
             compoundWarnWeaken: 0.10,
             compoundBlockStrengthen: 0.10,
+            // v3.6.28 (DEF-112, Build 6). DEPLOY-SEQUENCING FLAG, NOT A FEATURE. The
+            // direction branch in calculateCompoundEffect ships wired but OFF, so the
+            // consolidated deploy's recommendations are byte-identical to v3.6.27 and
+            // DEF-112 gets its own clinical read on a later night against that baseline.
+            // Read with a strict === true; undefined must not silently enable it. Its
+            // state is emitted to the JSON (`directionWiring`) so the reviewer can account
+            // for the gate. REGISTERED FOR REMOVAL in the build following the owner's
+            // ruling on the clinical read — a sequencing device that outlives its sequence
+            // becomes a permanent untested branch.
+            directionWiringEnabled: false,
             
             // Minimum carb threshold - meals below this are not substantial enough to cause lows
             minMealCarbsForAttribution: 10,
@@ -376,7 +386,10 @@
             // Confidence
             minEventsHighConfidence: 5,
             minEventsMediumConfidence: 3,
-            minConfidenceRecoveryState: 0.9,
+            // v3.6.28 (DEF-134). RENAMED from minConfidenceRecoveryState; the value is
+            // unchanged. It is consumed by `f.severity >= …` and was never a confidence
+            // gate; a future reader would have retuned it believing it was.
+            minSeverityRecoveryState: 0.9,
             
             // Protection
             changeLockoutDays: 2,     // basal — unchanged
@@ -942,6 +955,15 @@
                 // Step 1: Filter findings based on state
                 let filteredFindings = this.filterByState(validFindings, bodyState);
                 pipelineCensus.afterStateFilter = censusOf(filteredFindings);
+                // [RETAINED-EXPOSE-START] v3.6.28 (DEF-121). The safety rescue stamps
+                // `recommendationWithheld: 'state_filtered'` on COPIES (v3.6.10 A2b stopped
+                // mutating the originals). retentionCensus was reading the originals — a
+                // population that by construction can never carry the stamp — and reported
+                // zero rescues beside a 48 mg/dL finding that rendered "retained because it
+                // is a safety finding". Four production instances. The lastPipelineCensus
+                // pattern: expose the post-filter population, read it where the census runs.
+                this.lastFilteredFindings = filteredFindings;
+                // [RETAINED-EXPOSE-END]
 
                 // [HISTORY-UNAVAILABLE-WITHHOLD] v3.6.09 Part C (DEF-094).
                 // With the change record derived from Sheets, "history unavailable" and
@@ -1337,7 +1359,7 @@
                         // are structural AGP patterns, not discrete events. Their severity (0.7)
                         // is deliberately conservative and does not reflect confidence level.
                         return findings.filter(f =>
-                            f.severity >= CONFIG.minConfidenceRecoveryState ||
+                            f.severity >= CONFIG.minSeverityRecoveryState ||
                             (f.type === FindingType.CORRECTION_INEFFECTIVE &&
                              f.diagnosticContext?.patternType === 'basal_insufficiency')
                         );
@@ -2138,8 +2160,38 @@
                 const warnThresholdConcentratedPct = CONFIG.compoundWarnStrengthenConcentrated * 100; // 5%
                 const warnThresholdWeakenPct = CONFIG.compoundWarnWeaken * 100; // 10%
                 const blockThresholdWeakenPct = 20; // 20% for weakening (higher than strengthening)
-                
-                if (effect < 0) { // Strengthening (more insulin)
+
+                // [DIRECTION-WIRE-START] v3.6.28 (DEF-112, single-family). What the
+                // recommendations actually DO, read per recommendation and not from the
+                // sign of the sum: a basal strengthen is a POSITIVE changePercent, a CR/ISF
+                // strengthen is NEGATIVE, so the sum's sign selected the WRONG scale for
+                // basal — a +8.3% basal strengthen was graded on the 10%/20% weaken scale
+                // instead of 5%/10%. `effect` is untouched and `total` stays signed; only
+                // which threshold pair applies changes, and only when the flag is on.
+                //
+                // Flag OFF (default): `strengthenScale` is exactly the old `effect < 0`, so
+                // every grade is byte-identical to v3.6.27. Flag ON: a single-family bundle
+                // whose recommendations all add insulin takes the strengthen scale, all
+                // remove takes the weaken scale, and a bundle whose recommendations disagree
+                // falls back to the sum's sign (the mixed-family path below re-grades those
+                // per family regardless — that is R3b's, not this).
+                const addsInsulin = (rec) => {
+                    const q = (rec.param || '').toLowerCase();
+                    const c = rec.changePercent || 0;
+                    if (q === 'basal') return c > 0;
+                    if (q === 'cr' || q === 'isf') return c < 0;
+                    return null;
+                };
+                const dirs = bundle.recommendations.map(addsInsulin).filter(v => v !== null);
+                const allStrengthen = dirs.length > 0 && dirs.every(v => v === true);
+                const allWeaken = dirs.length > 0 && dirs.every(v => v === false);
+                const directionWired = CONFIG.directionWiringEnabled === true;
+                const strengthenScale = (directionWired && (allStrengthen || allWeaken))
+                    ? allStrengthen
+                    : (effect < 0);
+                // [DIRECTION-WIRE-END]
+
+                if (strengthenScale) { // Strengthening (more insulin)
                     if (absEffect >= blockThresholdPct) {
                         warning = 'BLOCKED';
                     } else if (absEffect >= warnThresholdConcentratedPct) {
@@ -2159,26 +2211,25 @@
                 // rather than from the sign of the sum — the DEF-112 shape, do not trust
                 // the sum. `gradedAs` is the branch the sign convention selected above.
                 // When the two disagree the cap was applied on the wrong scale.
-                const addsInsulin = (rec) => {
-                    const q = (rec.param || '').toLowerCase();
-                    const c = rec.changePercent || 0;
-                    if (q === 'basal') return c > 0;
-                    if (q === 'cr' || q === 'isf') return c < 0;
-                    return null;
-                };
-                const dirs = bundle.recommendations.map(addsInsulin).filter(v => v !== null);
-                const allStrengthen = dirs.length > 0 && dirs.every(v => v === true);
-                const allWeaken = dirs.length > 0 && dirs.every(v => v === false);
+                // v3.6.28: addsInsulin / dirs / allStrengthen / allWeaken are hoisted above
+                // the branch (DIRECTION-WIRE) so the branch can read them. Nothing else here
+                // moved.
                 const onStrengthenScale = (e) => {
                     const a = Math.abs(e);
                     if (a >= blockThresholdPct) return 'BLOCKED';
                     if (a >= warnThresholdConcentratedPct) return 'HIGH';
                     return null;
                 };
-                const mismatch = (allStrengthen && effect >= 0) || (allWeaken && effect < 0);
+                // The audit tracks the branch ACTUALLY TAKEN — i.e. the flag, not the code.
+                // Flag off: identical to v3.6.18 (`effect < 0`), so the mismatch it reports
+                // is still real and still fires. Flag on, single-family: the branch and the
+                // direction agree, mismatch goes false. Mixed-direction bundles fall back to
+                // the sum's sign and the audit keeps declaring them — R3b's territory.
+                const mismatch = (allStrengthen && !strengthenScale) || (allWeaken && strengthenScale);
                 const compoundDirectionAudit = {
                     direction: allStrengthen ? 'strengthen' : (allWeaken ? 'weaken' : 'mixed'),
-                    gradedAs: effect < 0 ? 'strengthen' : 'weaken',
+                    gradedAs: strengthenScale ? 'strengthen' : 'weaken',
+                    directionWired,
                     mismatch,
                     wouldGradeAs: (mismatch && allStrengthen) ? onStrengthenScale(effect) : null
                 };
@@ -2783,6 +2834,63 @@
             if (problems.length) out.censusInvariantViolated = problems;
             return out;
         };
+
+        // [BLOCK-PERSIST-START] v3.6.28 (DEF-154). gateCost counts what is blocked
+        // TONIGHT and never how long. Item Persistence exists for findings and not for
+        // blocks. Every gate in the framework is tuned against strengthening; nothing is
+        // tuned against failing to strengthen a structurally under-provisioned block,
+        // and that failure mode had no counter. This is the counter. It changes no gate:
+        // it reads the status the ladder already produced, matches it against the status
+        // text the log already stores for prior sessions, and reports a streak.
+        //
+        // ASSUMPTION, in the comment where a belief belongs: prior watch items carry the
+        // status TEXT getBundleStatus produced on their night (the log's `status` field,
+        // written by the auto-log payload). Where a row predates that field, or the text
+        // is unrecognisable, the streak simply stops there — the count is a floor, never
+        // an over-claim, and `priorSessionsScanned` says how far back it could look.
+        const bucketFromLoggedStatus = (text) => {
+            const t = String(text || '');
+            if (!t) return null;
+            if (t === 'Deferred') return 'onePerBlock';
+            if (t === 'Hold - conflicting patterns') return 'slotConflict';
+            const b = gateCostBucket(t, null);
+            return b === 'other' ? null : b;
+        };
+        const bundlePersistenceKey = (b) => {
+            const det = b?.findings?.[0]?.type || b?.detector || null;
+            const slot = b?.recommendations?.[0]?.scheduleTime || b?.findings?.[0]?.scheduleTime || b?.scheduleTime || null;
+            return (det && slot) ? `${det}@${slot}` : (b?.name || null);
+        };
+        const computeBlockPersistence = (bundles, priorRows) => {
+            const rows = (Array.isArray(priorRows) ? priorRows : [])
+                .filter(r => r && Array.isArray(r.watchItems))
+                .map(r => ({ day: gapLocalDateKey(r.date || r.timestamp), items: r.watchItems }))
+                .filter(r => r.day)
+                .sort((a, b) => b.day.localeCompare(a.day));
+            const out = [];
+            (Array.isArray(bundles) ? bundles : []).filter(Boolean).forEach(b => {
+                if (!(Array.isArray(b.recommendations) && b.recommendations.length > 0)) return;
+                if (b.priority === 'PRIMARY') return;
+                const st = getBundleStatus(b);
+                const bucket = gateCostBucket(st.status, st.statusReason);
+                const key = bundlePersistenceKey(b);
+                if (!key) return;
+                let streak = 0, since = null, lastDay = null;
+                for (const r of rows) {
+                    if (lastDay === r.day) continue;
+                    const hit = r.items.find(it => bundlePersistenceKey(it) === key
+                        && bucketFromLoggedStatus(it.status) === bucket);
+                    if (!hit) break;
+                    streak++; since = r.day; lastDay = r.day;
+                }
+                out.push({ key, name: b.name, bucket,
+                    consecutiveSessions: streak + 1,
+                    since: since || getLocalDateString(),
+                    priorSessionsScanned: rows.length });
+            });
+            return out;
+        };
+        // [BLOCK-PERSIST-END]
         // [BASAL-EFFECT-START] v3.6.01 Part C (DEF-080). READ-ONLY.
         //
         // changePercent is a percentage of a RATE and carries no clinical meaning on
@@ -3865,6 +3973,81 @@
             const dt = new Date(s);
             return isNaN(dt.getTime()) ? null : getLocalDateString(dt);
         };
+        // [SCHEDULE-SHAPE-START] v3.6.28 (DEF-157). Input is the basal schedule alone —
+        // no glucose, no treatments, no window population, no history — the one instrument
+        // in the queue that data quality cannot contaminate.
+        //
+        // Two checks. Adjacent-hour ratio at every boundary, and a single-hour notch: an
+        // hour that is a local minimum or maximum against BOTH neighbours by more than the
+        // threshold. It ENUMERATES all 24 boundaries and all 24 hours with verdicts rather
+        // than reporting hits, because a structure containing only what fired makes
+        // "nothing fired" indistinguishable from "the check did not run".
+        //
+        // THE THRESHOLD IS PROVISIONAL. Against the deployed Sep 7 schedule the full
+        // distribution was run once (B3): the 03:00→04:00 step reads +100% and the 19:00
+        // notch (0.40 / 0.35 / 0.50) reads 14.3% on its smaller side, so a single shared
+        // threshold that catches both calibration targets sits at ≤ 0.143 and also flags
+        // fifteen of the twenty-four boundaries. That trade is the PM's to rule; 0.14 is
+        // what makes both named targets fire tonight and is stated as provisional here and
+        // in the output.
+        //
+        // Declares. Does not act: no primaryParameter, no contributingFactors, no severity,
+        // no recommendation, and nothing downstream reads it (T4).
+        const SCHEDULE_SHAPE_THRESHOLD = 0.14;
+        const computeScheduleShape = (basalSchedule, threshold = SCHEDULE_SHAPE_THRESHOLD) => {
+            const hh = (h) => `${String(h).padStart(2, '0')}:00`;
+            const sched = Array.isArray(basalSchedule) ? basalSchedule.filter(e => e && typeof e.value === 'number') : [];
+            const sorted = sched.slice().sort((a, b) => String(a.time).localeCompare(String(b.time)));
+            // Hourly fill: the rate in force at each hour, carrying the last block forward.
+            const rates = new Array(24).fill(null);
+            if (sorted.length) {
+                let cur = sorted[sorted.length - 1].value;
+                for (let h = 0; h < 24; h++) {
+                    const hit = sorted.find(e => parseInt(String(e.time).split(':')[0], 10) === h);
+                    if (hit) cur = hit.value;
+                    rates[h] = cur;
+                }
+            }
+            const complete = rates.every(r => typeof r === 'number' && r > 0);
+            const ratioOf = (a, b) => (typeof a === 'number' && typeof b === 'number' && a > 0) ? b / a : null;
+            const boundaries = [];
+            for (let h = 0; h < 24; h++) {
+                const n = (h + 1) % 24;
+                const ratio = ratioOf(rates[h], rates[n]);
+                const changePct = ratio === null ? null : parseFloat(((ratio - 1) * 100).toFixed(1));
+                boundaries.push({ from: hh(h), to: hh(n), rateFrom: rates[h], rateTo: rates[n],
+                    ratio: ratio === null ? null : parseFloat(ratio.toFixed(4)), changePct,
+                    flagged: ratio !== null && Math.abs(ratio - 1) >= threshold });
+            }
+            const hours = [];
+            for (let h = 0; h < 24; h++) {
+                const p = rates[(h + 23) % 24], v = rates[h], n = rates[(h + 1) % 24];
+                const ok = [p, v, n].every(x => typeof x === 'number' && x > 0);
+                const isMin = ok && v < p && v < n, isMax = ok && v > p && v > n;
+                const kind = isMin ? 'min' : isMax ? 'max' : null;
+                // Excursion on each side, measured from the hour's own rate.
+                const vsPrev = ok ? parseFloat((Math.abs(p / v - 1)).toFixed(4)) : null;
+                const vsNext = ok ? parseFloat((Math.abs(n / v - 1)).toFixed(4)) : null;
+                hours.push({ hour: hh(h), prev: p, value: v, next: n, kind,
+                    excursionVsPrev: vsPrev, excursionVsNext: vsNext,
+                    flagged: kind !== null && vsPrev >= threshold && vsNext >= threshold });
+            }
+            return {
+                thresholdRatio: threshold,
+                thresholdProvisional: true,
+                scheduleComplete: complete,
+                boundaryCount: boundaries.length,
+                hourCount: hours.length,
+                flaggedBoundaryCount: boundaries.filter(b => b.flagged).length,
+                flaggedNotchCount: hours.filter(x => x.flagged).length,
+                boundaries,
+                notches: hours,
+                statement: `Schedule shape: ${boundaries.length} boundaries and ${hours.length} hours enumerated against a PROVISIONAL threshold of ${Math.round(threshold * 100)}% — `
+                    + `${boundaries.filter(b => b.flagged).length} boundary step(s) and ${hours.filter(x => x.flagged).length} single-hour notch(es) exceed it. `
+                    + `Declared only; nothing reads this. The threshold is ruled after this run, not before.`
+            };
+        };
+        // [SCHEDULE-SHAPE-END]
         const computeRequirementGap = (history) => {
             const parseSched = (v) => {
                 if (!v) return null;
@@ -5619,12 +5802,56 @@
                         ? ' Note: rapid recovery pattern suggests possible CGM pressure artifact — verify before acting.'
                         : '';
 
+                    // [D5-BASIS-START] v3.6.27 (DEF-151). The sentence this replaces read
+                    // "No recent meals or corrections to attribute" — an assertion that a
+                    // lookback was performed and returned nothing. THERE IS NO CORRECTION
+                    // LOOKBACK IN THIS DETECTOR. The gate at the top of the loop is
+                    // `claimedEvents.lows.has(lowId)`, so the real basis is that no OTHER
+                    // detector claimed the event. That is a different claim, it is true, and
+                    // it does not assert that anybody looked.
+                    //
+                    // The meal-completion arithmetic below was already computed on this path
+                    // and consulted only inside the low-IOB branch — so on Aug 4 the 34g at
+                    // 16:54 scored 0.61U against a 0.50U threshold, passed, and was discarded
+                    // by the branch that recommended the basal cut. It is DECLARED here and
+                    // deliberately NOT wired: see the note in the narrative and T6.
+                    const mealCompletionEstimateU_D5 = (mealWithin3h && estimatedCompletionU_D5 > 0)
+                        ? parseFloat(estimatedCompletionU_D5.toFixed(2)) : null;
+                    const governingMeal_D5 = mealWithin3h
+                        ? { carbs: mealWithin3h.carbs, time: formatTimeForDisplay(mealWithin3h.created_at) }
+                        : null;
+                    // FALSE renders. A disclosure that appears only on the exception teaches
+                    // the reviewer to read its absence as "nothing there" — DEF-106's T7, and
+                    // the failure mode of three builds of census silence.
+                    const mealClause_D5 = governingMeal_D5
+                        ? `Meal-completion check ${probableMealCompletion_D5 ? 'TRUE' : 'FALSE'}: `
+                          + `${governingMeal_D5.carbs}g at ${governingMeal_D5.time} estimates `
+                          + `${mealCompletionEstimateU_D5 === null ? 'no' : mealCompletionEstimateU_D5.toFixed(2) + 'U'} of completion delivery `
+                          + `against a ${D5_COMPLETION_THRESHOLD_U.toFixed(2)}U threshold.`
+                        : `Meal-completion check FALSE: no meal of 10g or more in the 3 hours before this low.`;
+                    // Null is UNREADABLE, not zero. The path defaults here when IOB cannot be
+                    // read, and a reader must be able to tell that from a measured low value.
+                    const iobClause_D5 = (iobAtLow === null || iobAtLow === undefined)
+                        ? `IOB at the low: UNREADABLE — this path is the default when IOB cannot be read.`
+                        : `IOB at the low: ${iobAtLow.toFixed(2)}U.`;
+                    const unwiredNote_D5 = probableMealCompletion_D5
+                        ? ` NOTE: that check PASSED and is NOT wired into this recommendation — the basal weaken below stands unchanged.`
+                        : '';
+                    const attributionBasis_D5 = 'no_other_detector_claimed_event';
+                    // [D5-BASIS-END]
+
                     findings.push({
                         id: `finding_unexplained_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                         type: FindingType.UNEXPLAINED_LOW,
                         detectedAt: new Date().toISOString(),
                         eventTime: low.localTime || low.time, // BUG-022: Store original timestamp
                         scheduleTime: basalEntry.time,
+                        attributionBasis: attributionBasis_D5,
+                        probableMealCompletion_D5: probableMealCompletion_D5,
+                        mealCompletionEstimateU: mealCompletionEstimateU_D5,
+                        mealCompletionThresholdU: D5_COMPLETION_THRESHOLD_U,
+                        governingMeal: governingMeal_D5,
+                        iobAtLow: (iobAtLow === undefined ? null : iobAtLow),
                         period: period?.name || 'Unknown',
                         severity: likelyPressureLow ? Math.min(baseSeverity, 0.4) : baseSeverity,
                         events: [{
@@ -5640,7 +5867,11 @@
                         claimedEventIds: [lowId],
                         conflictsWith: [],
                         recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
-                        details: `Unexplained low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}. No recent meals or corrections to attribute. Consider reducing basal at ${basalEntry.time}.${pressureDetails}`
+                        details: `Unexplained low ${low.bg} mg/dL at ${formatTimeForDisplay(low.localTime || low.time)}. `
+                            + `Basis: no other detector claimed this event — this detector runs no correction lookback of its own, `
+                            + `so that is the absence of a claim, not the result of a search. `
+                            + `${mealClause_D5} ${iobClause_D5}${unwiredNote_D5} `
+                            + `Consider reducing basal at ${basalEntry.time}.${pressureDetails}`
                     });
                     claimedEvents.lows.add(lowId);
                 });
@@ -8001,6 +8232,20 @@
         // SIGNAL ANALYSIS MODULE (PRESERVED FROM v25)
         // =========================================================================
         
+        // [FASTED-CONST-START] v3.6.28 (DEF-156). Named, not literals inside a branch —
+        // the tests read them from source. The lookback is GENEROUS by design: this gate
+        // errs toward exclusion. A wrong exclusion costs sample size; a wrong inclusion
+        // prints a covered window wearing a measurement's credibility (DEF-118's shape).
+        // Measured carb decay in this file is ~17–19 g/hr against a configured 50 (Jul 23,
+        // Jul 24), so a 60g meal is not clear at 180 minutes; six hours clears ~100g.
+        const FASTED_LOOKBACK_HOURS = 6;
+        // ASSUMPTION, stated where a belief belongs: "no bolus" in the spec is read as no
+        // USER/MEAL bolus. SMBs are the loop's own corrections and are the very quantity a
+        // measured basal requirement is made of; a gate that excluded windows after every
+        // SMB would exclude the measurement. This is a one-flag ruling for the PM, the
+        // flag is emitted in the output, and T5/T9 test both settings.
+        const FASTED_EXCLUDES_SMB = false;
+        // [FASTED-CONST-END]
         const SignalAnalysis = {
             analyzeCleanWindows(nightscoutData, basalWindow, targetBG = 110, basalSchedule = null, isfSchedule = null, tdd = null) {
                 const analysisStart = new Date(Date.now() - basalWindow * 24 * 60 * 60 * 1000);
@@ -8292,6 +8537,51 @@
                     const unsplitDeviations = windowsInPeriod.map(w => w.deviation).sort((a, b) => a - b);
                     const unsplitHasSufficient = windowsInPeriod.length >= CONFIG.minEventsHighConfidence;
                     const unsplitMedianDeviation = unsplitHasSufficient ? medianOf(unsplitDeviations) : null;
+
+                    // [FASTED-POP-START] v3.6.28 (DEF-156). A THIRD population beside the
+                    // unsplit/split pair, never merged into either: a clean window is FASTED
+                    // when no carb entry and no user bolus falls within FASTED_LOOKBACK_HOURS
+                    // before it. Clean windows already reject carbs inside 180 minutes (Gate A)
+                    // and require COB 0; this is the longer, stricter cut. Nothing downstream
+                    // reads it — accumulate and declare, then rule.
+                    //
+                    // The self-check the reader can run from the output: in the two fasting
+                    // periods (Deep Sleep, Dawn) nearly every clean window is fasted, so
+                    // shareOfClean sits near 1.0; in the four meal-covered periods it sits far
+                    // below. A LOOSER gate raises the meal-covered share toward 1.0 and raises
+                    // ceilingUtilization toward the period's own coverage. ceilingUtilization
+                    // here is over the SAME ceiling as the period's, so it is commensurable
+                    // with the Coverage column and is by construction ≤ it.
+                    const FASTED_LOOKBACK_MS = FASTED_LOOKBACK_HOURS * 60 * 60 * 1000;
+                    const fastedTreatments = (nightscoutData.treatments || []).filter(t => t && t.created_at
+                        && ((t.carbs > 0) || (t.insulin > 0 && (FASTED_EXCLUDES_SMB || !(t.eventType && String(t.eventType).includes('SMB'))))))
+                        .map(t => new Date(t.created_at).getTime()).filter(ms => !Number.isNaN(ms));
+                    const fastedWindows = windowsInPeriod.filter(w => {
+                        const at = w.time.getTime();
+                        const cutoff = at - FASTED_LOOKBACK_MS;
+                        return !fastedTreatments.some(ms => ms > cutoff && ms <= at);
+                    });
+                    const fastedByDate = {};
+                    fastedWindows.forEach(w => { if (w.date) fastedByDate[w.date] = (fastedByDate[w.date] || 0) + 1; });
+                    const fastedDates = Object.keys(fastedByDate).sort();
+                    const fastedDeviations = fastedWindows.map(w => w.deviation).sort((a, b) => a - b);
+                    const fastedPopulation = {
+                        lookbackHours: FASTED_LOOKBACK_HOURS,
+                        excludesSMB: FASTED_EXCLUDES_SMB,
+                        windowCount: fastedWindows.length,
+                        dayCount: fastedDates.length,
+                        dates: fastedDates,
+                        windowsByDate: fastedByDate,
+                        medianDeviation: fastedDeviations.length ? medianOf(fastedDeviations) : null,
+                        ceilingUtilization: ceilingForWindow > 0
+                            ? parseFloat((fastedWindows.length / ceilingForWindow).toFixed(4)) : null,
+                        shareOfClean: windowsInPeriod.length > 0
+                            ? parseFloat((fastedWindows.length / windowsInPeriod.length).toFixed(4)) : null,
+                        expected: 'shareOfClean near 1.0 in Deep Sleep and Dawn, far below in meal-covered periods; '
+                            + 'a looser gate raises the meal-covered share. ceilingUtilization is over the period ceiling and is ≤ the period\'s own coverage. '
+                            + 'Declared only — nothing reads this.'
+                    };
+                    // [FASTED-POP-END]
                     const unsplitSignal = !unsplitHasSufficient ? 'INSUFFICIENT' : signalOf(unsplitMedianDeviation);
                     // [UNSPLIT-END]
 
@@ -8301,6 +8591,7 @@
                         cleanWindowCount: windowsInPeriod.length,
                         effectiveWindowCount: effectiveWindows.length,
                         hasSufficientData,
+                        fastedPopulation,
                         medianDeviation,
                         signal,
                         candidateWindowCount,
@@ -9003,6 +9294,8 @@
             },
 
             formatForClaude(analysisResults, bodyState, bundles, schedules, config, dynamicTarget = null, detectedChanges = [], cachedHistory = [], historyMeta = null) {
+                // DEF-154: computed once per render, read at every watch-list status line.
+                const blockPersistenceForRender = computeBlockPersistence(bundles, excludeToday(cachedHistory || []));
                 const hMeta = historyMeta || { historyAvailable: Array.isArray(cachedHistory) && cachedHistory.length > 0,
                     historyUnavailableReason: 'not_supplied_by_caller' };
                 const now = new Date();
@@ -9218,7 +9511,15 @@
                             status = 'Address before CR/ISF optimizations';
                         }
                         
-                        output += `- **Status:** ${status}\n`;
+                        // [BLOCK-PERSIST-RENDER-START] v3.6.28 (DEF-154). The streak rides
+                        // the rendered line; `blockedBy` itself is byte-identical.
+                        const bp = (blockPersistenceForRender || []).find(x => x.key === bundlePersistenceKey(bundle));
+                        const streakNote = bp
+                            ? ` — _blocked by \`${bp.bucket}\` for ${bp.consecutiveSessions} consecutive session${bp.consecutiveSessions === 1 ? '' : 's'}`
+                              + `${bp.consecutiveSessions > 1 ? ', since ' + bp.since : ''}_`
+                            : '';
+                        output += `- **Status:** ${status}${streakNote}\n`;
+                        // [BLOCK-PERSIST-RENDER-END]
                         output += `- **Confidence:** ${(bundle.confidence * 100).toFixed(0)}%\n`;
 
                         // v3.5.95 Part C: state WHY no lever is proposed. A bundle that
@@ -9460,9 +9761,18 @@
                         const finalPct = analysisResults.finalPercent;
                         const isSignalFallback = analysisResults.effectiveTargetSource === 'signal-fallback';
                         
-                        output += `**Basal % of TDD:**\n`;
-                        if (currentPct) output += `- Current: ${currentPct.toFixed(1)}% (actual basal schedule ÷ TDD)\n`;
-                        if (signalPct) output += `- Signal: ${signalPct.toFixed(1)}% (today's clean windows suggest)\n`;
+                        // [BASALPCT-LABEL-START] v3.6.28 (DEF-122). Three quantities used to
+                        // render under one word, and `current`'s parenthetical named the wrong
+                        // denominator: it divides by the 2-week average TDD (tddForSignal), not
+                        // the 24-hour figure printed four lines above it. Each line now names
+                        // what it is and what it was divided by.
+                        const den = analysisResults.basalPctDenominator || null;
+                        const denLabel = den && den.value
+                            ? `${den.source === 'tdd2Week' ? '2-week average TDD' : den.source === 'tdd24h' ? '24-hour TDD (no 2-week figure available)' : 'TDD'} ${Number(den.value).toFixed(1)} U`
+                            : 'TDD (denominator not recorded)';
+                        output += `**Basal % of TDD — three different quantities:**\n`;
+                        if (currentPct) output += `- Scheduled basal share: ${currentPct.toFixed(1)}% (scheduled daily basal ÷ ${denLabel})\n`;
+                        if (signalPct) output += `- Signal-suggested share: ${signalPct.toFixed(1)}% (scheduled share + the tiered nudge from today's clean windows)\n`;
                         
                         // BUG-023: Show different message for signal fallback
                         if (isSignalFallback) {
@@ -9492,7 +9802,8 @@
                             output += `\n`;
                         }
                         
-                        if (finalPct) output += `- Final: ${finalPct.toFixed(1)}% (rate-limited recommendation)\n`;
+                        if (finalPct) output += `- Final recommended share: ${finalPct.toFixed(1)}% (the target, rate-limited — this is the number a recommendation would move toward)\n`;
+                        // [BASALPCT-LABEL-END]
                         
                         // BUG-023: Show conflict warning if target diverges from signal (only for non-fallback)
                         if (!isSignalFallback && signalPct && Math.abs(targetPct - signalPct) > 1.5) {
@@ -9572,20 +9883,63 @@
                         }
                     });
                     
+                    // DEF-112 Build 6: the flag's position, on the markdown surface too.
+                    output += `_Direction wiring (DEF-112): ${CONFIG.directionWiringEnabled === true ? 'ON — single-family compound grades use the scale their direction selects' : 'OFF — compound grades byte-identical to v3.6.27; the audit note still declares the mismatch'}._\n\n`;
+                    // [PERIOD-TABLE-START] v3.6.28 (DEF-153). The Deviation column is drawn
+                    // from the SPLIT population wherever a parameter change falls in the
+                    // window; the AGP Check column is always the 7-day AGP. Aug 5 rendered
+                    // Sleep Onset "+39.0 | 78% HIGH" — 29 windows over 2 days beside 7 days —
+                    // in adjacent columns with no label, and Guardrail #2 (signal LOW + AGP
+                    // HIGH → not basal) fired categorically off a five-window sample.
+                    //
+                    // Ruling, of the three options offered: render BOTH deviations with their
+                    // populations, not the AGP on the split population (that is a new
+                    // computation, and this build renders) and not a bare label (that leaves
+                    // one number and an asterisk). The unsplit figure is the DEF-120 "both
+                    // populations or neither" rule applied to the table that the guardrail
+                    // is read against. Coverage is ceilingUtilization, already computed and
+                    // ruled correctly-pre-split in DEF-120's sweep: below ~0.25 the period is
+                    // meal-covered and its deviation rests on a small fasted residue.
                     output += `**Period Signals:**\n`;
-                    output += `| Period | Deviation | Signal | AGP Check | Protection |\n`;
-                    output += `|--------|-----------|--------|-----------|------------|\n`;
-                    
+                    output += `| Period | Deviation (population) | Signal | AGP Check (7-day) | Coverage | Protection |\n`;
+                    output += `|--------|------------------------|--------|-------------------|----------|------------|\n`;
+
                     analysisResults.signalAnalysis.periods.forEach(period => {
-                        const dev = period.medianDeviation !== null 
-                            ? `${period.medianDeviation >= 0 ? '+' : ''}${period.medianDeviation.toFixed(1)} mg/dL`
-                            : 'N/A';
+                        const fmtDev = (v) => (v === null || v === undefined || Number.isNaN(v))
+                            ? 'N/A' : `${v >= 0 ? '+' : ''}${Number(v).toFixed(1)} mg/dL`;
+                        const eff = period.effectiveWindowCount ?? period.cleanWindowCount ?? 0;
+                        const effDays = period.effectiveContributingDayCount ?? null;
+                        const pop = `${eff} windows · ${effDays === null ? '?' : effDays} day${effDays === 1 ? '' : 's'}`;
+                        let dev = `${fmtDev(period.medianDeviation)} — ${pop}`;
+                        if (period.splitApplied === true) {
+                            const since = period.splitChangeDate ? String(period.splitChangeDate).slice(0, 10) : '?';
+                            const uDays = period.contributingDayCount ?? null;
+                            dev += ` since ${since} · unsplit ${fmtDev(period.unsplitMedianDeviation)}`
+                                + ` (${period.unsplitWindowCount ?? period.cleanWindowCount ?? 0} windows · `
+                                + `${uDays === null ? '?' : uDays} day${uDays === 1 ? '' : 's'})`;
+                        }
                         const signal = period.signal || 'INSUFFICIENT';
                         const protection = ProtectionSystem.getProtectionIcon(ProtectionLevel.CLEAR);
                         const agpCheck = getAGPCheckForPeriod(period.name);
-                        output += `| ${period.name} | ${dev} | ${signal} | ${agpCheck.icon} ${agpCheck.detail} | ${protection} |\n`;
+                        const coverage = (typeof period.ceilingUtilization === 'number' && !Number.isNaN(period.ceilingUtilization))
+                            ? period.ceilingUtilization.toFixed(3) : '—';
+                        output += `| ${period.name} | ${dev} | ${signal} | ${agpCheck.icon} ${agpCheck.detail} | ${coverage} | ${protection} |\n`;
                     });
-                    output += `\n`;
+                    // [FASTED-RENDER-START] v3.6.28 (DEF-156). The markdown surface. Renders
+                    // every period, including dayCount 0 — absence must not read as "nothing".
+                    {
+                        const fp = analysisResults.signalAnalysis.periods.map(p => {
+                            const f = p.fastedPopulation;
+                            if (!f || f.unavailable) return `${p.name}: UNAVAILABLE`;
+                            const med = (f.medianDeviation === null || f.medianDeviation === undefined) ? 'n/a' : `${Number(f.medianDeviation) >= 0 ? '+' : ''}${Number(f.medianDeviation).toFixed(1)}`;
+                            return `${p.name} ${f.windowCount}w/${f.dayCount}d · med ${med} · share ${f.shareOfClean === null ? 'n/a' : f.shareOfClean.toFixed(2)} · cov ${f.ceilingUtilization === null ? 'n/a' : f.ceilingUtilization.toFixed(3)}`;
+                        });
+                        const any = analysisResults.signalAnalysis.periods.find(p => p.fastedPopulation && !p.fastedPopulation.unavailable)?.fastedPopulation;
+                        output += `\n_Fasted population (declared only; ${any ? any.lookbackHours + 'h lookback, ' + (any.excludesSMB ? 'SMBs excluded' : 'SMBs exempt') : 'gate not computed'}): ${fp.join(' · ')}. Expected: share near 1.0 in Deep Sleep and Dawn, far below in meal-covered periods; a looser gate raises the meal-covered share._\n`;
+                    }
+                    // [FASTED-RENDER-END]
+                    output += `\n_Deviation is the median of the clean-window population named beside it — the post-change population where a parameter change falls in the window, with the unsplit figure alongside. AGP Check is always the trailing 7 days. Coverage = clean windows collected ÷ the ceiling for the window; a coverage below ~0.25 means the period is meal-covered and its deviation rests on a small fasted residue._\n\n`;
+                    // [PERIOD-TABLE-END]
 
                     const insufficientWaking = analysisResults.signalAnalysis.periods
                         .filter(p => p.signal === 'INSUFFICIENT' &&
@@ -9703,6 +10057,22 @@
                 } else {
                     output += `## Proposed Basal Schedule\n\nNo basal changes in tonight's recommendations.\n\n`;
                 }
+                // [SCHEDULE-SHAPE-RENDER-START] v3.6.28 (DEF-157). The other surface. Renders
+                // on every run, flagged or not — an enumeration that shows only when it fires
+                // teaches the reader that silence means shape is fine.
+                {
+                    const shape = computeScheduleShape(schedules?.basal);
+                    output += `## Schedule Shape (declared, provisional threshold)\n\n`;
+                    output += `_${shape.statement}_\n\n`;
+                    const fb = shape.boundaries.filter(x => x.flagged);
+                    const fn = shape.notches.filter(x => x.flagged);
+                    output += `| Check | Where | Values | Excursion |\n|-------|-------|--------|-----------|\n`;
+                    fb.forEach(x => { output += `| step | ${x.from}→${x.to} | ${x.rateFrom}→${x.rateTo} | ${x.changePct > 0 ? '+' : ''}${x.changePct}% |\n`; });
+                    fn.forEach(x => { output += `| notch (${x.kind}) | ${x.hour} | ${x.prev} / ${x.value} / ${x.next} | ${(x.excursionVsPrev * 100).toFixed(1)}% · ${(x.excursionVsNext * 100).toFixed(1)}% |\n`; });
+                    if (!fb.length && !fn.length) output += `| — | none | ${shape.boundaryCount} boundaries enumerated | 0 flagged |\n`;
+                    output += `\n`;
+                }
+                // [SCHEDULE-SHAPE-RENDER-END]
                 output += `---\n\n`;
                 
                 // Next Steps section (when blocked items exist)
@@ -9938,6 +10308,20 @@
                 const agp48h = analysisResults.nightscoutData?.glucose
                     ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
                     : null;
+                // [COVERAGE-PCT-START] v3.6.28 (DEF-119). One computation, both emitters.
+                // The quiet-night (fast-path) object emitted a SUM OF WINDOW COUNTS under the
+                // name coveragePercent — a count wearing a percent's name. The path is
+                // reachable (no PRIMARY, no urgent, ratio OK, TIR ≥ 80, very-low < 1, no
+                // period deviation over 15, no divergence) and has simply never fired in
+                // this file, where TIR has not reached 80%. No in-tool reader; the JSON
+                // reader would have been handed a count. Now the same percent on both.
+                const coveragePercentOf = (days) => {
+                    const expectedPerDay = 288; // 5-min intervals
+                    const actualReadings = agp7day?.readingCount ||
+                        analysisResults.nightscoutData?.glucose?.length || 0;
+                    return Math.min(100, Math.round((actualReadings / (expectedPerDay * (days || 7))) * 100));
+                };
+                // [COVERAGE-PCT-END]
                 
                 const toLocalTimeStr = (isoOrDate) => {
                     if (!isoOrDate) return null;
@@ -9962,14 +10346,13 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.26',
+                            version: '3.6.28',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
                             dataQuality: {
                                 glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
-                                coveragePercent: analysisResults.signalAnalysis?.periods?.reduce((sum, p) => 
-                                    sum + (p.cleanWindowCount || 0), 0) || 0,
+                                coveragePercent: coveragePercentOf(config.basalSignalWindow || 7),
                                 cleanWindows: analysisResults.signalAnalysis?.periods?.reduce((sum, p) => 
                                     sum + (p.cleanWindowCount || 0), 0) || 0
                             }
@@ -9993,6 +10376,16 @@
                         // INSTR-3: visible on the fast path too — a 10-generated /
                         // 10-blocked / 0-actionable night IS a potential fast-path night.
                         gateCost: analysisResults?.gateCost || null,
+                        // DEF-154: how long each block has stood. Both emitters, from the first build.
+                        blockPersistence: computeBlockPersistence(bundles, excludeToday(cachedHistory || [])),
+                        // DEF-157: declares the schedule's shape. Both emitters.
+                        scheduleShape: computeScheduleShape(schedules?.basal),
+                        // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
+                        directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
+                            configValue: CONFIG.directionWiringEnabled === undefined ? 'unset' : CONFIG.directionWiringEnabled,
+                            note: CONFIG.directionWiringEnabled === true
+                                ? 'DEF-112 direction wiring ON: single-family compound grades use the scale their direction selects.'
+                                : 'DEF-112 direction wiring OFF: compound grades are byte-identical to v3.6.27; the audit still declares the mismatch.' },
                         shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
                         historyAvailable: hMeta.historyAvailable,
                         historyEntryCount: hMeta.historyEntryCount ?? (cachedHistory || []).length,
@@ -10111,7 +10504,27 @@
                                     type: f.type,
                                     bg,
                                     context: f.details?.substring(0, 200) || null,
-                                    severity: f.severity >= 0.8 ? 'severe' : f.severity >= 0.5 ? 'moderate' : 'mild'
+                                    severity: f.severity >= 0.8 ? 'severe' : f.severity >= 0.5 ? 'moderate' : 'mild',
+                                    // [D5-DISCLOSURE-START] v3.6.27 (DEF-151). `context` is
+                                    // capped at 200 characters, so the arithmetic CANNOT ride
+                                    // the prose into the JSON — the markdown surface renders
+                                    // `f.details` in full, this is the other surface and it
+                                    // carries the figures as fields. Emitting them as prose
+                                    // only would have reproduced the defect on one surface.
+                                    //
+                                    // Gated on `attributionBasis`, not on `type`: the CAE
+                                    // emits an `unexplained_low` of its own that computes none
+                                    // of this, and giving it a row of nulls would claim it
+                                    // checked and found nothing. Absent, not false.
+                                    ...(f.attributionBasis ? {
+                                        attributionBasis: f.attributionBasis,
+                                        probableMealCompletion_D5: f.probableMealCompletion_D5 === true,
+                                        mealCompletionEstimateU: f.mealCompletionEstimateU ?? null,
+                                        mealCompletionThresholdU: f.mealCompletionThresholdU ?? null,
+                                        governingMeal: f.governingMeal ?? null,
+                                        iobAtLow: f.iobAtLow ?? null
+                                    } : {})
+                                    // [D5-DISCLOSURE-END]
                                 });
                             }
                             // Signal support from structural findings (fix operator precedence)
@@ -10299,6 +10712,9 @@
                     contributingDayCount: period.contributingDayCount ?? 0,
                     effectiveWindowsByDate: period.effectiveWindowsByDate || {},
                     effectiveContributingDayCount: period.effectiveContributingDayCount ?? 0,
+                    // DEF-156: the third population. Absent on a legacy period object is
+                    // declared, never null; empty is a real reading with dayCount 0.
+                    fastedPopulation: period.fastedPopulation ?? { unavailable: true, section: 'fastedPopulation', reason: 'not_computed' },
                     concentration: {
                         // DEF-120: these three now describe the population medianDeviation
                         // was computed from. The unsplit twins ride alongside — both
@@ -10382,21 +10798,13 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.26',
+                        version: '3.6.28',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
-                            coveragePercent: (() => {
-                                // Use AGP reading count (already filtered/deduped for analysis window)
-                                // rather than raw glucose array which may span wider timeframe
-                                const expectedPerDay = 288; // 5-min intervals
-                                const days = config?.analysisWindow || 7;
-                                const actualReadings = agp7day?.readingCount || 
-                                    analysisResults.nightscoutData?.glucose?.length || 0;
-                                return Math.min(100, Math.round((actualReadings / (expectedPerDay * days)) * 100));
-                            })(),
+                            coveragePercent: coveragePercentOf(config?.analysisWindow || 7),
                             cleanWindows: analysisResults.signalAnalysis?.cleanWindows?.total || 0
                         },
                         // v3.5.95 (DEF-044): per-stage finding census. `lost` names any
@@ -10488,6 +10896,16 @@
                     // INSTR-3: tonight's block economics + R2 shadow (detect-only info;
                     // the real bimodal gate is unchanged and still blocks as reported).
                     gateCost: analysisResults?.gateCost || null,
+                    // DEF-154: how long each block has stood. Both emitters, from the first build.
+                    blockPersistence: computeBlockPersistence(bundles, excludeToday(cachedHistory || [])),
+                    // DEF-157: declares the schedule's shape. Both emitters.
+                    scheduleShape: computeScheduleShape(schedules?.basal),
+                    // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
+                    directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
+                        configValue: CONFIG.directionWiringEnabled === undefined ? 'unset' : CONFIG.directionWiringEnabled,
+                        note: CONFIG.directionWiringEnabled === true
+                            ? 'DEF-112 direction wiring ON: single-family compound grades use the scale their direction selects.'
+                            : 'DEF-112 direction wiring OFF: compound grades are byte-identical to v3.6.27; the audit still declares the mismatch.' },
                     shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
                     // INSTR-2: derived from history snapshots every run (auto-backfilling)
                     historyAvailable: hMeta.historyAvailable,
@@ -10561,7 +10979,13 @@
                             signal: analysisResults.signalAnalysis?.signalOnlyAnchor || null,
                             target: analysisResults.effectiveBasalTarget || null,
                             final: analysisResults.finalPercent || null,
-                            targetSource: analysisResults.effectiveTargetSource || 'not-available'
+                            targetSource: analysisResults.effectiveTargetSource || 'not-available',
+                            // DEF-122: `current` divides by THIS, not by the 24-hour TDD.
+                            currentDenominator: analysisResults.basalPctDenominator
+                                ? { tdd: analysisResults.basalPctDenominator.value, source: analysisResults.basalPctDenominator.source }
+                                : { unavailable: true, section: 'basalPercentOfTDD.currentDenominator' },
+                            meaning: { current: 'scheduled daily basal ÷ currentDenominator.tdd', signal: 'current + tiered nudge from clean windows',
+                                       target: 'effective target (see targetSource)', final: 'target, rate-limited' }
                         },
                         weightedDeviation: analysisResults.signalAnalysis?.weightedDeviation || null,
                         periods: periodSignals,
@@ -11267,14 +11691,23 @@
                 // 48h Trend comparison
                 if (agp48h) {
                     const tirDiff = agp48h.tir.inRange - agp.tir.inRange;
-                    const tirArrow = tirDiff > 2 ? '↑' : tirDiff < -2 ? '↑' : '→';
+                    // [TREND-ARROW-START] v3.6.28 (DEF-123). Diagnosed before fixing: the glyph
+                    // was bound to NEITHER sign-of-delta nor direction-of-harm — both non-neutral
+                    // branches emitted ↑ (a typo), so "-20% ↑" and "19→17 ↑" were the same fixed
+                    // glyph. Now: the arrow is the SIGN of the number beside it, and the word
+                    // beside the arrow says whether that direction is good, so neither reading
+                    // is ambiguous. Both surfaces: the JSON already carries the signed deltas.
+                    const tirArrow = tirDiff > 2 ? '↑' : tirDiff < -2 ? '↓' : '→';
+                    const tirWord = tirDiff > 2 ? 'improving' : tirDiff < -2 ? 'worsening' : 'stable';
                     const tirDiffStr = tirDiff > 0 ? `+${tirDiff.toFixed(0)}%` : `${tirDiff.toFixed(0)}%`;
                     
                     const problemHours7d = agp.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
                     const problemHours48h = agp48h.hourlyStats.filter(h => h && h.tir.inRange < 70).length;
-                    const problemArrow = problemHours48h < problemHours7d ? '↑' : problemHours48h > problemHours7d ? '↑' : '→';
-                    
-                    output += `**48h Trend:** ${agp48h.tir.inRange.toFixed(0)}% TIR (${tirDiffStr} ${tirArrow}) | Problem hours: ${problemHours7d}→${problemHours48h} ${problemArrow}\n`;
+                    const problemArrow = problemHours48h < problemHours7d ? '↓' : problemHours48h > problemHours7d ? '↑' : '→';
+                    const problemWord = problemHours48h < problemHours7d ? 'improving' : problemHours48h > problemHours7d ? 'worsening' : 'stable';
+                    // [TREND-ARROW-END]
+
+                    output += `**48h Trend:** ${agp48h.tir.inRange.toFixed(0)}% TIR (${tirDiffStr} ${tirArrow} ${tirWord}) | Problem hours: ${problemHours7d}→${problemHours48h} ${problemArrow} ${problemWord}\n`;
                 }
                 
                 output += `\n`;
@@ -11872,7 +12305,14 @@
                                     const label2 = collides ? `${displayName[key]} \`[${key}]\`` : displayName[key];
                                     const u = unionOf(key);
                                     const unionStr = u
+                                        // DEF-129: the union counts DISTINCT sessions, so a row that sat in
+                                        // both sections on one night reads e.g. "7 total — 1 primary, 7 watch"
+                                        // and looks like an arithmetic error beside rows that sum exactly.
+                                        // The arithmetic is right; it is labelled now, only where it differs.
                                         ? `${u.total}/${unionDenom} sessions total — ${u.asPrimary} as primary, ${u.asWatch} as watch`
+                                          + ((u.asPrimary + u.asWatch) !== u.total
+                                              ? ` (distinct sessions; ${(u.asPrimary + u.asWatch) - u.total} counted in both sections on the same night)`
+                                              : '')
                                         : `${count}/${rows.length} sessions`;
                                     output += `- ${label2}: ${unionStr} (weighted here: ${(weighted[key] || 0).toFixed(1)})\n`;
                                 }
@@ -12291,6 +12731,13 @@
         // MAIN COMPONENT
         // =========================================================================
         
+        // [FETCH-LOG-START] v3.6.28 (DEF-162). MODULE SCOPE, deliberately: these survive
+        // React renders. See the note at [LATE-RESPONSE-END] for what happened when they
+        // did not. Late arrivals: proof the endpoint answered, and how late. Attempts: every
+        // JSONP attempt with its budget and outcome — the failure-rate numerator/denominator.
+        const jsonpLateArrivals = [];
+        const jsonpAttemptLog = [];
+        // [FETCH-LOG-END]
         const DailyInsulinReview = () => {
             // State
             const [step, setStep] = useState('config'); // config, analyzing, results
@@ -12677,11 +13124,14 @@
             // A late arrival is the proof that the endpoint answered, and how late it was is
             // the ONLY measurement in the system that can size the timeout correctly. It is
             // recorded here rather than reasoned about later.
-            const jsonpLateArrivals = [];
-            // Every attempt, its outcome, and how many it took. This is the numerator and
-            // denominator of the failure rate that nothing counted before this build — the
-            // 10-of-20 figure had to be reconstructed from console logs after the fact.
-            const jsonpAttemptLog = [];
+            // v3.6.28 (DEF-162): the two arrays that were declared HERE — `const jsonpLateArrivals = []`
+            // and `const jsonpAttemptLog = []` — sat inside the component body, so React
+            // re-created them empty on every render. The analysis render wrote them; the Copy
+            // click, several renders later, read a fresh pair. `fetchTelemetry.attempts` could
+            // only ever be `[]` in production, and the v3.6.26 harness could not see it because
+            // it evaluated the export slice with an injected stub. Caught by the differential
+            // replay, which runs two real renders. Both now live at module scope, above the
+            // component, where a render cannot touch them (see [FETCH-LOG-START]).
             // [LATE-RESPONSE-END]
             const jsonpFetch = (url, timeoutMs = 10000, attemptNo = 1) => {
                 return new Promise((resolve, reject) => {
@@ -13404,6 +13854,12 @@
                     // DQ-B FIX: use shared TDD extraction helper
                     const { tdd24h, tdd2Week, tddForSignal } = extractTDDFromDeviceStatus(nightscoutData?.deviceStatus);
                     
+                    // DEF-122: the denominator Basal% is computed over, named so the
+                    // markdown can say which TDD it divided by. It is the 2-week average
+                    // where iAPS supplies one, else the 24-hour figure — never "today's TDD"
+                    // as the old parenthetical claimed four lines under "24-hour: 31.7 U".
+                    const basalPctDenominator = { value: tddForSignal ?? null,
+                        source: tdd2Week ? 'tdd2Week' : (tdd24h ? 'tdd24h' : null) };
                     console.log('TDD extracted:', {
                         tdd24h: tdd24h,
                         tdd2Week: tdd2Week,
@@ -14370,8 +14826,12 @@
                         runTimeSweep: computeRunTimeSweep(
                             nightscoutData, sweepBaselineBolusPerCarb, sweepBaselineBasal),
                         flipHistory: computeFlipHistory(sensitivityHistoryLocal, 28),
-                        retentionCensus: computeRetentionCensus(
-                            aggregatedFindings, detectedState?.state),
+                        // DEF-121: read the post-filter population that carries the rescue
+                        // stamp, never the pre-filter originals. Absent = the engine did not
+                        // run before this point, which is declared rather than counted as 0.
+                        retentionCensus: Array.isArray(RecommendationEngine.lastFilteredFindings)
+                            ? computeRetentionCensus(RecommendationEngine.lastFilteredFindings, detectedState?.state)
+                            : { unavailable: true, section: 'retentionCensus', reason: 'pipeline_not_run' },
                         mealPeakTiming: computeMealPeakTiming(aggregatedFindings)
                     };
 
@@ -14388,6 +14848,7 @@
                         basalOptimization,           // retained for compatibility (null)
                         projectedBasalSchedule,      // Part C: finding-driven projection
                         tdd: tddForSignal,  // For calculations (2-week preferred)
+                        basalPctDenominator,        // DEF-122: which TDD Basal% divides by
                         tdd24h: tdd24h,     // 24-hour TDD for trend comparison
                         tdd2Week: tdd2Week, // 2-week TDD for stable baseline
                         totalCarbs24h: totalCarbs24h,  // Total carbs in last 24h (logged + estimated treatment)
@@ -15380,7 +15841,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.26 — Clipboard Gesture &amp; Fetch Telemetry (DEF-149, DEF-148)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.28 — Consolidated queue (Sep 7 build order)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
