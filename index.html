@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.28</title>
+    <title>Daily Insulin Settings Review v3.6.29</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3140,7 +3140,10 @@
                 retainedCount: retained.length,
                 bySeverity, byType,
                 lowestBG: retained.reduce((min, f) => {
-                    const bg = f.events?.[0]?.lowBG ?? f.events?.[0]?.bg ?? null;
+                    // v3.6.29 (DEF-121 residual). CAE findings carry `f.bg` (v3.6.01) and no
+                    // events[]; Close A read lowestBG: null against a 64. Same fallback chain
+                    // as the export's event push.
+                    const bg = f.events?.[0]?.lowBG ?? f.events?.[0]?.bg ?? f.bg ?? null;
                     return (bg != null && (min == null || bg < min)) ? bg : min;
                 }, null)
             };
@@ -3347,13 +3350,39 @@
         // the reviewer to read its absence as "everything loaded", which is exactly what
         // three builds of silence did to the census line (DEF-106 T7).
         const FULL_HISTORY_WINDOW_DAYS = 365;
+        // [PROVENANCE-START] v3.6.29 (DEF-165). `historySource: "state_cache"` and a
+        // `fetchTelemetry` row recording a live 365-day read in 3314 ms were both true on
+        // Sep 7, and nothing said so — a cache hit after a good fetch was indistinguishable
+        // from a cache hit after no fetch at all. That distinction is the trigger for
+        // DEF-149's still-open iOS gate. The two facts are now emitted distinctly and the
+        // statement carries the sentence. Derived from the session's attempt log, which
+        // lives at module scope (DEF-162) and so survives the render between analysis and
+        // Copy.
+        const sessionFetchSummary = (attemptLog) => {
+            const rows = (Array.isArray(attemptLog) ? attemptLog : []).filter(a => a && /days=365/.test(String(a.url)));
+            if (!rows.length) return { ran: false, attempts: 0, outcome: null, elapsedMs: null,
+                note: 'no live 365-day read this session — the cache was populated by an earlier run' };
+            const last = rows[rows.length - 1];
+            return { ran: true, attempts: rows.length, outcome: last.outcome ?? null, elapsedMs: last.elapsedMs ?? null,
+                note: last.outcome === 'ok'
+                    ? 'a live 365-day read succeeded this session' + (rows.length > 1 ? ' after ' + (rows.length - 1) + ' failed attempt(s)' : '') + ' (' + last.elapsedMs + ' ms)'
+                    : 'the live 365-day read FAILED this session (' + (last.reason || last.outcome) + ') after ' + rows.length + ' attempt(s)' };
+        };
+        const provenanceSentence = (m) => {
+            const f = m.sessionFetch;
+            if (!f) return '';
+            const served = m.historySource === 'state_cache' ? 'the render read the state cache' : m.historySource === 'fetch' ? 'the render read a direct fetch' : 'the render source is ' + (m.historySource || 'unknown');
+            return ' Provenance: ' + f.note + '; ' + served + '.';
+        };
+        // [PROVENANCE-END]
         const buildAvailability = (historyMeta, changeRecordAvailable) => {
             const m = historyMeta || {};
             const win = m.historyWindowDays ?? null;
             const rows = m.historyEntryCount ?? null;
             if (m.historyAvailable !== true) {
                 return {
-                    status: 'unavailable', historySource: m.historySource ?? null,
+                    sessionFetch: m.sessionFetch ?? null,
+                status: 'unavailable', historySource: m.historySource ?? null,
                     windowDays: null, rows: rows ?? 0, changeRecordAvailable: changeRecordAvailable === true,
                     longitudinalBasis: 'none',
                     statement: 'History could not be read (`'
@@ -3365,7 +3394,8 @@
             // the rows are all there, for a window nobody asked the reader to notice.
             if (win !== null && win < FULL_HISTORY_WINDOW_DAYS) {
                 return {
-                    status: 'reduced_window', historySource: m.historySource ?? null,
+                    sessionFetch: m.sessionFetch ?? null,
+                status: 'reduced_window', historySource: m.historySource ?? null,
                     windowDays: win, rows, changeRecordAvailable: changeRecordAvailable === true,
                     longitudinalBasis: 'partial_window',
                     statement: 'History was read over a REDUCED WINDOW of ' + win + ' days ('
@@ -3379,10 +3409,11 @@
                 status: 'full', historySource: m.historySource ?? null,
                 windowDays: win, rows, changeRecordAvailable: changeRecordAvailable === true,
                 longitudinalBasis: 'full_window',
+                sessionFetch: m.sessionFetch ?? null,
                 statement: 'History read in full: ' + (rows ?? '?') + ' rows over '
                     + (win ?? FULL_HISTORY_WINDOW_DAYS) + ' days (source `'
                     + (m.historySource || 'unknown') + '`). Longitudinal sections below are '
-                    + 'computed on the complete retrieved record.'
+                    + 'computed on the complete retrieved record.' + provenanceSentence(m)
             };
         };
         // [AVAILABILITY-END]
@@ -3973,6 +4004,86 @@
             const dt = new Date(s);
             return isNaN(dt.getTime()) ? null : getLocalDateString(dt);
         };
+        // [COB-DECAY-START] v3.6.29 (DEF-158 instrument — AUTHORISED Sep 7, declared-only).
+        // The premise blocking the highest-value item in the queue ("COB is exhausted at
+        // 180 minutes") rested on n = 2 hand reads, while the loop's COB series sat in
+        // devicestatus on every run and was discarded. This emits it, per meal, as a
+        // timestamped series at fixed offsets, with the observed decay slope beside the
+        // configured rate. It does NOT emit a derived "safe post-absorptive interval" —
+        // that is the ruling the diagnostic exists to produce, and a tool that computes
+        // it has pre-empted it. Short and absent series render with the reason. Nothing
+        // reads this. Three sessions, then the PM rules.
+        const COB_SAMPLE_OFFSETS_MIN = [15, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360];
+        const COB_SAMPLE_TOLERANCE_MS = 7.5 * 60 * 1000;
+        const COB_MEAL_MIN_CARBS_G = 10;
+        const computeCobDecay = (nightscoutData, now = new Date()) => {
+            const treatments = Array.isArray(nightscoutData?.treatments) ? nightscoutData.treatments : [];
+            const statuses = (Array.isArray(nightscoutData?.deviceStatus) ? nightscoutData.deviceStatus : [])
+                .map(d => ({ t: new Date(d?.created_at || d?.timestamp || 0).getTime(),
+                             cob: (typeof d?.cob === 'number') ? d.cob : (typeof d?.openaps?.cob?.cob === 'number' ? d.openaps.cob.cob : null) }))
+                .filter(x => !Number.isNaN(x.t) && x.t > 0 && x.cob !== null)
+                .sort((a, b) => a.t - b.t);
+            const nearest = (ms) => {
+                let best = null;
+                for (const x of statuses) { const d = Math.abs(x.t - ms); if (d <= COB_SAMPLE_TOLERANCE_MS && (!best || d < best.d)) best = { d, x }; }
+                return best ? best.x : null;
+            };
+            const meals = treatments
+                .filter(t => t && t.created_at && typeof t.carbs === 'number' && t.carbs >= COB_MEAL_MIN_CARBS_G)
+                .map(t => ({ t: new Date(t.created_at).getTime(), carbs: t.carbs, insulin: typeof t.insulin === 'number' ? t.insulin : null, eventType: t.eventType || null }))
+                .filter(m => !Number.isNaN(m.t)).sort((a, b) => a.t - b.t)
+                .map((m, idx, arr) => {
+                    // A series ends at the NEXT carb entry: after it, COB belongs to that
+                    // meal. The first replay of this instrument fitted a breakfast's slope
+                    // through lunch's 43.8g at +300 and read −0.3 g/hr.
+                    const nextMealT = arr[idx + 1] ? arr[idx + 1].t : null;
+                    const bolus = treatments.filter(t => t && t.created_at && t.insulin > 0 && !(t.eventType && String(t.eventType).includes('SMB')))
+                        .map(t => ({ t: new Date(t.created_at).getTime(), u: t.insulin }))
+                        .filter(b => Math.abs(b.t - m.t) <= 15 * 60 * 1000).sort((a, b) => Math.abs(a.t - m.t) - Math.abs(b.t - m.t))[0] || null;
+                    const samples = COB_SAMPLE_OFFSETS_MIN.map(off => {
+                        const at = m.t + off * 60 * 1000;
+                        if (at > now.getTime()) return { offsetMin: off, cob: null, reason: 'after run time' };
+                        if (nextMealT !== null && at >= nextMealT) return { offsetMin: off, cob: null, reason: 'after the next carb entry (+' + Math.round((nextMealT - m.t) / 60000) + ' min)' };
+                        const x = nearest(at);
+                        return x ? { offsetMin: off, cob: parseFloat(x.cob.toFixed(1)), at: new Date(x.t).toISOString() }
+                                 : { offsetMin: off, cob: null, reason: 'no devicestatus within ±7.5 min' };
+                    });
+                    const seriesComplete = samples.every(sm => sm.cob !== null);
+                    // Observed decay: least-squares slope over the samples that carry a value,
+                    // from the first sample to the last non-zero one. g/hr, positive = decay.
+                    const pts = samples.filter(sm => sm.cob !== null);
+                    const lastNonZero = pts.reduce((k, sm, i) => sm.cob > 0 ? i : k, -1);
+                    const fit = pts.slice(0, lastNonZero + 1);
+                    let slope = null;
+                    if (fit.length >= 2) {
+                        const n = fit.length, mx = fit.reduce((a, q) => a + q.offsetMin, 0) / n, my = fit.reduce((a, q) => a + q.cob, 0) / n;
+                        const den = fit.reduce((a, q) => a + (q.offsetMin - mx) ** 2, 0);
+                        slope = den > 0 ? parseFloat((-(fit.reduce((a, q) => a + (q.offsetMin - mx) * (q.cob - my), 0) / den) * 60).toFixed(1)) : null;
+                    }
+                    return {
+                        mealTime: new Date(m.t).toISOString(), carbs: m.carbs, eventType: m.eventType,
+                        bolus: bolus ? { time: new Date(bolus.t).toISOString(), units: bolus.u } : { time: null, units: m.insulin, reason: m.insulin ? 'insulin on the carb entry itself' : 'no user bolus within ±15 min' },
+                        samples, seriesComplete,
+                        seriesNote: seriesComplete ? null
+                            : samples.some(sm => sm.reason === 'after run time') ? 'meal within 6h of run time — series truncated'
+                            : samples.some(sm => /next carb entry/.test(sm.reason || '')) ? 'series ends at the next carb entry'
+                            : 'devicestatus gaps inside the series',
+                        nextMealOffsetMin: nextMealT === null ? null : Math.round((nextMealT - m.t) / 60000),
+                        observedDecayGPerHr: slope,
+                        observedDecayNote: slope === null ? 'fewer than two COB samples with a value — no slope' : 'least-squares over samples from the first to the last non-zero COB',
+                        configuredDecay: { gPerHr: null, reason: 'not present in the Nightscout fetch — iAPS min_5m_carbimpact is a device preference and is not uploaded' }
+                    };
+                });
+            return {
+                mealCount: meals.length, sampleOffsetsMin: COB_SAMPLE_OFFSETS_MIN, minCarbsG: COB_MEAL_MIN_CARBS_G,
+                deviceStatusSamples: statuses.length,
+                meals,
+                statement: meals.length
+                    ? `COB decay: ${meals.length} meal(s) ≥ ${COB_MEAL_MIN_CARBS_G}g in the fetch window, each with COB sampled at ${COB_SAMPLE_OFFSETS_MIN.length} fixed offsets from ${statuses.length} devicestatus records. Observed slope per meal; configured rate not in the fetch. No interval is derived — declared only, nothing reads this.`
+                    : `COB decay: no meal ≥ ${COB_MEAL_MIN_CARBS_G}g in the fetch window (${statuses.length} devicestatus records with COB). Declared only.`
+            };
+        };
+        // [COB-DECAY-END]
         // [SCHEDULE-SHAPE-START] v3.6.28 (DEF-157). Input is the basal schedule alone —
         // no glucose, no treatments, no window population, no history — the one instrument
         // in the queue that data quality cannot contaminate.
@@ -3993,8 +4104,28 @@
         //
         // Declares. Does not act: no primaryParameter, no contributingFactors, no severity,
         // no recommendation, and nothing downstream reads it (T4).
-        const SCHEDULE_SHAPE_THRESHOLD = 0.14;
-        const computeScheduleShape = (basalSchedule, threshold = SCHEDULE_SHAPE_THRESHOLD) => {
+        // v3.6.29 — PM RULING after Close A (Sep 7), read from the deployed schedule:
+        // a single 14% threshold flagged 8 of 24 boundaries, and "a detector that flags a
+        // third of the schedule is not an instrument". Two rules now, neither a bare percent:
+        //   STEP  — flags when the boundary moves by ≥ SCHEDULE_STEP_INCREMENTS pump
+        //           increments. A percentage over-flags the smallest rates (0.35→0.30 is
+        //           one increment reading −14.3%) — R3b's defect reappearing in the shape
+        //           detector. SCHEDULE_STEP_PCT_FALLBACK applies only if the pump increment
+        //           is unavailable.
+        //   NOTCH — flags on the LARGER excursion against either neighbour, not both. The
+        //           symmetric rule missed the 19:00 notch (0.45/0.40/0.55 → 0.125/0.375) that
+        //           the reviewer had tracked by hand for eight days, and flagged one nobody
+        //           had named. A detector that fires on what the reviewer already found is
+        //           calibrated.
+        const SCHEDULE_STEP_INCREMENTS = 3;
+        const SCHEDULE_STEP_PCT_FALLBACK = 0.20;
+        const SCHEDULE_NOTCH_MAX_EXCURSION = 0.20;
+        const SCHEDULE_SHAPE_THRESHOLD = 0.14;   // retained ONLY as the emitted historical provisional value; no longer a rule
+        const computeScheduleShape = (basalSchedule, opts = {}) => {
+            const increment = (typeof opts.pumpIncrement === 'number' && opts.pumpIncrement > 0) ? opts.pumpIncrement : null;
+            const stepIncrements = opts.stepIncrements ?? SCHEDULE_STEP_INCREMENTS;
+            const stepPctFallback = opts.stepPctFallback ?? SCHEDULE_STEP_PCT_FALLBACK;
+            const notchMax = opts.notchMaxExcursion ?? SCHEDULE_NOTCH_MAX_EXCURSION;
             const hh = (h) => `${String(h).padStart(2, '0')}:00`;
             const sched = Array.isArray(basalSchedule) ? basalSchedule.filter(e => e && typeof e.value === 'number') : [];
             const sorted = sched.slice().sort((a, b) => String(a.time).localeCompare(String(b.time)));
@@ -4015,9 +4146,13 @@
                 const n = (h + 1) % 24;
                 const ratio = ratioOf(rates[h], rates[n]);
                 const changePct = ratio === null ? null : parseFloat(((ratio - 1) * 100).toFixed(1));
+                const deltaU = (typeof rates[h] === 'number' && typeof rates[n] === 'number') ? parseFloat((rates[n] - rates[h]).toFixed(4)) : null;
+                const incrementsMoved = (deltaU !== null && increment) ? parseFloat((Math.abs(deltaU) / increment).toFixed(2)) : null;
+                const flagged = deltaU === null ? false
+                    : (increment ? incrementsMoved >= stepIncrements : Math.abs(ratio - 1) >= stepPctFallback);
                 boundaries.push({ from: hh(h), to: hh(n), rateFrom: rates[h], rateTo: rates[n],
                     ratio: ratio === null ? null : parseFloat(ratio.toFixed(4)), changePct,
-                    flagged: ratio !== null && Math.abs(ratio - 1) >= threshold });
+                    deltaU, incrementsMoved, flagged });
             }
             const hours = [];
             for (let h = 0; h < 24; h++) {
@@ -4028,13 +4163,20 @@
                 // Excursion on each side, measured from the hour's own rate.
                 const vsPrev = ok ? parseFloat((Math.abs(p / v - 1)).toFixed(4)) : null;
                 const vsNext = ok ? parseFloat((Math.abs(n / v - 1)).toFixed(4)) : null;
+                const maxExcursion = ok ? Math.max(vsPrev, vsNext) : null;
                 hours.push({ hour: hh(h), prev: p, value: v, next: n, kind,
-                    excursionVsPrev: vsPrev, excursionVsNext: vsNext,
-                    flagged: kind !== null && vsPrev >= threshold && vsNext >= threshold });
+                    excursionVsPrev: vsPrev, excursionVsNext: vsNext, maxExcursion,
+                    flagged: kind !== null && maxExcursion !== null && maxExcursion >= notchMax });
             }
             return {
-                thresholdRatio: threshold,
-                thresholdProvisional: true,
+                rules: {
+                    step: increment
+                        ? { basis: 'pump_increments', pumpIncrement: increment, flagAtIncrements: stepIncrements }
+                        : { basis: 'percent_fallback', flagAtPct: stepPctFallback, reason: 'pump increment unavailable' },
+                    notch: { basis: 'max_excursion', flagAt: notchMax },
+                    rulingDate: '2026-09-07',
+                    supersededProvisionalThreshold: SCHEDULE_SHAPE_THRESHOLD
+                },
                 scheduleComplete: complete,
                 boundaryCount: boundaries.length,
                 hourCount: hours.length,
@@ -4042,9 +4184,11 @@
                 flaggedNotchCount: hours.filter(x => x.flagged).length,
                 boundaries,
                 notches: hours,
-                statement: `Schedule shape: ${boundaries.length} boundaries and ${hours.length} hours enumerated against a PROVISIONAL threshold of ${Math.round(threshold * 100)}% — `
-                    + `${boundaries.filter(b => b.flagged).length} boundary step(s) and ${hours.filter(x => x.flagged).length} single-hour notch(es) exceed it. `
-                    + `Declared only; nothing reads this. The threshold is ruled after this run, not before.`
+                statement: `Schedule shape: ${boundaries.length} boundaries and ${hours.length} hours enumerated — `
+                    + `steps flag at ≥ ${increment ? stepIncrements + ' pump increments (' + increment + ' U/hr each)' : Math.round(stepPctFallback * 100) + '% (fallback: pump increment unavailable)'}, `
+                    + `notches at a larger-side excursion ≥ ${Math.round(notchMax * 100)}% — `
+                    + `${boundaries.filter(b => b.flagged).length} step(s) and ${hours.filter(x => x.flagged).length} notch(es) flag. `
+                    + `Rules ruled Sep 7 from the first production distribution. Declared only; nothing reads this.`
             };
         };
         // [SCHEDULE-SHAPE-END]
@@ -8565,6 +8709,21 @@
                     fastedWindows.forEach(w => { if (w.date) fastedByDate[w.date] = (fastedByDate[w.date] || 0) + 1; });
                     const fastedDates = Object.keys(fastedByDate).sort();
                     const fastedDeviations = fastedWindows.map(w => w.deviation).sort((a, b) => a - b);
+                    // [FASTED-CAPABILITY-START] v3.6.29 (DEF-163). On its first production
+                    // night Sleep Onset read shareOfClean 0.00 — indistinguishable from "no
+                    // fasted days occurred". It was not that: 21:00–24:00 sits inside six
+                    // hours of every dinner, so the period CANNOT produce a fasted window
+                    // under the current rule. A zero that reads as an observation is the
+                    // count class arriving at a brand-new field. The lookback is NOT retuned
+                    // here — that is the COB question and it gates DEF-158.
+                    //
+                    // Capability is derived from what happened, not from a meal timetable:
+                    // clean windows existed, and every one of them fell inside the lookback
+                    // of a treatment → excluded_by_rule. No clean windows → no_candidates.
+                    const excludedByLookback = windowsInPeriod.length - fastedWindows.length;
+                    const fastedCapability = windowsInPeriod.length === 0 ? 'no_candidates'
+                        : (fastedWindows.length === 0 ? 'excluded_by_rule' : 'capable');
+                    // [FASTED-CAPABILITY-END]
                     const fastedPopulation = {
                         lookbackHours: FASTED_LOOKBACK_HOURS,
                         excludesSMB: FASTED_EXCLUDES_SMB,
@@ -8572,6 +8731,14 @@
                         dayCount: fastedDates.length,
                         dates: fastedDates,
                         windowsByDate: fastedByDate,
+                        candidateWindows: windowsInPeriod.length,
+                        excludedByLookback,
+                        capability: fastedCapability,
+                        capabilityNote: fastedCapability === 'excluded_by_rule'
+                            ? `${windowsInPeriod.length} clean windows, every one within ${FASTED_LOOKBACK_HOURS}h of a carb entry or user bolus — this period cannot produce a fasted window under the current rule; its zero is exclusion, not observation.`
+                            : fastedCapability === 'no_candidates'
+                                ? 'No clean windows in this period, so nothing to gate.'
+                                : `${fastedWindows.length} of ${windowsInPeriod.length} clean windows fasted.`,
                         medianDeviation: fastedDeviations.length ? medianOf(fastedDeviations) : null,
                         ceilingUtilization: ceilingForWindow > 0
                             ? parseFloat((fastedWindows.length / ceilingForWindow).toFixed(4)) : null,
@@ -9932,10 +10099,12 @@
                             const f = p.fastedPopulation;
                             if (!f || f.unavailable) return `${p.name}: UNAVAILABLE`;
                             const med = (f.medianDeviation === null || f.medianDeviation === undefined) ? 'n/a' : `${Number(f.medianDeviation) >= 0 ? '+' : ''}${Number(f.medianDeviation).toFixed(1)}`;
-                            return `${p.name} ${f.windowCount}w/${f.dayCount}d · med ${med} · share ${f.shareOfClean === null ? 'n/a' : f.shareOfClean.toFixed(2)} · cov ${f.ceilingUtilization === null ? 'n/a' : f.ceilingUtilization.toFixed(3)}`;
+                            const cap = f.capability === 'excluded_by_rule' ? ` [EXCLUDED BY RULE: ${f.candidateWindows} clean windows all within ${f.lookbackHours}h of a meal/bolus]`
+                                : f.capability === 'no_candidates' ? ' [no clean windows]' : '';
+                            return `${p.name} ${f.windowCount}w/${f.dayCount}d · med ${med} · share ${f.shareOfClean === null ? 'n/a' : f.shareOfClean.toFixed(2)} · cov ${f.ceilingUtilization === null ? 'n/a' : f.ceilingUtilization.toFixed(3)}${cap}`;
                         });
                         const any = analysisResults.signalAnalysis.periods.find(p => p.fastedPopulation && !p.fastedPopulation.unavailable)?.fastedPopulation;
-                        output += `\n_Fasted population (declared only; ${any ? any.lookbackHours + 'h lookback, ' + (any.excludesSMB ? 'SMBs excluded' : 'SMBs exempt') : 'gate not computed'}): ${fp.join(' · ')}. Expected: share near 1.0 in Deep Sleep and Dawn, far below in meal-covered periods; a looser gate raises the meal-covered share._\n`;
+                        output += `\n_Fasted population (declared only; ${any ? any.lookbackHours + 'h lookback, ' + (any.excludesSMB ? 'SMBs excluded' : 'SMBs exempt') : 'gate not computed'}): ${fp.join(' · ')}. Expected: share near 1.0 in Deep Sleep and Dawn, far below in meal-covered periods; a looser gate raises the meal-covered share. STANDING READ RESTRICTION (Sep 7): the fasted median is readable only where share is 1.00._\n`;
                     }
                     // [FASTED-RENDER-END]
                     output += `\n_Deviation is the median of the clean-window population named beside it — the post-change population where a parameter change falls in the window, with the unsplit figure alongside. AGP Check is always the trailing 7 days. Coverage = clean windows collected ÷ the ceiling for the window; a coverage below ~0.25 means the period is meal-covered and its deviation rests on a small fasted residue._\n\n`;
@@ -10061,18 +10230,34 @@
                 // on every run, flagged or not — an enumeration that shows only when it fires
                 // teaches the reader that silence means shape is fine.
                 {
-                    const shape = computeScheduleShape(schedules?.basal);
-                    output += `## Schedule Shape (declared, provisional threshold)\n\n`;
+                    const shape = computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement });
+                    output += `## Schedule Shape (declared)\n\n`;
                     output += `_${shape.statement}_\n\n`;
                     const fb = shape.boundaries.filter(x => x.flagged);
                     const fn = shape.notches.filter(x => x.flagged);
                     output += `| Check | Where | Values | Excursion |\n|-------|-------|--------|-----------|\n`;
-                    fb.forEach(x => { output += `| step | ${x.from}→${x.to} | ${x.rateFrom}→${x.rateTo} | ${x.changePct > 0 ? '+' : ''}${x.changePct}% |\n`; });
-                    fn.forEach(x => { output += `| notch (${x.kind}) | ${x.hour} | ${x.prev} / ${x.value} / ${x.next} | ${(x.excursionVsPrev * 100).toFixed(1)}% · ${(x.excursionVsNext * 100).toFixed(1)}% |\n`; });
+                    fb.forEach(x => { output += `| step | ${x.from}→${x.to} | ${x.rateFrom}→${x.rateTo} | ${x.incrementsMoved !== null ? x.incrementsMoved + ' increments' : ''} (${x.changePct > 0 ? '+' : ''}${x.changePct}%) |\n`; });
+                    fn.forEach(x => { output += `| notch (${x.kind}) | ${x.hour} | ${x.prev} / ${x.value} / ${x.next} | max ${(x.maxExcursion * 100).toFixed(1)}% (${(x.excursionVsPrev * 100).toFixed(1)}% · ${(x.excursionVsNext * 100).toFixed(1)}%) |\n`; });
                     if (!fb.length && !fn.length) output += `| — | none | ${shape.boundaryCount} boundaries enumerated | 0 flagged |\n`;
                     output += `\n`;
                 }
                 // [SCHEDULE-SHAPE-RENDER-END]
+                // [COB-DECAY-RENDER-START] v3.6.29 (DEF-158). The other surface; renders on
+                // zero meals too, with the reason.
+                {
+                    const cd = computeCobDecay(analysisResults?.nightscoutData);
+                    output += `## COB Decay (declared only, DEF-158 instrument)\n\n_${cd.statement}_\n\n`;
+                    if (cd.meals.length) {
+                        output += `| Meal | g | Bolus | COB at +${cd.sampleOffsetsMin.join('/+')} min | Observed g/hr |\n|------|---|-------|-----|---------------|\n`;
+                        cd.meals.forEach(m => {
+                            const when = new Date(m.mealTime).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+                            const series = m.samples.map(sm => sm.cob === null ? '·' : sm.cob).join('→');
+                            output += `| ${when} | ${m.carbs} | ${m.bolus.units ?? '—'}U | ${series}${m.seriesComplete ? '' : ' _(' + m.seriesNote + ')_'} | ${m.observedDecayGPerHr ?? 'n/a'} |\n`;
+                        });
+                        output += `\n_Configured rate: not in the fetch (iAPS min_5m_carbimpact is a device preference). No post-absorptive interval is derived here._\n\n`;
+                    }
+                }
+                // [COB-DECAY-RENDER-END]
                 output += `---\n\n`;
                 
                 // Next Steps section (when blocked items exist)
@@ -10321,6 +10506,17 @@
                         analysisResults.nightscoutData?.glucose?.length || 0;
                     return Math.min(100, Math.round((actualReadings / (expectedPerDay * (days || 7))) * 100));
                 };
+                // v3.6.29 (DEF-164). The percent could not be reproduced from any emitted figure:
+                // 2276 raw readings over 2016 expected is 113%, and the emitted 96 came from the
+                // AGP's deduplicated readingCount, which the JSON never showed. An aggregate the
+                // reader cannot decompose is one they must trust wholly or discard wholly.
+                const coverageInputsOf = (days) => {
+                    const expectedPerDay = 288;
+                    const fromAgp = agp7day?.readingCount;
+                    const raw = analysisResults.nightscoutData?.glucose?.length || 0;
+                    return { readings: fromAgp || raw, readingsSource: fromAgp ? 'agp7day.readingCount (deduplicated, windowed)' : 'glucose.length (raw)',
+                             rawGlucoseLength: raw, expected: expectedPerDay * (days || 7), days: days || 7, expectedPerDay, capped: true };
+                };
                 // [COVERAGE-PCT-END]
                 
                 const toLocalTimeStr = (isoOrDate) => {
@@ -10346,13 +10542,14 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.28',
+                            version: '3.6.29',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
                             dataQuality: {
                                 glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
                                 coveragePercent: coveragePercentOf(config.basalSignalWindow || 7),
+                                coverageInputs: coverageInputsOf(config.basalSignalWindow || 7),
                                 cleanWindows: analysisResults.signalAnalysis?.periods?.reduce((sum, p) => 
                                     sum + (p.cleanWindowCount || 0), 0) || 0
                             }
@@ -10379,7 +10576,9 @@
                         // DEF-154: how long each block has stood. Both emitters, from the first build.
                         blockPersistence: computeBlockPersistence(bundles, excludeToday(cachedHistory || [])),
                         // DEF-157: declares the schedule's shape. Both emitters.
-                        scheduleShape: computeScheduleShape(schedules?.basal),
+                        scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
+                        // DEF-158 instrument. Both emitters.
+                        cobDecay: computeCobDecay(analysisResults?.nightscoutData),
                         // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
                         directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
                             configValue: CONFIG.directionWiringEnabled === undefined ? 'unset' : CONFIG.directionWiringEnabled,
@@ -10798,13 +10997,14 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.28',
+                        version: '3.6.29',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
                             coveragePercent: coveragePercentOf(config?.analysisWindow || 7),
+                            coverageInputs: coverageInputsOf(config?.analysisWindow || 7),
                             cleanWindows: analysisResults.signalAnalysis?.cleanWindows?.total || 0
                         },
                         // v3.5.95 (DEF-044): per-stage finding census. `lost` names any
@@ -10899,7 +11099,9 @@
                     // DEF-154: how long each block has stood. Both emitters, from the first build.
                     blockPersistence: computeBlockPersistence(bundles, excludeToday(cachedHistory || [])),
                     // DEF-157: declares the schedule's shape. Both emitters.
-                    scheduleShape: computeScheduleShape(schedules?.basal),
+                    scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
+                    // DEF-158 instrument. Both emitters.
+                    cobDecay: computeCobDecay(analysisResults?.nightscoutData),
                     // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
                     directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
                         configValue: CONFIG.directionWiringEnabled === undefined ? 'unset' : CONFIG.directionWiringEnabled,
@@ -15137,6 +15339,9 @@
                 } else {
                     historyMeta.historyUnavailableReason = 'no_sheets_url_configured';
                 }
+                // DEF-165: which of the two facts happened this session, attached where the
+                // render will read it.
+                historyMeta.sessionFetch = sessionFetchSummary(jsonpAttemptLog);
                 console.log('[HISTORY-RESOLVE]', JSON.stringify(historyMeta),
                     '| state cache was', (Array.isArray(cachedSheetsEntries) && cachedSheetsEntries.length > 0)
                         ? 'POPULATED' : 'COLD');
@@ -15841,7 +16046,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.28 — Consolidated queue (Sep 7 build order)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.29 — Close A rulings (DEF-157, 163, 164, 165, 121, 158)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
