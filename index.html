@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.31</title>
+    <title>Daily Insulin Settings Review v3.6.32</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2687,14 +2687,14 @@
         const cobPathCensus = (statuses) => {
             const byPath = {};
             COB_PATHS.forEach(p => { byPath[p] = 0; });
-            let withCOB = 0, suggestedEnactedDiverge = 0;
+            let withCOB = 0, suggestedEnactedDiverge = 0, suggestedEnactedCompared = 0;
             (Array.isArray(statuses) ? statuses : []).forEach(s => {
                 const r = extractCOB(s);
                 if (r.source) { byPath[r.source]++; withCOB++; }
                 const a = s?.openaps?.suggested?.COB, b = s?.openaps?.enacted?.COB;
-                if (typeof a === 'number' && typeof b === 'number' && a !== b) suggestedEnactedDiverge++;
+                if (typeof a === 'number' && typeof b === 'number') { suggestedEnactedCompared++; if (a !== b) suggestedEnactedDiverge++; }
             });
-            return { deviceStatusRecords: (Array.isArray(statuses) ? statuses : []).length, withCOB, byPath, suggestedEnactedDiverge };
+            return { deviceStatusRecords: (Array.isArray(statuses) ? statuses : []).length, withCOB, byPath, suggestedEnactedCompared, suggestedEnactedDiverge };
         };
         // [EXTRACT-COB-END]
 
@@ -3748,6 +3748,33 @@
         const LEDGER_LOWPCT_THRESHOLD = 0.5; // pp Low_Pct fall for weaken IMPROVED
         const LEDGER_LOW_GUARD = 1.0;      // pp Low_Pct rise → CAUSED_LOW on a strengthen
         const LEDGER_EPS = 1e-9;
+        // [LEDGER-BASIS-START] v3.6.32 (DEF-178). A ledger window compares logged period
+        // medians across sessions; when the population those medians are computed on
+        // changes between builds, a window that straddles the change compares two bases
+        // and reads the level shift as the change's effect. The basis is computed from
+        // the row's logged tool version (Tool_Version column, App Script v5.8), not from
+        // a hard-coded date, so the next basis change is one table entry. A row with no
+        // version was logged before the column existed and is the earliest basis. The
+        // straddle is a confounder of the same class as an override session.
+        const LEDGER_BASIS_CHANGES = [
+            { fromVersion: '3.6.31', basis: 'cob_gated', reason: 'clean-window COB gate switched to devicestatus COB (DEF-172)' }
+        ];
+        const semverGte = (a, b) => {
+            const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+            for (let i = 0; i < 3; i++) { const x = pa[i] || 0, y = pb[i] || 0; if (x !== y) return x > y; }
+            return true;
+        };
+        const ledgerBasisOf = (toolVersion) => {
+            const v = (typeof toolVersion === 'string' && /^\d+\.\d+\.\d+$/.test(toolVersion.trim())) ? toolVersion.trim() : null;
+            if (!v) return 'legacy';
+            let basis = 'legacy';
+            LEDGER_BASIS_CHANGES.forEach(c => { if (semverGte(v, c.fromVersion)) basis = c.basis; });
+            return basis;
+        };
+        const TOOL_VERSION_FROM_TITLE = () => {
+            try { return (String(document.title).match(/v(\d+\.\d+\.\d+)/) || [])[1] || null; } catch (e) { return null; }
+        };
+        // [LEDGER-BASIS-END]
         const LEDGER_PERIOD_KEYS = {
             'Deep Sleep': { dev: 'deepSleep', low: 'lowDeepSleep' },
             'Dawn': { dev: 'dawn', low: 'lowDawn' },
@@ -3794,6 +3821,7 @@
                     dev: (period) => num(e.periodDeviations ? e.periodDeviations[LEDGER_PERIOD_KEYS[period]?.dev] : null),
                     low: (period) => num(e[LEDGER_PERIOD_KEYS[period]?.low]),
                     isOverride: !!e.isOverride,
+                    basis: ledgerBasisOf(e.toolVersion),
                     voids: parseVoidsTokens(e.decisionLog)
                 }));
 
@@ -3868,6 +3896,16 @@
                 for (let j = i; j <= Math.min(sessions.length - 1, postEnd); j++) {
                     if (sessions[j].isOverride) return { verdict: 'CONFOUNDED', confounder: `override session ${sessions[j].date}` };
                 }
+                // [LEDGER-BASIS-CONFOUND-START] v3.6.32 (DEF-178).
+                {
+                    const win = sessions.slice(Math.max(0, i - LEDGER_PRE), Math.min(sessions.length, i + LEDGER_POST));
+                    const bases = [...new Set(win.map(s => s.basis))];
+                    if (bases.length > 1) {
+                        const first = win.find(s => s.basis !== win[0].basis);
+                        return { verdict: 'CONFOUNDED', confounder: `population basis change ${bases.join(' → ')} at session ${first ? first.date : '?'} (DEF-178)` };
+                    }
+                }
+                // [LEDGER-BASIS-CONFOUND-END]
                 // Windows. Post includes session i — the first day under the change.
                 const preRows = sessions.slice(Math.max(0, i - LEDGER_PRE), i);
                 const postRows = sessions.slice(i, i + LEDGER_POST);
@@ -4099,12 +4137,26 @@
                     const pts = samples.filter(sm => sm.cob !== null);
                     const lastNonZero = pts.reduce((k, sm, i) => sm.cob > 0 ? i : k, -1);
                     const fit = pts.slice(0, lastNonZero + 1);
+                    // [COB-RISE-START] v3.6.32 (DEF-174, PM amendment). A series in which COB
+                    // RISES between consecutive samples is not a decay series: the loop
+                    // re-estimated, or a carb entry the meal detector did not see landed. The
+                    // flag fires on ANY rise, not only where the fitted slope lands ≤ 0 — a
+                    // rise mid-window can still return a plausible positive slope (Sep 8
+                    // 6:54p: 197 → 209 inside a +45.8). A slope of zero or below is a category
+                    // error printed as a number and is nulled with the reason kept.
+                    const rises = [];
+                    for (let k = 1; k < pts.length; k++) if (pts[k].cob > pts[k - 1].cob) rises.push({ fromOffsetMin: pts[k - 1].offsetMin, toOffsetMin: pts[k].offsetMin, fromCob: pts[k - 1].cob, toCob: pts[k].cob });
+                    const cobRose = rises.length > 0;
+                    // [COB-RISE-END]
                     let slope = null;
                     if (fit.length >= 2) {
                         const n = fit.length, mx = fit.reduce((a, q) => a + q.offsetMin, 0) / n, my = fit.reduce((a, q) => a + q.cob, 0) / n;
                         const den = fit.reduce((a, q) => a + (q.offsetMin - mx) ** 2, 0);
                         slope = den > 0 ? parseFloat((-(fit.reduce((a, q) => a + (q.offsetMin - mx) * (q.cob - my), 0) / den) * 60).toFixed(1)) : null;
                     }
+                    const slopeNotDecay = slope !== null && slope <= 0;
+                    const fittedSlope = slope;
+                    if (slopeNotDecay) slope = null;
                     return {
                         mealTime: new Date(m.t).toISOString(), carbs: m.carbs, eventType: m.eventType,
                         bolus: bolus ? { time: new Date(bolus.t).toISOString(), units: bolus.u } : { time: null, units: m.insulin, reason: m.insulin ? 'insulin on the carb entry itself' : 'no user bolus within ±15 min' },
@@ -4115,7 +4167,9 @@
                             : 'devicestatus gaps inside the series',
                         nextMealOffsetMin: nextMealT === null ? null : Math.round((nextMealT - m.t) / 60000),
                         observedDecayGPerHr: slope,
-                        observedDecayNote: slope === null ? 'fewer than two COB samples with a value — no slope' : 'least-squares over samples from the first to the last non-zero COB',
+                        observedDecayNote: slopeNotDecay ? `fitted slope ${fittedSlope} g/hr is not a decay — COB rose inside the series; nulled (DEF-174)`
+                            : slope === null ? 'fewer than two COB samples with a value — no slope' : 'least-squares over samples from the first to the last non-zero COB',
+                        cobRose, rises,
                         configuredDecay: { gPerHr: null, reason: 'not present in the Nightscout fetch — iAPS min_5m_carbimpact is a device preference and is not uploaded' }
                     };
                 });
@@ -4124,6 +4178,7 @@
                 deviceStatusRecords: pathCensus.deviceStatusRecords,
                 withCOB: pathCensus.withCOB,
                 byPath: pathCensus.byPath,
+                suggestedEnactedCompared: pathCensus.suggestedEnactedCompared,
                 suggestedEnactedDiverge: pathCensus.suggestedEnactedDiverge,
                 cobPathsRead: COB_PATHS,
                 meals,
@@ -8442,6 +8497,15 @@
         const SignalAnalysis = {
             analyzeCleanWindows(nightscoutData, basalWindow, targetBG = 110, basalSchedule = null, isfSchedule = null, tdd = null) {
                 const analysisStart = new Date(Date.now() - basalWindow * 24 * 60 * 60 * 1000);
+                // [WINDOW-EDGE-START] v3.6.32 (DEF-182). The window is run-time-relative, so
+                // its trailing edge falls at the run's clock time on the earliest day and
+                // sweeps through exactly one period's hours; two runs on the same date can
+                // differ on that period alone. Declared per period so a reviewer comparing
+                // runs can tell a population change from a build effect.
+                const analysisEnd = new Date(analysisStart.getTime() + basalWindow * 24 * 60 * 60 * 1000);
+                const trailingDate = getLocalDateString(analysisStart);
+                const trailingEdgeHour = analysisStart.getHours() + analysisStart.getMinutes() / 60;
+                // [WINDOW-EDGE-END]
                 
                 // Find clean windows (COB = 0) with ENH-CAE-001 gates A/B/C.
                 // IOB filter removed: iAPS SMB IOB is not a contaminant — it is the loop's
@@ -8862,9 +8926,9 @@
                         capability: (windowsInPeriod.length + cobRejectedInPeriod.length + cobUnreadableInPeriod.length) === 0 ? 'no_candidates'
                             : (windowsInPeriod.length === 0 && cobUnreadableInPeriod.length > 0 && cobRejectedInPeriod.length === 0 ? 'no_readable_cob'
                             : (windowsInPeriod.length === 0 ? 'excluded_by_rule' : 'capable')),
-                        expected: 'Deep Sleep and Dawn near shareOfPreSwitch 1.0 with medians unmoved; Afternoon may read INSUFFICIENT where it read HIGH before the switch; '
-                            + 'Sleep Onset moves on nights with a late large meal (Sep 5: 104g at 7:48p, COB 48 at 11:03p). A small delta on a quiet week is not the gate failing — '
-                            + 'the Sep 8 -14.0 on Sleep Onset was one night. Declared for comparison; nothing reads preSwitch.'
+                        expected: 'Fasting periods (Deep Sleep, Dawn) near shareOfPreSwitch 1.0 with medians unmoved; meal-covered periods lose windows on late-large-meal nights, '
+                            + 'named in excludedByDate; a thin period may read INSUFFICIENT where it read a signal before the switch. The size of the delta follows the week\'s meals, '
+                            + 'not the gate. Session-specific calibration lives in the build report (spec_history v3.6.31), not here. Declared for comparison; nothing reads preSwitch.'
                     };
                     // [COB-GATE-REPORT-END]
                     const unsplitSignal = !unsplitHasSufficient ? 'INSUFFICIENT' : signalOf(unsplitMedianDeviation);
@@ -8878,6 +8942,15 @@
                         hasSufficientData,
                         fastedPopulation,
                         cobGate,
+                        windowEdge: {
+                            analysisStart: analysisStart.toISOString(),
+                            analysisEnd: analysisEnd.toISOString(),
+                            trailingDate,
+                            trailingEdgeLocalTime: `${String(analysisStart.getHours()).padStart(2, '0')}:${String(analysisStart.getMinutes()).padStart(2, '0')}`,
+                            intersectsThisPeriod: trailingEdgeHour >= period.startHour && trailingEdgeHour < period.endHour,
+                            windowsOnTrailingDate: windowsByDate[trailingDate] || 0,
+                            note: 'the trailing edge moves with run time; on the period it intersects, two runs on the same date differ by the windows between their run times'
+                        },
                         medianDeviation,
                         signal,
                         candidateWindowCount,
@@ -8999,6 +9072,7 @@
                 
                 return {
                     periods,
+                    analysisWindow: { start: analysisStart.toISOString(), end: analysisEnd.toISOString(), days: basalWindow, trailingDate, trailingEdgeLocalTime: `${String(analysisStart.getHours()).padStart(2, '0')}:${String(analysisStart.getMinutes()).padStart(2, '0')}` },
                     cleanWindows: { total: cleanWindows.length },
                     signalOnlyAnchor,
                     weightedDeviation,
@@ -10196,7 +10270,7 @@
                         const eff = period.effectiveWindowCount ?? period.cleanWindowCount ?? 0;
                         const effDays = period.effectiveContributingDayCount ?? null;
                         const pop = `${eff} windows · ${effDays === null ? '?' : effDays} day${effDays === 1 ? '' : 's'}`;
-                        let dev = `${fmtDev(period.medianDeviation)} — ${pop}`;
+                        let dev = `${fmtDev(period.medianDeviation)}${period.splitApplied === true ? ' (split basis)' : ''} — ${pop}`;
                         if (period.splitApplied === true) {
                             const since = period.splitChangeDate ? String(period.splitChangeDate).slice(0, 10) : '?';
                             const uDays = period.contributingDayCount ?? null;
@@ -10237,9 +10311,9 @@
                             const cap = c.capability === 'no_readable_cob' ? ' [NO READABLE COB on any nearest record]'
                                 : c.capability === 'excluded_by_rule' ? ' [every candidate carried COB > 0]'
                                 : c.capability === 'no_candidates' ? ' [no candidates]' : '';
-                            return `${p.name} ${c.windowCount}/${c.preSwitch.windowCount}w · med ${fmt(p.unsplitMedianDeviation)} vs pre-switch ${fmt(c.preSwitch.medianDeviation)} (${c.preSwitch.signal}) · removed ${c.excludedByCOB} (med ${fmt(c.excludedMedianDeviation)}) · unreadable ${c.unreadableCOB}${cap}`;
+                            return `${p.name} ${c.windowCount}/${c.preSwitch.windowCount}w · unsplit med ${fmt(p.unsplitMedianDeviation)} vs pre-switch unsplit ${fmt(c.preSwitch.medianDeviation)} (${c.preSwitch.signal}) · removed ${c.excludedByCOB} (med ${fmt(c.excludedMedianDeviation)}) · unreadable ${c.unreadableCOB}${cap}`;
                         });
-                        output += `_COB gate (switched v3.6.31, DEF-172 — a clean window requires a real COB of 0 from devicestatus; the prior gate read a path no record carries and never rejected a reading): ${cg.join(' · ')}. "pre-switch" is the unsplit population the old gate would have reported. Expected: Deep Sleep and Dawn unmoved; Afternoon may read INSUFFICIENT; Sleep Onset moves on late-large-meal nights only._\n`;
+                        output += `_COB gate (switched v3.6.31, DEF-172 — a clean window requires a real COB of 0 from devicestatus; the prior gate read a path no record carries and never rejected a reading). UNSPLIT BASIS throughout this line — the period table above reports the split population where a split applied, so the same period can carry two medians: ${cg.join(' · ')}. "pre-switch" is the unsplit population the old gate would have reported. Expected: fasting periods unmoved; a thin period may read INSUFFICIENT; meal-covered periods move on late-large-meal nights._\n`;
                     }
                     // [COB-GATE-RENDER-END]
                     output += `\n_Deviation is the median of the clean-window population named beside it — the post-change population where a parameter change falls in the window, with the unsplit figure alongside. AGP Check is always the trailing 7 days. Coverage = clean windows collected ÷ the ceiling for the window; a coverage below ~0.25 means the period is meal-covered and its deviation rests on a small fasted residue._\n\n`;
@@ -10683,7 +10757,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.31',
+                            version: '3.6.32',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -10723,7 +10797,9 @@
                         // DEF-172: the fast path carries no signals.periods, so the gate's cost
                         // and pre-switch comparison ride here by period — a quiet night must
                         // not hide what the switch removed.
+                        analysisWindow: analysisResults.signalAnalysis?.analysisWindow ?? { unavailable: true, section: 'analysisWindow', reason: 'not_computed' },
                         cobGateByPeriod: (analysisResults.signalAnalysis?.periods || []).map(p => ({ name: p.name,
+                            rejectedByGate: p.rejectedByGate ?? { unavailable: true, section: 'rejectedByGate', reason: 'not_computed' },
                             ...(p.cobGate ?? { unavailable: true, section: 'cobGate', reason: 'not_computed' }) })),
                         // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
                         directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
@@ -11062,6 +11138,12 @@
                     fastedPopulation: period.fastedPopulation ?? { unavailable: true, section: 'fastedPopulation', reason: 'not_computed' },
                     // DEF-172 (v3.6.31): the COB gate's cost and the pre-switch comparison.
                     cobGate: period.cobGate ?? { unavailable: true, section: 'cobGate', reason: 'not_computed' },
+                    // DEF-180 (v3.6.32): the per-gate rejection census was on the period object
+                    // and never exported — a presence check wearing a reach check's name.
+                    rejectedByGate: period.rejectedByGate ?? { unavailable: true, section: 'rejectedByGate', reason: 'not_computed' },
+                    candidateWindowCount: period.candidateWindowCount ?? null,
+                    // DEF-182 (v3.6.32): run-time trailing edge, declared per period.
+                    windowEdge: period.windowEdge ?? { unavailable: true, section: 'windowEdge', reason: 'not_computed' },
                     concentration: {
                         // DEF-120: these three now describe the population medianDeviation
                         // was computed from. The unsplit twins ride alongside — both
@@ -11145,7 +11227,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.31',
+                        version: '3.6.32',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -11338,6 +11420,7 @@
                                        target: 'effective target (see targetSource)', final: 'target, rate-limited' }
                         },
                         weightedDeviation: analysisResults.signalAnalysis?.weightedDeviation || null,
+                        analysisWindow: analysisResults.signalAnalysis?.analysisWindow ?? { unavailable: true, section: 'analysisWindow', reason: 'not_computed' },
                         periods: periodSignals,
                         agpBasalSignal: {
                             agpHighPeriods: analysisResults.basalOptimization?.distribution?.agpHighPeriods || [],
@@ -14006,6 +14089,12 @@
                         } catch(e) { return '[]'; }
                     })(),
                     safetyLowSlots: deriveSafetyLowSlots(findings),
+                    // [TOOL-VERSION-LOG-START] v3.6.32 (DEF-178). The version that produced
+                    // this row, read from the title stamp (one source, already asserted equal
+                    // to meta.version). The ledger reads it back to detect a population-basis
+                    // change; a row without it is a row logged before the column existed.
+                    toolVersion: TOOL_VERSION_FROM_TITLE(),
+                    // [TOOL-VERSION-LOG-END]
                     // INSTR-3: gate-cost + R2 shadow. Fields always present (the Log
                     // Script write guard keys on !== undefined); null metrics fail
                     // safe to empty tallies, never omitted.
@@ -16194,7 +16283,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.31 — DEF-172 COB gate switched (ruled Sep 8)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.32 — DEF-178 ledger basis + DEF-174, 175, 179–182</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
