@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.30</title>
+    <title>Daily Insulin Settings Review v3.6.31</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -8467,21 +8467,8 @@
                     if (!closestStatus) return;
 
                     const iob = closestStatus.iob || closestStatus.openaps?.iob?.iob || 0;
-                    const cob = closestStatus.cob || closestStatus.openaps?.cob?.cob || 0;
-
-                    if (cob !== 0) return;
-                    // [COB-REAL-START] v3.6.30 (DEF-172). The gate above reads two paths no
-                    // iAPS record carries, so `cob` is 0 on every production record and the
-                    // return never fires. The gate is NOT switched here — the PM ruled that a
-                    // one-night fixture cannot adjudicate the largest change to the tool's
-                    // evidentiary base. Instead the real COB rides on every candidate so the
-                    // period block can emit the population the switched gate WOULD produce,
-                    // beside the one it does produce. Nothing reads cobReal but that block.
-                    const cobReal = extractCOB(closestStatus).value;
-                    // [COB-REAL-END]
-
-                    // Candidate: passed COB filter. Now apply gates in order.
                     const deviation = reading.sgv - targetBG;
+
 
                     // Gate A: no carb entry within 180 minutes before reading.
                     // Food contamination gate — iAPS SMBs are not food and must not reset
@@ -8522,6 +8509,29 @@
                         return;
                     }
 
+                    // [COB-GATE-START] v3.6.31 (DEF-172 — SWITCH ruled Sep 8 on one production
+                    // session of both populations). The COB gate reads the canonical extractor.
+                    // Its predecessor read `status.cob || status.openaps?.cob?.cob || 0` — two
+                    // paths no iAPS record carries — and so never rejected a reading since it
+                    // was written; Gates A and B alone shaped the population. Applied HERE,
+                    // after Gate B and before the clean-window push, so (1) every downstream
+                    // population — unsplit, split/effective, fasted, every distribution field —
+                    // inherits it from one site, and (2) `rejectedBy: 'cob'` counts ONLY the
+                    // readings the switch newly removes: kept + COB-rejected is exactly the
+                    // population the pre-switch gate reported, which is what cobGate.preSwitch
+                    // emits. A record with no readable COB cannot assert fasting: rejected,
+                    // counted apart from COB-active, never folded into either.
+                    const cobReal = extractCOB(closestStatus).value;
+                    if (cobReal === null) {
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'cobUnreadable', cobReal });
+                        return;
+                    }
+                    if (cobReal > 0) {
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'cob', cobReal });
+                        return;
+                    }
+                    // [COB-GATE-END]
+
                     // Passed all gates — clean window.
                     // v3.5.98 B1 (DEF-052c): LOCAL date, matching period membership.
                     // Period grouping uses getHours() (local) while this key used
@@ -8544,6 +8554,8 @@
                     const windowsInPeriod = candidatesInPeriod.filter(c => c.rejectedBy === null);
                     const candidateWindowCount = candidatesInPeriod.length;
                     const rejectedByGate = {
+                        cob: candidatesInPeriod.filter(c => c.rejectedBy === 'cob').length,
+                        cobUnreadable: candidatesInPeriod.filter(c => c.rejectedBy === 'cobUnreadable').length,
                         gateA: candidatesInPeriod.filter(c => c.rejectedBy === 'gateA').length,
                         gateB: candidatesInPeriod.filter(c => c.rejectedBy === 'gateB').length,
                     };
@@ -8807,50 +8819,54 @@
                             + 'Declared only — nothing reads this.'
                     };
                     // [FASTED-POP-END]
-                    // [COB-FILTERED-START] v3.6.30 (DEF-172, PM ruling Sep 8). A FOURTH
-                    // population, the unsplit/fasted shape: the clean windows that ALSO carry
-                    // a real COB of 0 from devicestatus — what the clean-window gate would
-                    // admit if it read the path production records actually carry. Declared
-                    // only; nothing reads it. One session with both populations visible, then
-                    // the switch is ruled on six periods of real data rather than a fixture.
+                    // [COB-GATE-REPORT-START] v3.6.31 (DEF-172 switch; PM condition 2). The
+                    // v3.6.30 parallel population (cobFiltered) IS the population now, so the
+                    // emission inverts: this block carries the gate's cost and the population
+                    // the PRE-SWITCH gate would have reported (kept + COB-rejected), so the
+                    // switch stays readable against its own baseline. A parallel population
+                    // that survives its own adoption is DEF-161's hazard in a new place —
+                    // the parallel field is retired, not kept.
                     //
-                    // A window whose nearest record carries no readable COB cannot assert
-                    // fasting and is NOT in cobFiltered; it is counted apart (unreadableCOB)
-                    // so exclusion-by-COB and exclusion-by-absence never share a number.
-                    const cobZeroWindows = windowsInPeriod.filter(w => w.cobReal === 0);
-                    const cobActiveWindows = windowsInPeriod.filter(w => typeof w.cobReal === 'number' && w.cobReal > 0);
-                    const cobUnreadableWindows = windowsInPeriod.filter(w => !(typeof w.cobReal === 'number'));
-                    const cobByDate = {};
-                    cobZeroWindows.forEach(w => { if (w.date) cobByDate[w.date] = (cobByDate[w.date] || 0) + 1; });
-                    const cobDates = Object.keys(cobByDate).sort();
-                    const cobDeviations = cobZeroWindows.map(w => w.deviation).sort((a, b) => a - b);
-                    const cobHasSufficient = cobZeroWindows.length >= CONFIG.minEventsHighConfidence;
-                    const cobMedian = cobHasSufficient ? medianOf(cobDeviations) : null;
-                    const cobActiveDeviations = cobActiveWindows.map(w => w.deviation).sort((a, b) => a - b);
-                    const cobFiltered = {
-                        gate: 'clean window AND extractCOB(nearest devicestatus) === 0',
-                        windowCount: cobZeroWindows.length,
-                        excludedByCOB: cobActiveWindows.length,
-                        unreadableCOB: cobUnreadableWindows.length,
-                        candidateWindows: windowsInPeriod.length,
-                        dayCount: cobDates.length,
-                        dates: cobDates,
-                        windowsByDate: cobByDate,
-                        contributingDayCount: cobDates.length,
-                        medianDeviation: cobMedian,
-                        signal: !cobHasSufficient ? 'INSUFFICIENT' : signalOf(cobMedian),
-                        excludedMedianDeviation: cobActiveDeviations.length ? medianOf(cobActiveDeviations) : null,
-                        shareOfClean: windowsInPeriod.length > 0
-                            ? parseFloat((cobZeroWindows.length / windowsInPeriod.length).toFixed(4)) : null,
-                        capability: windowsInPeriod.length === 0 ? 'no_candidates'
-                            : (cobUnreadableWindows.length === windowsInPeriod.length ? 'no_readable_cob'
-                            : (cobZeroWindows.length === 0 ? 'excluded_by_rule' : 'capable')),
-                        comparedTo: { unsplitMedianDeviation, unsplitWindowCount: windowsInPeriod.length, unsplitSignal: !unsplitHasSufficient ? 'INSUFFICIENT' : signalOf(unsplitMedianDeviation) },
-                        expected: 'shareOfClean 1.0 where the shipped gate and a working COB gate agree; below 1.0 where clean windows sat on a meal tail Gate A had already released (carbs > 180 min old, COB still > 0). '
-                            + 'excludedMedianDeviation is the deviation of the windows a working gate would remove — if it sits well above medianDeviation the shipped population has been inflated toward high. '
-                            + 'Declared only — nothing reads this; the switch is ruled on this field after one production session.'
+                    // Where the gate applies (PM condition 1): at the reading loop, after Gate
+                    // B. windowsInPeriod, effectiveWindows (the split), fastedWindows and every
+                    // distribution field derive from candidates with rejectedBy === null, so no
+                    // second site exists to miss.
+                    const cobRejectedInPeriod = candidatesInPeriod.filter(c => c.rejectedBy === 'cob');
+                    const cobUnreadableInPeriod = candidatesInPeriod.filter(c => c.rejectedBy === 'cobUnreadable');
+                    const preSwitchWindows = windowsInPeriod.concat(cobRejectedInPeriod);
+                    const preSwitchByDate = {};
+                    preSwitchWindows.forEach(w => { if (w.date) preSwitchByDate[w.date] = (preSwitchByDate[w.date] || 0) + 1; });
+                    const preSwitchDeviations = preSwitchWindows.map(w => w.deviation).sort((a, b) => a - b);
+                    const preSwitchHasSufficient = preSwitchWindows.length >= CONFIG.minEventsHighConfidence;
+                    const preSwitchMedian = preSwitchHasSufficient ? medianOf(preSwitchDeviations) : null;
+                    const cobRejectedDeviations = cobRejectedInPeriod.map(w => w.deviation).sort((a, b) => a - b);
+                    const cobGate = {
+                        switchedIn: 'v3.6.31',
+                        appliesAt: 'reading loop, after Gate B, before the clean-window push; every population in this period derives from it',
+                        gate: 'extractCOB(nearest devicestatus within 10 min) === 0',
+                        windowCount: windowsInPeriod.length,
+                        excludedByCOB: cobRejectedInPeriod.length,
+                        unreadableCOB: cobUnreadableInPeriod.length,
+                        candidateWindows: windowsInPeriod.length + cobRejectedInPeriod.length + cobUnreadableInPeriod.length,
+                        excludedMedianDeviation: cobRejectedDeviations.length ? medianOf(cobRejectedDeviations) : null,
+                        excludedByDate: (() => { const o = {}; cobRejectedInPeriod.forEach(w => { if (w.date) o[w.date] = (o[w.date] || 0) + 1; }); return o; })(),
+                        preSwitch: {
+                            note: 'what the gate before v3.6.31 reported as this period\'s unsplit population (kept + COB-rejected); Gate A/B rejections excluded from both',
+                            windowCount: preSwitchWindows.length,
+                            medianDeviation: preSwitchMedian,
+                            signal: !preSwitchHasSufficient ? 'INSUFFICIENT' : signalOf(preSwitchMedian),
+                            contributingDayCount: Object.keys(preSwitchByDate).length
+                        },
+                        shareOfPreSwitch: preSwitchWindows.length > 0
+                            ? parseFloat((windowsInPeriod.length / preSwitchWindows.length).toFixed(4)) : null,
+                        capability: (windowsInPeriod.length + cobRejectedInPeriod.length + cobUnreadableInPeriod.length) === 0 ? 'no_candidates'
+                            : (windowsInPeriod.length === 0 && cobUnreadableInPeriod.length > 0 && cobRejectedInPeriod.length === 0 ? 'no_readable_cob'
+                            : (windowsInPeriod.length === 0 ? 'excluded_by_rule' : 'capable')),
+                        expected: 'Deep Sleep and Dawn near shareOfPreSwitch 1.0 with medians unmoved; Afternoon may read INSUFFICIENT where it read HIGH before the switch; '
+                            + 'Sleep Onset moves on nights with a late large meal (Sep 5: 104g at 7:48p, COB 48 at 11:03p). A small delta on a quiet week is not the gate failing — '
+                            + 'the Sep 8 -14.0 on Sleep Onset was one night. Declared for comparison; nothing reads preSwitch.'
                     };
-                    // [COB-FILTERED-END]
+                    // [COB-GATE-REPORT-END]
                     const unsplitSignal = !unsplitHasSufficient ? 'INSUFFICIENT' : signalOf(unsplitMedianDeviation);
                     // [UNSPLIT-END]
 
@@ -8861,7 +8877,7 @@
                         effectiveWindowCount: effectiveWindows.length,
                         hasSufficientData,
                         fastedPopulation,
-                        cobFiltered,
+                        cobGate,
                         medianDeviation,
                         signal,
                         candidateWindowCount,
@@ -10210,22 +10226,22 @@
                         output += `\n_Fasted population (declared only; ${any ? any.lookbackHours + 'h lookback, ' + (any.excludesSMB ? 'SMBs excluded' : 'SMBs exempt') : 'gate not computed'}): ${fp.join(' · ')}. Expected: share near 1.0 in Deep Sleep and Dawn, far below in meal-covered periods; a looser gate raises the meal-covered share. STANDING READ RESTRICTION (Sep 7): the fasted median is readable only where share is 1.00._\n`;
                     }
                     // [FASTED-RENDER-END]
-                    // [COB-FILTERED-RENDER-START] v3.6.30 (DEF-172). Renders every period,
-                    // including the ones where the two populations coincide — agreement is
-                    // the finding on a fasting period, and silence would hide it.
+                    // [COB-GATE-RENDER-START] v3.6.31 (DEF-172 switch). Renders every period,
+                    // including the ones the gate did not touch — agreement is the finding on
+                    // a fasting period, and silence would hide it.
                     {
-                        const cf = analysisResults.signalAnalysis.periods.map(p => {
-                            const c = p.cobFiltered;
+                        const cg = analysisResults.signalAnalysis.periods.map(p => {
+                            const c = p.cobGate;
                             if (!c || c.unavailable) return `${p.name}: UNAVAILABLE`;
                             const fmt = v => (v === null || v === undefined) ? 'n/a' : `${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(1)}`;
                             const cap = c.capability === 'no_readable_cob' ? ' [NO READABLE COB on any nearest record]'
-                                : c.capability === 'excluded_by_rule' ? ' [every clean window carried COB > 0]'
-                                : c.capability === 'no_candidates' ? ' [no clean windows]' : '';
-                            return `${p.name} ${c.windowCount}/${c.candidateWindows}w · ${c.dayCount}d · med ${fmt(c.medianDeviation)} vs unsplit ${fmt(c.comparedTo?.unsplitMedianDeviation)} · removed ${c.excludedByCOB} (med ${fmt(c.excludedMedianDeviation)}) · unreadable ${c.unreadableCOB}${cap}`;
+                                : c.capability === 'excluded_by_rule' ? ' [every candidate carried COB > 0]'
+                                : c.capability === 'no_candidates' ? ' [no candidates]' : '';
+                            return `${p.name} ${c.windowCount}/${c.preSwitch.windowCount}w · med ${fmt(p.unsplitMedianDeviation)} vs pre-switch ${fmt(c.preSwitch.medianDeviation)} (${c.preSwitch.signal}) · removed ${c.excludedByCOB} (med ${fmt(c.excludedMedianDeviation)}) · unreadable ${c.unreadableCOB}${cap}`;
                         });
-                        output += `_COB-filtered population (declared only; DEF-172 — clean windows whose nearest devicestatus carries a real COB of 0): ${cf.join(' · ')}. The shipped gate reads a COB path no iAPS record carries and has never rejected a reading; this is the population a working gate would keep. The switch is ruled on this line after one production session._\n`;
+                        output += `_COB gate (switched v3.6.31, DEF-172 — a clean window requires a real COB of 0 from devicestatus; the prior gate read a path no record carries and never rejected a reading): ${cg.join(' · ')}. "pre-switch" is the unsplit population the old gate would have reported. Expected: Deep Sleep and Dawn unmoved; Afternoon may read INSUFFICIENT; Sleep Onset moves on late-large-meal nights only._\n`;
                     }
-                    // [COB-FILTERED-RENDER-END]
+                    // [COB-GATE-RENDER-END]
                     output += `\n_Deviation is the median of the clean-window population named beside it — the post-change population where a parameter change falls in the window, with the unsplit figure alongside. AGP Check is always the trailing 7 days. Coverage = clean windows collected ÷ the ceiling for the window; a coverage below ~0.25 means the period is meal-covered and its deviation rests on a small fasted residue._\n\n`;
                     // [PERIOD-TABLE-END]
 
@@ -10667,7 +10683,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.30',
+                            version: '3.6.31',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -10704,11 +10720,11 @@
                         scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
                         // DEF-158 instrument. Both emitters.
                         cobDecay: computeCobDecay(analysisResults?.nightscoutData),
-                        // DEF-172: the fast path carries no signals.periods, so the fourth
-                        // population rides here by period — the switch is ruled on it and a
-                        // quiet night must not hide it.
-                        cobFilteredByPeriod: (analysisResults.signalAnalysis?.periods || []).map(p => ({ name: p.name,
-                            ...(p.cobFiltered ?? { unavailable: true, section: 'cobFiltered', reason: 'not_computed' }) })),
+                        // DEF-172: the fast path carries no signals.periods, so the gate's cost
+                        // and pre-switch comparison ride here by period — a quiet night must
+                        // not hide what the switch removed.
+                        cobGateByPeriod: (analysisResults.signalAnalysis?.periods || []).map(p => ({ name: p.name,
+                            ...(p.cobGate ?? { unavailable: true, section: 'cobGate', reason: 'not_computed' }) })),
                         // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
                         directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
                             configValue: CONFIG.directionWiringEnabled === undefined ? 'unset' : CONFIG.directionWiringEnabled,
@@ -11044,8 +11060,8 @@
                     // DEF-156: the third population. Absent on a legacy period object is
                     // declared, never null; empty is a real reading with dayCount 0.
                     fastedPopulation: period.fastedPopulation ?? { unavailable: true, section: 'fastedPopulation', reason: 'not_computed' },
-                    // DEF-172: the fourth population — clean windows with a REAL COB of 0.
-                    cobFiltered: period.cobFiltered ?? { unavailable: true, section: 'cobFiltered', reason: 'not_computed' },
+                    // DEF-172 (v3.6.31): the COB gate's cost and the pre-switch comparison.
+                    cobGate: period.cobGate ?? { unavailable: true, section: 'cobGate', reason: 'not_computed' },
                     concentration: {
                         // DEF-120: these three now describe the population medianDeviation
                         // was computed from. The unsplit twins ride alongside — both
@@ -11129,7 +11145,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.30',
+                        version: '3.6.31',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -16178,7 +16194,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.30 — DEF-172 cobFiltered population + extractCOB (DEF-170, 171)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.31 — DEF-172 COB gate switched (ruled Sep 8)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
