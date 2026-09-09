@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.29</title>
+    <title>Daily Insulin Settings Review v3.6.30</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2666,6 +2666,37 @@
             if (status.openaps?.iob?.basaliob != null) return status.openaps.iob.basaliob;
             return null;
         };
+        // [EXTRACT-COB-START] v3.6.30 (DEF-172). The canonical COB extractor, beside the
+        // IOB one. iAPS (oref) devicestatus carries COB ONLY at openaps.suggested.COB and
+        // openaps.enacted.COB — uppercase, a sibling of the openaps.iob object extractIOB
+        // already reads (raw record: Specs/fixtures/devicestatus_iAPS_0.7.1_2026-09-08.json).
+        // The two paths the clean-window gate and the DEF-158 instrument read before this
+        // build (status.cob, status.openaps.cob.cob) exist on no production record, so both
+        // sites returned 0 / null on every record since they were written. Returns the value
+        // AND the path that yielded it, so a zero can be told from an absent field; the
+        // legacy paths stay last so any record that does carry them is counted by name.
+        const COB_PATHS = ['openaps.suggested.COB', 'openaps.enacted.COB', 'cob', 'openaps.cob.cob'];
+        const extractCOB = (status) => {
+            if (!status) return { value: null, source: null };
+            if (typeof status.openaps?.suggested?.COB === 'number') return { value: status.openaps.suggested.COB, source: 'openaps.suggested.COB' };
+            if (typeof status.openaps?.enacted?.COB === 'number') return { value: status.openaps.enacted.COB, source: 'openaps.enacted.COB' };
+            if (typeof status.cob === 'number') return { value: status.cob, source: 'cob' };
+            if (typeof status.openaps?.cob?.cob === 'number') return { value: status.openaps.cob.cob, source: 'openaps.cob.cob' };
+            return { value: null, source: null };
+        };
+        const cobPathCensus = (statuses) => {
+            const byPath = {};
+            COB_PATHS.forEach(p => { byPath[p] = 0; });
+            let withCOB = 0, suggestedEnactedDiverge = 0;
+            (Array.isArray(statuses) ? statuses : []).forEach(s => {
+                const r = extractCOB(s);
+                if (r.source) { byPath[r.source]++; withCOB++; }
+                const a = s?.openaps?.suggested?.COB, b = s?.openaps?.enacted?.COB;
+                if (typeof a === 'number' && typeof b === 'number' && a !== b) suggestedEnactedDiverge++;
+            });
+            return { deviceStatusRecords: (Array.isArray(statuses) ? statuses : []).length, withCOB, byPath, suggestedEnactedDiverge };
+        };
+        // [EXTRACT-COB-END]
 
         // Single source of truth for bundle status resolution. Every serialization
         // path (structured export watchList, Sheets watchItems, trend currentData)
@@ -2772,7 +2803,14 @@
         const gateCostBucket = (status, statusReason) => {
             const s = String(status || '');
             if (s.includes('Safety Rule #1')) return 'bimodal';
-            if (statusReason === 'staged' || s.includes('Compound effect')) return 'compound';
+            // [STAGED-BUCKET-START] v3.6.30 (DEF-170). `staged` is an invitation to proceed in
+            // steps (compoundEffect HIGH, blockedBy null); `compound` is a refusal (blockedBy
+            // set by the BLOCKED grade). Close B counted four staged bundles under `compound`,
+            // inflating the cost DEF-154 exists to make visible. The logged status TEXT is the
+            // only key a prior session's row carries, so the text form is matched too.
+            if (statusReason === 'staged' || s.includes('consider staging')) return 'staged';
+            if (s.includes('Compound effect')) return 'compound';
+            // [STAGED-BUCKET-END]
             if (s.includes('No recent events')) return 'staleness';
             if (statusReason === 'demoted') return 'recency';
             if (/recovery|sensitivity/i.test(s)) return 'stateFilter';
@@ -2794,10 +2832,12 @@
             const withheldBy = {};
             const otherReasons = [];
             let actionable = 0;
+            let staged = 0;
             withRecs.forEach(b => {
                 if (b.priority === 'PRIMARY') { actionable++; return; }
                 const st = getBundleStatus(b);
                 const bucket = gateCostBucket(st.status, st.statusReason);
+                if (bucket === 'staged') { staged++; return; }
                 blocked[bucket] = (blocked[bucket] || 0) + 1;
                 if (bucket === 'other') otherReasons.push(String(st.status || ''));
             });
@@ -2816,7 +2856,8 @@
                 generated: withRecs.length,
                 withheld: withheldBundles.length,
                 bundlesConsidered: all.length,
-                actionable, blocked, withheldBy
+                actionable, staged, blocked, withheldBy,
+                stagedNote: 'staged = compound effect HIGH with blockedBy null: proceed in steps, not a refusal. Counted apart from blocked since v3.6.30 (DEF-170); generated === actionable + staged + sum(blocked).'
             };
             if (otherReasons.length > 0) out.otherReasons = otherReasons;
             // Permanent invariant. `generated: 0` beside a non-empty actions array is a
@@ -2827,8 +2868,8 @@
             const problems = [];
             if (out.generated === 0 && primaryCount > 0)
                 problems.push(`generated=0 with ${primaryCount} PRIMARY bundle(s)`);
-            if (out.generated !== actionable + blockedSum)
-                problems.push(`generated ${out.generated} != actionable ${actionable} + blocked ${blockedSum}`);
+            if (out.generated !== actionable + staged + blockedSum)
+                problems.push(`generated ${out.generated} != actionable ${actionable} + staged ${staged} + blocked ${blockedSum}`);
             if (out.generated + out.withheld !== out.bundlesConsidered)
                 problems.push(`generated+withheld != bundlesConsidered`);
             if (problems.length) out.censusInvariantViolated = problems;
@@ -2873,6 +2914,7 @@
                 if (b.priority === 'PRIMARY') return;
                 const st = getBundleStatus(b);
                 const bucket = gateCostBucket(st.status, st.statusReason);
+                if (bucket === 'staged') return;
                 const key = bundlePersistenceKey(b);
                 if (!key) return;
                 let streak = 0, since = null, lastDay = null;
@@ -4018,9 +4060,10 @@
         const COB_MEAL_MIN_CARBS_G = 10;
         const computeCobDecay = (nightscoutData, now = new Date()) => {
             const treatments = Array.isArray(nightscoutData?.treatments) ? nightscoutData.treatments : [];
-            const statuses = (Array.isArray(nightscoutData?.deviceStatus) ? nightscoutData.deviceStatus : [])
-                .map(d => ({ t: new Date(d?.created_at || d?.timestamp || 0).getTime(),
-                             cob: (typeof d?.cob === 'number') ? d.cob : (typeof d?.openaps?.cob?.cob === 'number' ? d.openaps.cob.cob : null) }))
+            const rawStatuses = Array.isArray(nightscoutData?.deviceStatus) ? nightscoutData.deviceStatus : [];
+            const pathCensus = cobPathCensus(rawStatuses);
+            const statuses = rawStatuses
+                .map(d => { const r = extractCOB(d); return { t: new Date(d?.created_at || d?.timestamp || 0).getTime(), cob: r.value, cobSource: r.source }; })
                 .filter(x => !Number.isNaN(x.t) && x.t > 0 && x.cob !== null)
                 .sort((a, b) => a.t - b.t);
             const nearest = (ms) => {
@@ -4045,8 +4088,10 @@
                         if (at > now.getTime()) return { offsetMin: off, cob: null, reason: 'after run time' };
                         if (nextMealT !== null && at >= nextMealT) return { offsetMin: off, cob: null, reason: 'after the next carb entry (+' + Math.round((nextMealT - m.t) / 60000) + ' min)' };
                         const x = nearest(at);
-                        return x ? { offsetMin: off, cob: parseFloat(x.cob.toFixed(1)), at: new Date(x.t).toISOString() }
-                                 : { offsetMin: off, cob: null, reason: 'no devicestatus within ±7.5 min' };
+                        return x ? { offsetMin: off, cob: parseFloat(x.cob.toFixed(1)), at: new Date(x.t).toISOString(), cobSource: x.cobSource }
+                                 : { offsetMin: off, cob: null, reason: pathCensus.withCOB === 0 && pathCensus.deviceStatusRecords > 0
+                                        ? 'devicestatus present but no record carries COB at any known path'
+                                        : 'no devicestatus within ±7.5 min' };
                     });
                     const seriesComplete = samples.every(sm => sm.cob !== null);
                     // Observed decay: least-squares slope over the samples that carry a value,
@@ -4076,11 +4121,15 @@
                 });
             return {
                 mealCount: meals.length, sampleOffsetsMin: COB_SAMPLE_OFFSETS_MIN, minCarbsG: COB_MEAL_MIN_CARBS_G,
-                deviceStatusSamples: statuses.length,
+                deviceStatusRecords: pathCensus.deviceStatusRecords,
+                withCOB: pathCensus.withCOB,
+                byPath: pathCensus.byPath,
+                suggestedEnactedDiverge: pathCensus.suggestedEnactedDiverge,
+                cobPathsRead: COB_PATHS,
                 meals,
                 statement: meals.length
-                    ? `COB decay: ${meals.length} meal(s) ≥ ${COB_MEAL_MIN_CARBS_G}g in the fetch window, each with COB sampled at ${COB_SAMPLE_OFFSETS_MIN.length} fixed offsets from ${statuses.length} devicestatus records. Observed slope per meal; configured rate not in the fetch. No interval is derived — declared only, nothing reads this.`
-                    : `COB decay: no meal ≥ ${COB_MEAL_MIN_CARBS_G}g in the fetch window (${statuses.length} devicestatus records with COB). Declared only.`
+                    ? `COB decay: ${meals.length} meal(s) ≥ ${COB_MEAL_MIN_CARBS_G}g in the fetch window, each with COB sampled at ${COB_SAMPLE_OFFSETS_MIN.length} fixed offsets from ${pathCensus.withCOB} of ${pathCensus.deviceStatusRecords} devicestatus records carrying COB. Observed slope per meal; configured rate not in the fetch. No interval is derived — declared only, nothing reads this.`
+                    : `COB decay: no meal ≥ ${COB_MEAL_MIN_CARBS_G}g in the fetch window (${pathCensus.withCOB} of ${pathCensus.deviceStatusRecords} devicestatus records carry COB). Declared only.`
             };
         };
         // [COB-DECAY-END]
@@ -8421,6 +8470,15 @@
                     const cob = closestStatus.cob || closestStatus.openaps?.cob?.cob || 0;
 
                     if (cob !== 0) return;
+                    // [COB-REAL-START] v3.6.30 (DEF-172). The gate above reads two paths no
+                    // iAPS record carries, so `cob` is 0 on every production record and the
+                    // return never fires. The gate is NOT switched here — the PM ruled that a
+                    // one-night fixture cannot adjudicate the largest change to the tool's
+                    // evidentiary base. Instead the real COB rides on every candidate so the
+                    // period block can emit the population the switched gate WOULD produce,
+                    // beside the one it does produce. Nothing reads cobReal but that block.
+                    const cobReal = extractCOB(closestStatus).value;
+                    // [COB-REAL-END]
 
                     // Candidate: passed COB filter. Now apply gates in order.
                     const deviation = reading.sgv - targetBG;
@@ -8473,8 +8531,8 @@
                     // — inflating contributingDayCount and deflating maxDayShare on
                     // exactly the two periods that motivated measuring concentration.
                     const dateStr = getLocalDateString(readingTime); // local 'YYYY-MM-DD'
-                    candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr, rejectedBy: null });
-                    cleanWindows.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr });
+                    candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr, rejectedBy: null, cobReal });
+                    cleanWindows.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr, cobReal });
                 });
 
                 // Group by period
@@ -8749,6 +8807,50 @@
                             + 'Declared only — nothing reads this.'
                     };
                     // [FASTED-POP-END]
+                    // [COB-FILTERED-START] v3.6.30 (DEF-172, PM ruling Sep 8). A FOURTH
+                    // population, the unsplit/fasted shape: the clean windows that ALSO carry
+                    // a real COB of 0 from devicestatus — what the clean-window gate would
+                    // admit if it read the path production records actually carry. Declared
+                    // only; nothing reads it. One session with both populations visible, then
+                    // the switch is ruled on six periods of real data rather than a fixture.
+                    //
+                    // A window whose nearest record carries no readable COB cannot assert
+                    // fasting and is NOT in cobFiltered; it is counted apart (unreadableCOB)
+                    // so exclusion-by-COB and exclusion-by-absence never share a number.
+                    const cobZeroWindows = windowsInPeriod.filter(w => w.cobReal === 0);
+                    const cobActiveWindows = windowsInPeriod.filter(w => typeof w.cobReal === 'number' && w.cobReal > 0);
+                    const cobUnreadableWindows = windowsInPeriod.filter(w => !(typeof w.cobReal === 'number'));
+                    const cobByDate = {};
+                    cobZeroWindows.forEach(w => { if (w.date) cobByDate[w.date] = (cobByDate[w.date] || 0) + 1; });
+                    const cobDates = Object.keys(cobByDate).sort();
+                    const cobDeviations = cobZeroWindows.map(w => w.deviation).sort((a, b) => a - b);
+                    const cobHasSufficient = cobZeroWindows.length >= CONFIG.minEventsHighConfidence;
+                    const cobMedian = cobHasSufficient ? medianOf(cobDeviations) : null;
+                    const cobActiveDeviations = cobActiveWindows.map(w => w.deviation).sort((a, b) => a - b);
+                    const cobFiltered = {
+                        gate: 'clean window AND extractCOB(nearest devicestatus) === 0',
+                        windowCount: cobZeroWindows.length,
+                        excludedByCOB: cobActiveWindows.length,
+                        unreadableCOB: cobUnreadableWindows.length,
+                        candidateWindows: windowsInPeriod.length,
+                        dayCount: cobDates.length,
+                        dates: cobDates,
+                        windowsByDate: cobByDate,
+                        contributingDayCount: cobDates.length,
+                        medianDeviation: cobMedian,
+                        signal: !cobHasSufficient ? 'INSUFFICIENT' : signalOf(cobMedian),
+                        excludedMedianDeviation: cobActiveDeviations.length ? medianOf(cobActiveDeviations) : null,
+                        shareOfClean: windowsInPeriod.length > 0
+                            ? parseFloat((cobZeroWindows.length / windowsInPeriod.length).toFixed(4)) : null,
+                        capability: windowsInPeriod.length === 0 ? 'no_candidates'
+                            : (cobUnreadableWindows.length === windowsInPeriod.length ? 'no_readable_cob'
+                            : (cobZeroWindows.length === 0 ? 'excluded_by_rule' : 'capable')),
+                        comparedTo: { unsplitMedianDeviation, unsplitWindowCount: windowsInPeriod.length, unsplitSignal: !unsplitHasSufficient ? 'INSUFFICIENT' : signalOf(unsplitMedianDeviation) },
+                        expected: 'shareOfClean 1.0 where the shipped gate and a working COB gate agree; below 1.0 where clean windows sat on a meal tail Gate A had already released (carbs > 180 min old, COB still > 0). '
+                            + 'excludedMedianDeviation is the deviation of the windows a working gate would remove — if it sits well above medianDeviation the shipped population has been inflated toward high. '
+                            + 'Declared only — nothing reads this; the switch is ruled on this field after one production session.'
+                    };
+                    // [COB-FILTERED-END]
                     const unsplitSignal = !unsplitHasSufficient ? 'INSUFFICIENT' : signalOf(unsplitMedianDeviation);
                     // [UNSPLIT-END]
 
@@ -8759,6 +8861,7 @@
                         effectiveWindowCount: effectiveWindows.length,
                         hasSufficientData,
                         fastedPopulation,
+                        cobFiltered,
                         medianDeviation,
                         signal,
                         candidateWindowCount,
@@ -10107,6 +10210,22 @@
                         output += `\n_Fasted population (declared only; ${any ? any.lookbackHours + 'h lookback, ' + (any.excludesSMB ? 'SMBs excluded' : 'SMBs exempt') : 'gate not computed'}): ${fp.join(' · ')}. Expected: share near 1.0 in Deep Sleep and Dawn, far below in meal-covered periods; a looser gate raises the meal-covered share. STANDING READ RESTRICTION (Sep 7): the fasted median is readable only where share is 1.00._\n`;
                     }
                     // [FASTED-RENDER-END]
+                    // [COB-FILTERED-RENDER-START] v3.6.30 (DEF-172). Renders every period,
+                    // including the ones where the two populations coincide — agreement is
+                    // the finding on a fasting period, and silence would hide it.
+                    {
+                        const cf = analysisResults.signalAnalysis.periods.map(p => {
+                            const c = p.cobFiltered;
+                            if (!c || c.unavailable) return `${p.name}: UNAVAILABLE`;
+                            const fmt = v => (v === null || v === undefined) ? 'n/a' : `${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(1)}`;
+                            const cap = c.capability === 'no_readable_cob' ? ' [NO READABLE COB on any nearest record]'
+                                : c.capability === 'excluded_by_rule' ? ' [every clean window carried COB > 0]'
+                                : c.capability === 'no_candidates' ? ' [no clean windows]' : '';
+                            return `${p.name} ${c.windowCount}/${c.candidateWindows}w · ${c.dayCount}d · med ${fmt(c.medianDeviation)} vs unsplit ${fmt(c.comparedTo?.unsplitMedianDeviation)} · removed ${c.excludedByCOB} (med ${fmt(c.excludedMedianDeviation)}) · unreadable ${c.unreadableCOB}${cap}`;
+                        });
+                        output += `_COB-filtered population (declared only; DEF-172 — clean windows whose nearest devicestatus carries a real COB of 0): ${cf.join(' · ')}. The shipped gate reads a COB path no iAPS record carries and has never rejected a reading; this is the population a working gate would keep. The switch is ruled on this line after one production session._\n`;
+                    }
+                    // [COB-FILTERED-RENDER-END]
                     output += `\n_Deviation is the median of the clean-window population named beside it — the post-change population where a parameter change falls in the window, with the unsplit figure alongside. AGP Check is always the trailing 7 days. Coverage = clean windows collected ÷ the ceiling for the window; a coverage below ~0.25 means the period is meal-covered and its deviation rests on a small fasted residue._\n\n`;
                     // [PERIOD-TABLE-END]
 
@@ -10514,8 +10633,14 @@
                     const expectedPerDay = 288;
                     const fromAgp = agp7day?.readingCount;
                     const raw = analysisResults.nightscoutData?.glucose?.length || 0;
-                    return { readings: fromAgp || raw, readingsSource: fromAgp ? 'agp7day.readingCount (deduplicated, windowed)' : 'glucose.length (raw)',
-                             rawGlucoseLength: raw, expected: expectedPerDay * (days || 7), days: days || 7, expectedPerDay, capped: true };
+                    const readings = fromAgp || raw;
+                    const expected = expectedPerDay * (days || 7);
+                    const uncappedPercent = Math.round((readings / expected) * 100);
+                    // DEF-171: `capped` states whether the min(100, ·) FIRED on this value, not
+                    // that a cap exists. A boolean that is always true is indistinguishable
+                    // from one that is broken.
+                    return { readings, readingsSource: fromAgp ? 'agp7day.readingCount (deduplicated, windowed)' : 'glucose.length (raw)',
+                             rawGlucoseLength: raw, expected, days: days || 7, expectedPerDay, uncappedPercent, capped: uncappedPercent > 100 };
                 };
                 // [COVERAGE-PCT-END]
                 
@@ -10542,7 +10667,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.29',
+                            version: '3.6.30',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -10579,6 +10704,11 @@
                         scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
                         // DEF-158 instrument. Both emitters.
                         cobDecay: computeCobDecay(analysisResults?.nightscoutData),
+                        // DEF-172: the fast path carries no signals.periods, so the fourth
+                        // population rides here by period — the switch is ruled on it and a
+                        // quiet night must not hide it.
+                        cobFilteredByPeriod: (analysisResults.signalAnalysis?.periods || []).map(p => ({ name: p.name,
+                            ...(p.cobFiltered ?? { unavailable: true, section: 'cobFiltered', reason: 'not_computed' }) })),
                         // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
                         directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
                             configValue: CONFIG.directionWiringEnabled === undefined ? 'unset' : CONFIG.directionWiringEnabled,
@@ -10914,6 +11044,8 @@
                     // DEF-156: the third population. Absent on a legacy period object is
                     // declared, never null; empty is a real reading with dayCount 0.
                     fastedPopulation: period.fastedPopulation ?? { unavailable: true, section: 'fastedPopulation', reason: 'not_computed' },
+                    // DEF-172: the fourth population — clean windows with a REAL COB of 0.
+                    cobFiltered: period.cobFiltered ?? { unavailable: true, section: 'cobFiltered', reason: 'not_computed' },
                     concentration: {
                         // DEF-120: these three now describe the population medianDeviation
                         // was computed from. The unsplit twins ride alongside — both
@@ -10997,7 +11129,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.29',
+                        version: '3.6.30',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -16046,7 +16178,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.29 — Close A rulings (DEF-157, 163, 164, 165, 121, 158)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.30 — DEF-172 cobFiltered population + extractCOB (DEF-170, 171)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
