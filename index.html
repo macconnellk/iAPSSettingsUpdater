@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.32</title>
+    <title>Daily Insulin Settings Review v3.6.33</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -8585,13 +8585,45 @@
                     // population the pre-switch gate reported, which is what cobGate.preSwitch
                     // emits. A record with no readable COB cannot assert fasting: rejected,
                     // counted apart from COB-active, never folded into either.
-                    const cobReal = extractCOB(closestStatus).value;
+                    // [COB-REPOINT-START] v3.6.33 (DEF-176). `closestStatus` is `find(first
+                    // within ±10 min)` in array order — not nearest — so at a COB regime
+                    // boundary a reading inherits the PREVIOUS record's COB. Candidacy still
+                    // keys on that record (a reading with no record within ±10 min is not a
+                    // candidate, as before). The COB itself now comes from the canonical
+                    // lookup, findDeviceStatusAt(direction 'before'): the latest record at or
+                    // before the reading, inside IOB_LOOKUP_WINDOW_MS, never one written
+                    // after it. 'before' rather than 'nearest' because DEF-032 deleted the
+                    // nearest branch on a confirmed clinical failure — a record written after
+                    // an event carries the event. A reading before a carb entry must not read
+                    // the post-entry COB. Where no 'before' record exists inside the window
+                    // the legacy record is used and the fallback counted. The count of
+                    // readings whose gate verdict changed rides rejectedByGate.cobBoundaryRepoint,
+                    // beside the count a true-nearest rule would have changed, so the PM can
+                    // rule on the direction with the numbers rather than the argument.
+                    const beforeStatus = findDeviceStatusAt(nightscoutData.deviceStatus, readingTime, { direction: 'before' });
+                    const cobStatus = beforeStatus || closestStatus;
+                    const cobReal = extractCOB(cobStatus).value;
+                    const legacyCob = extractCOB(closestStatus).value;
+                    const verdictOf = (c) => c === null ? 'cobUnreadable' : (c > 0 ? 'cob' : 'pass');
+                    let nearestStatus = null, nearestDelta = Infinity;
+                    (nightscoutData.deviceStatus || []).forEach(st => {
+                        if (!st || !st.created_at) return;
+                        const d = Math.abs(new Date(st.created_at).getTime() - readingTime.getTime());
+                        if (d < 10 * 60 * 1000 && d < nearestDelta) { nearestDelta = d; nearestStatus = st; }
+                    });
+                    const cobRepoint = {
+                        fallback: !beforeStatus,
+                        recordChanged: cobStatus !== closestStatus,
+                        verdictChanged: verdictOf(cobReal) !== verdictOf(legacyCob),
+                        nearestVerdictChanged: verdictOf(extractCOB(nearestStatus || closestStatus).value) !== verdictOf(legacyCob)
+                    };
+                    // [COB-REPOINT-END]
                     if (cobReal === null) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'cobUnreadable', cobReal });
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'cobUnreadable', cobReal, cobRepoint });
                         return;
                     }
                     if (cobReal > 0) {
-                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'cob', cobReal });
+                        candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: getLocalDateString(readingTime), rejectedBy: 'cob', cobReal, cobRepoint });
                         return;
                     }
                     // [COB-GATE-END]
@@ -8605,7 +8637,7 @@
                     // — inflating contributingDayCount and deflating maxDayShare on
                     // exactly the two periods that motivated measuring concentration.
                     const dateStr = getLocalDateString(readingTime); // local 'YYYY-MM-DD'
-                    candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr, rejectedBy: null, cobReal });
+                    candidateReadings.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr, rejectedBy: null, cobReal, cobRepoint });
                     cleanWindows.push({ time: readingTime, bg: reading.sgv, deviation, date: dateStr, cobReal });
                 });
 
@@ -8622,6 +8654,21 @@
                         cobUnreadable: candidatesInPeriod.filter(c => c.rejectedBy === 'cobUnreadable').length,
                         gateA: candidatesInPeriod.filter(c => c.rejectedBy === 'gateA').length,
                         gateB: candidatesInPeriod.filter(c => c.rejectedBy === 'gateB').length,
+                        // DEF-176 (v3.6.33): what the lookup repoint changed, per period. Only
+                        // readings that reached the COB gate carry cobRepoint (Gate A/B rejects
+                        // never read COB), so `evaluated` is that population.
+                        cobBoundaryRepoint: (() => {
+                            const ev = candidatesInPeriod.filter(c => c.cobRepoint);
+                            return {
+                                lookupDirection: 'before', windowMs: IOB_LOOKUP_WINDOW_MS, candidacyWindowMs: 10 * 60 * 1000,
+                                evaluated: ev.length,
+                                recordChanged: ev.filter(c => c.cobRepoint.recordChanged).length,
+                                verdictChanged: ev.filter(c => c.cobRepoint.verdictChanged).length,
+                                verdictChangedIfNearest: ev.filter(c => c.cobRepoint.nearestVerdictChanged).length,
+                                fallbackToLegacy: ev.filter(c => c.cobRepoint.fallback).length,
+                                note: 'verdictChanged = readings whose COB gate verdict differs from the pre-v3.6.33 first-within-10-min record; verdictChangedIfNearest = the same count under a true-nearest rule, for the ruling on direction'
+                            };
+                        })(),
                     };
                     const windowQuality = candidateWindowCount > 0
                         ? windowsInPeriod.length / candidateWindowCount
@@ -10757,7 +10804,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.32',
+                            version: '3.6.33',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -11227,7 +11274,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.32',
+                        version: '3.6.33',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -16283,7 +16330,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.32 — DEF-178 ledger basis + DEF-174, 175, 179–182</p>
+                                    <p className="text-gray-400 text-sm">v3.6.33 — DEF-176 COB lookup repoint (before-record)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
