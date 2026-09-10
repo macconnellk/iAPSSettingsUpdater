@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.33</title>
+    <title>Daily Insulin Settings Review v3.6.34</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -996,6 +996,8 @@
                 pipelineCensus.lost = {
                     atConflictDetection: lostBetween(pipelineCensus.emitted, pipelineCensus.afterConflictDetection),
                     atStateFilter: lostBetween(pipelineCensus.afterConflictDetection, pipelineCensus.afterStateFilter),
+                    // DEF-184 (v3.6.34): one record per dropped finding — criterion, value, threshold.
+                    atStateFilterDetail: Array.isArray(this.lastStateFilterDrops) ? this.lastStateFilterDrops : [],
                     atBundling: lostBetween(pipelineCensus.afterStateFilter, pipelineCensus.afterBundling)
                 };
                 this.lastPipelineCensus = pipelineCensus;
@@ -1298,6 +1300,19 @@
                 // contradicted was promoted to PRIMARY on a 40 mg/dL event.
                 const rescued = findings.filter(f =>
                     (this.isSafetyFinding(f) || !joinsConflictSide(f)) && !keptSet.has(f));
+                // [STATE-FILTER-DROPS-START] v3.6.34 (DEF-184). A finding the state filter
+                // drops was a key in lost.atStateFilter and nothing else: no criterion, no
+                // value, no threshold. On Sep 9 that cost a finding — direct_meal_high@12:00
+                // at 85% dropped beside @15:00 at 55% retained, unreadable. One record per
+                // dropped finding, keyed like the census, naming what was compared to what.
+                const rescuedSet = new Set(rescued);
+                const dropped = findings.filter(f => !keptSet.has(f) && !rescuedSet.has(f));
+                this.lastStateFilterDrops = dropped.map(f => ({
+                    key: `${f.type}@${f.scheduleTime ?? 'slotless'}`,
+                    state: bodyState.state,
+                    ...stateFilterCriterion(f, bodyState.state)
+                }));
+                // [STATE-FILTER-DROPS-END]
                 if (rescued.length > 0) {
                     const detail = rescued.map(f =>
                         `${f.type}@${f.scheduleTime}${joinsConflictSide(f) ? '' : ' (no lever)'}`);
@@ -1833,6 +1848,7 @@
                 // recommendations and still be the most important thing in the output.
                 // Surfaced at bundle level so the render gates and the export agree.
                 const withheldFindings = findings.filter(f => f.recommendationWithheld);
+                const noLeverFindings = findings.filter(f => !f.recommendationWithheld && f.noLeverReason);
 
                 return {
                     id,
@@ -1847,6 +1863,12 @@
                         scheduleTime: f.scheduleTime || null,
                         parameter: f.primaryParameter || null,
                         severity: f.severity ?? null
+                    })),
+                    // DEF-185 (v3.6.34): findings that proposed nothing, with the reason the
+                    // lever function gave. Distinct from withheld: no lever ever existed.
+                    noLeverFindings: noLeverFindings.map(f => ({
+                        type: f.type, reason: f.noLeverReason,
+                        scheduleTime: f.scheduleTime || null, parameter: f.primaryParameter || null, severity: f.severity ?? null
                     })),
                     compoundEffect: {},
                     rootCause: this.generateRootCause(findings),
@@ -1873,24 +1895,33 @@
             },
 
             findingToRecommendation(finding, schedules, basalRatioInfo = null) {
+                // [NO-LEVER-REASON-START] v3.6.34 (DEF-185). Ten early returns produce a
+                // finding with no recommendation and, until now, no reason: the census
+                // counted them as `unclassified`, and three of five withholdings on Sep 10
+                // could not be read. Each return now stamps WHY on the finding (a scored
+                // copy — the originals are never mutated, DEF-063), and the bundle and the
+                // census read the stamp. `recommendationWithheld` is a different thing —
+                // a lever that existed and was held — and keeps its own field.
+                const noLever = (f, reason) => { f.noLeverReason = reason; return null; };
+                // [NO-LEVER-REASON-END]
                 // v3.5.94 B2: a withheld finding proposes nothing — covers
                 // slot_conflict quarantine, covered_by_iob, and future withholds.
-                if (finding.recommendationWithheld) return null;
-                if (finding.type === FindingType.MIXED_ATTRIBUTION) return null;
-                if (finding.type === FindingType.RESISTANT_HIGH) return null;
-                if (finding.type === FindingType.PRESSURE_ARTIFACT) return null;
+                if (finding.recommendationWithheld) return null;   // stamped upstream; withheldBy reads it
+                if (finding.type === FindingType.MIXED_ATTRIBUTION) return noLever(finding, 'type_mixed_attribution');
+                if (finding.type === FindingType.RESISTANT_HIGH) return noLever(finding, 'type_resistant_high');
+                if (finding.type === FindingType.PRESSURE_ARTIFACT) return noLever(finding, 'type_pressure_artifact');
                 // v3.5.92 (DEF-034): a rebound-classified high must not contribute a
                 // CR/ISF strengthen — the classifier's own text says "physiological
                 // rebound from hypoglycemia, not weak CR". Rebound-only bundles render
                 // informationally; mixed bundles derive from non-rebound findings only
                 // (extends the existing filterByState/getBundleName special-casing).
-                if (finding.type === FindingType.REBOUND_HIGH) return null;
+                if (finding.type === FindingType.REBOUND_HIGH) return noLever(finding, 'type_rebound_high');
                 // v3.5.68: DAWN_CORRECTION_PATTERN is detect-and-quantify-only — it informs the
                 // review that basal is under-provisioned across the dawn window but does not itself
                 // recommend a change (that's a clinical decision on the basal schedule). Excluded
                 // here so it never generates an unintended basal recommendation.
-                if (finding.type === FindingType.DAWN_CORRECTION_PATTERN) return null;
-                if (!finding.primaryParameter || !finding.scheduleTime) return null;
+                if (finding.type === FindingType.DAWN_CORRECTION_PATTERN) return noLever(finding, 'type_dawn_correction_pattern');
+                if (!finding.primaryParameter || !finding.scheduleTime) return noLever(finding, !finding.primaryParameter ? 'no_primary_parameter' : 'no_schedule_time');
 
                 // Part A: basal_insufficiency routing.
                 let effectiveParameter = finding.primaryParameter;
@@ -1911,9 +1942,9 @@
                 }
 
                 const schedule = schedules[effectiveParameter.toLowerCase()];
-                if (!schedule) return null;
+                if (!schedule) return noLever(finding, 'schedule_missing:' + effectiveParameter);
                 const currentEntry = schedule.find(e => e.time === effectiveScheduleTime);
-                if (!currentEntry) return null;
+                if (!currentEntry) return noLever(finding, 'schedule_entry_missing:' + effectiveParameter + '@' + effectiveScheduleTime);
 
                 let newValue;
                 if (effectiveParameter === 'basal') {
@@ -1930,7 +1961,7 @@
                     newValue = parseFloat((currentEntry.value * (1 + effectiveChangePercent / 100)).toFixed(1));
                 }
 
-                if (newValue === currentEntry.value) return null;
+                if (newValue === currentEntry.value) return noLever(finding, 'no_change_at_pump_resolution');
 
                 const actualChangePercent = ((newValue - currentEntry.value) / currentEntry.value) * 100;
 
@@ -2704,6 +2735,26 @@
         // log history, and the human-readable report can never disagree.
         // Precedence: demoted > blocked (safety) > staged (compound ceiling) >
         // conflict > deferred (ordering only).
+        // [STATE-FILTER-CRITERION-START] v3.6.34 (DEF-184). The criterion each filtering
+        // state applies, stated as data so a dropped finding can carry it. Mirrors the
+        // branches of filterByStateInner by NAME (the state), not by re-implementing the
+        // test — RECOVERY's exemption is named, not re-evaluated.
+        const stateFilterCriterion = (f, state) => {
+            switch (state) {
+                case BodyStateType.RECOVERY:
+                    return { criterion: 'severity', value: f.severity ?? null, threshold: CONFIG.minSeverityRecoveryState,
+                             rule: 'kept when severity >= threshold, or correction_ineffective with diagnosticContext.patternType basal_insufficiency' };
+                case BodyStateType.TRANSIENT_RESISTANCE:
+                    return { criterion: 'direction', value: 'strengthen', threshold: 'no strengthening', rule: 'strengthening findings dropped in transient resistance' };
+                case BodyStateType.TRANSIENT_SENSITIVITY:
+                    return { criterion: 'direction', value: 'weaken', threshold: 'no weakening', rule: 'weakening findings dropped in transient sensitivity' };
+                case BodyStateType.HIGH_VARIABILITY:
+                    return { criterion: 'slot_conflict', value: f.scheduleTime ?? null, threshold: 'one side per slot', rule: 'quarantined by detectSlotConflicts' };
+                default:
+                    return { criterion: 'none', value: null, threshold: null, rule: `no filter in state ${state}` };
+            }
+        };
+        // [STATE-FILTER-CRITERION-END]
         const getBundleStatus = (bundle) => {
             if (bundle.demotedReason) {
                 return { status: bundle.demotedReason, statusReason: 'demoted' };
@@ -2849,7 +2900,12 @@
             withheldBundles.forEach(b => {
                 const reasons = [...new Set((Array.isArray(b.withheldFindings) ? b.withheldFindings : [])
                     .map(w => w && w.reason).filter(Boolean))];
-                const r = reasons.length ? reasons.join(',') : 'unclassified';
+                // DEF-185 (v3.6.34): a bundle with no withheld finding carried no reason and
+                // was counted `unclassified`. The lever function now stamps why it returned
+                // nothing; a bundle that is all no-lever reads `no_lever:<reason>`.
+                const noLever = [...new Set((Array.isArray(b.noLeverFindings) ? b.noLeverFindings : [])
+                    .map(w => w && w.reason).filter(Boolean))];
+                const r = reasons.length ? reasons.join(',') : (noLever.length ? 'no_lever:' + noLever.join(',') : 'unclassified');
                 withheldBy[r] = (withheldBy[r] || 0) + 1;
             });
             const out = {
@@ -5768,11 +5824,21 @@
                 const findings = [];
                 const INTRA_PERIOD_TIR_THRESHOLD = 60;
                 const INTRA_PERIOD_LOW_THRESHOLD  = 4;
+                // [INTRA-PERIOD-CENSUS-START] v3.6.34 (DEF-183). The intra-period pass had
+                // no negative branch: an entry that failed the hour test was `continue`d,
+                // and @19:00 vanishing between sessions on an identical population was
+                // unreadable. One record per period, every schedule entry the pass
+                // considered, the hour that qualified it or the best hour it had, against
+                // the two thresholds. Nothing reads this. lastPipelineCensus pattern.
+                const intraCensus = {};
+                this.lastIntraPeriodCensus = intraCensus;
+                // [INTRA-PERIOD-CENSUS-END]
                 
                 if (!signalAnalysis || !signalAnalysis.periods) return findings;
                 
                 signalAnalysis.periods.forEach(period => {
-                    if (!period.hasSufficientData) return;
+                    intraCensus[period.name] = { evaluated: false, reason: null, thresholds: { tirBelow: INTRA_PERIOD_TIR_THRESHOLD, lowPctAtMost: INTRA_PERIOD_LOW_THRESHOLD }, entries: [] };
+                    if (!period.hasSufficientData) { intraCensus[period.name].reason = 'period signal insufficient'; return; }
                     // [SPLIT-READS-START] DEF-115. The split is computed and persisted on
                     // this same period object; the detector was reading the PRE-split count
                     // five times and the post-split count zero times. Every read below is the
@@ -5780,10 +5846,10 @@
                     // computed from. No branch: where no split applies the two are equal
                     // (Dawn 321/321, Morning 90/90), so a conditional would add a path
                     // without adding a behaviour.
-                    if (period.effectiveWindowCount < CONFIG.minEventsHighConfidence) return;
+                    if (period.effectiveWindowCount < CONFIG.minEventsHighConfidence) { intraCensus[period.name].reason = 'effective window count below floor'; return; }
                     
                     const deviation = period.medianDeviation;
-                    if (Math.abs(deviation) <= 10) return;
+                    if (Math.abs(deviation) <= 10) { intraCensus[period.name].reason = 'median inside ±10'; return; }
                     
                     const type = deviation > 0 ? FindingType.BASAL_SIGNAL_HIGH : FindingType.BASAL_SIGNAL_LOW;
                     const adjustmentPercent = deviation > 0 
@@ -5863,11 +5929,15 @@
 
                     // Emit anchor finding (existing behavior unchanged)
                     findings.push(buildFinding(anchorTime));
+                    const census = intraCensus[period.name];
+                    census.anchor = anchorTime;
+                    census.direction = deviation > 0 ? 'HIGH' : 'LOW';
 
                     // Intra-period pass: HIGH periods only, when AGP stats available
                     // LOW periods are not evaluated intra-period (no clean-window evidence
                     // for sub-period weakening).
                     if (deviation > 0 && hourlyAgpStats7d && periodEntries.length > 1) {
+                        census.evaluated = true;
                         for (let i = 1; i < periodEntries.length; i++) {
                             const entry     = periodEntries[i];
                             const entryHour = parseInt(entry.time.split(':')[0]);
@@ -5878,17 +5948,38 @@
                             const coveredHours = [];
                             for (let h = entryHour; h < nextHour; h++) coveredHours.push(h);
 
-                            const independentlyFailing = coveredHours.some(h => {
+                            const hourTest = (h) => {
                                 const agp = hourlyAgpStats7d[h];
                                 return agp != null
                                     && agp.tir    < INTRA_PERIOD_TIR_THRESHOLD
                                     && agp.lowPct <= INTRA_PERIOD_LOW_THRESHOLD;
+                            };
+                            const qualifyingHour = coveredHours.find(hourTest);
+                            const independentlyFailing = qualifyingHour !== undefined;
+                            // Best hour when none qualifies: the lowest TIR among hours with stats,
+                            // shown against both thresholds so the reader sees which one held it.
+                            const withStats = coveredHours.filter(h => hourlyAgpStats7d[h] != null);
+                            const bestHour = withStats.length
+                                ? withStats.reduce((b, h) => (hourlyAgpStats7d[h].tir < hourlyAgpStats7d[b].tir ? h : b), withStats[0]) : null;
+                            const hourRec = (h) => h === null || h === undefined ? null
+                                : { hour: h, tir: hourlyAgpStats7d[h].tir, lowPct: hourlyAgpStats7d[h].lowPct,
+                                    tirBelowThreshold: hourlyAgpStats7d[h].tir < INTRA_PERIOD_TIR_THRESHOLD,
+                                    lowPctWithinThreshold: hourlyAgpStats7d[h].lowPct <= INTRA_PERIOD_LOW_THRESHOLD };
+                            census.entries.push({
+                                time: entry.time, coveredHours, emitted: independentlyFailing,
+                                qualifyingHour: hourRec(qualifyingHour),
+                                bestHour: independentlyFailing ? null : hourRec(bestHour),
+                                hoursWithoutStats: coveredHours.length - withStats.length
                             });
 
                             if (!independentlyFailing) continue;
 
                             findings.push(buildFinding(entry.time, { intraPeriodEntry: true }));
                         }
+                    } else {
+                        census.reason = deviation <= 0 ? 'LOW period — intra-period pass is HIGH-only'
+                            : !hourlyAgpStats7d ? 'no 7-day hourly AGP stats'
+                            : 'single schedule entry in period — anchor only';
                     }
                 });
                 
@@ -8598,24 +8689,17 @@
                     // the post-entry COB. Where no 'before' record exists inside the window
                     // the legacy record is used and the fallback counted. The count of
                     // readings whose gate verdict changed rides rejectedByGate.cobBoundaryRepoint,
-                    // beside the count a true-nearest rule would have changed, so the PM can
-                    // rule on the direction with the numbers rather than the argument.
+                    // (the nearest comparison rode beside it for one session and was retired
+                    // on the Sep 10 ruling: KEEP 'before', DEF-032 not reopened).
                     const beforeStatus = findDeviceStatusAt(nightscoutData.deviceStatus, readingTime, { direction: 'before' });
                     const cobStatus = beforeStatus || closestStatus;
                     const cobReal = extractCOB(cobStatus).value;
                     const legacyCob = extractCOB(closestStatus).value;
                     const verdictOf = (c) => c === null ? 'cobUnreadable' : (c > 0 ? 'cob' : 'pass');
-                    let nearestStatus = null, nearestDelta = Infinity;
-                    (nightscoutData.deviceStatus || []).forEach(st => {
-                        if (!st || !st.created_at) return;
-                        const d = Math.abs(new Date(st.created_at).getTime() - readingTime.getTime());
-                        if (d < 10 * 60 * 1000 && d < nearestDelta) { nearestDelta = d; nearestStatus = st; }
-                    });
                     const cobRepoint = {
                         fallback: !beforeStatus,
                         recordChanged: cobStatus !== closestStatus,
-                        verdictChanged: verdictOf(cobReal) !== verdictOf(legacyCob),
-                        nearestVerdictChanged: verdictOf(extractCOB(nearestStatus || closestStatus).value) !== verdictOf(legacyCob)
+                        verdictChanged: verdictOf(cobReal) !== verdictOf(legacyCob)
                     };
                     // [COB-REPOINT-END]
                     if (cobReal === null) {
@@ -8664,9 +8748,8 @@
                                 evaluated: ev.length,
                                 recordChanged: ev.filter(c => c.cobRepoint.recordChanged).length,
                                 verdictChanged: ev.filter(c => c.cobRepoint.verdictChanged).length,
-                                verdictChangedIfNearest: ev.filter(c => c.cobRepoint.nearestVerdictChanged).length,
                                 fallbackToLegacy: ev.filter(c => c.cobRepoint.fallback).length,
-                                note: 'verdictChanged = readings whose COB gate verdict differs from the pre-v3.6.33 first-within-10-min record; verdictChangedIfNearest = the same count under a true-nearest rule, for the ruling on direction'
+                                note: 'verdictChanged = readings whose COB gate verdict differs from the pre-v3.6.33 first-within-10-min record (which, on a newest-first array, was the SUCCESSOR record — DEF-186). Direction ruled before, Sep 10; the nearest comparison is retired.'
                             };
                         })(),
                     };
@@ -10804,7 +10887,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.33',
+                            version: '3.6.34',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -11191,6 +11274,10 @@
                     candidateWindowCount: period.candidateWindowCount ?? null,
                     // DEF-182 (v3.6.32): run-time trailing edge, declared per period.
                     windowEdge: period.windowEdge ?? { unavailable: true, section: 'windowEdge', reason: 'not_computed' },
+                    // DEF-183 (v3.6.34): the intra-period pass's candidate list, with the hour
+                    // that qualified each entry or the best hour it had against the thresholds.
+                    intraPeriod: PatternDetectors.lastIntraPeriodCensus?.[period.name]
+                        ?? { unavailable: true, section: 'intraPeriod', reason: 'detector_not_run' },
                     concentration: {
                         // DEF-120: these three now describe the population medianDeviation
                         // was computed from. The unsplit twins ride alongside — both
@@ -11274,7 +11361,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.33',
+                        version: '3.6.34',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -16330,7 +16417,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.33 — DEF-176 COB lookup repoint (before-record)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.34 — gates declare their negatives (DEF-183, 184, 185)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
