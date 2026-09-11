@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.34</title>
+    <title>Daily Insulin Settings Review v3.6.35</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -998,7 +998,23 @@
                     atStateFilter: lostBetween(pipelineCensus.afterConflictDetection, pipelineCensus.afterStateFilter),
                     // DEF-184 (v3.6.34): one record per dropped finding — criterion, value, threshold.
                     atStateFilterDetail: Array.isArray(this.lastStateFilterDrops) ? this.lastStateFilterDrops : [],
-                    atBundling: lostBetween(pipelineCensus.afterStateFilter, pipelineCensus.afterBundling)
+                    atBundling: lostBetween(pipelineCensus.afterStateFilter, pipelineCensus.afterBundling),
+                    // [LOST-COUNTS-START] v3.6.35 (DEF-188). The three lists above are KEY
+                    // lists: two findings on one key (isf_suppressed_high@09:00 twice, Sep 10)
+                    // collapse to one entry, and the list has understated every loss of a
+                    // duplicated key silently. The finding counts, from the stage totals the
+                    // census already carries, are what the loss figure was read as.
+                    findingCounts: (() => {
+                        const totalOf = (c) => Object.values(c || {}).reduce((acc, n) => acc + (Number.isFinite(n) ? n : 0), 0);
+                        return {
+                            emitted: totalOf(pipelineCensus.emitted),
+                            atConflictDetection: totalOf(pipelineCensus.emitted) - totalOf(pipelineCensus.afterConflictDetection),
+                            atStateFilter: totalOf(pipelineCensus.afterConflictDetection) - totalOf(pipelineCensus.afterStateFilter),
+                            atBundling: totalOf(pipelineCensus.afterStateFilter) - totalOf(pipelineCensus.afterBundling),
+                            note: 'findings lost per stage (sum of the keyed counts); the key lists beside them collapse duplicate keys and may read lower'
+                        };
+                    })()
+                    // [LOST-COUNTS-END]
                 };
                 this.lastPipelineCensus = pipelineCensus;
                 // [PIPELINE-CENSUS-END]
@@ -1014,6 +1030,11 @@
                         tier: Tier.ROUTINE,
                         priority: 'REFERENCE',
                         recommendations: [],
+                        // DEF-185 (v3.6.35): a conflict row has no findings to carry a stamp, so
+                        // it names its own reason — it was the one `unclassified` left on Sep 10.
+                        withheldFindings: [],
+                        noLeverFindings: [{ type: 'slot_conflict', reason: isResolved ? 'conflict_resolved_by_recency' : 'slot_conflict_unresolved',
+                                            scheduleTime: conflict.slot, parameter: null, severity: null }],
                         compoundEffect: null,
                         rootCause: isResolved
                             ? `Conflict at this slot resolved by recency — stale signals suppressed`
@@ -2743,7 +2764,8 @@
             switch (state) {
                 case BodyStateType.RECOVERY:
                     return { criterion: 'severity', value: f.severity ?? null, threshold: CONFIG.minSeverityRecoveryState,
-                             rule: 'kept when severity >= threshold, or correction_ineffective with diagnosticContext.patternType basal_insufficiency' };
+                             rule: 'DROPPED when severity < threshold, unless correction_ineffective with diagnosticContext.patternType basal_insufficiency. '
+                                 + 'Sub-threshold findings that are safety types or carry no lever are RESCUED at the boundary (retentionReason safety_type / no_lever) and are not drops.' };
                 case BodyStateType.TRANSIENT_RESISTANCE:
                     return { criterion: 'direction', value: 'strengthen', threshold: 'no strengthening', rule: 'strengthening findings dropped in transient resistance' };
                 case BodyStateType.TRANSIENT_SENSITIVITY:
@@ -10887,7 +10909,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.34',
+                            version: '3.6.35',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -11361,7 +11383,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.34',
+                        version: '3.6.35',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -14229,6 +14251,15 @@
                     // change; a row without it is a row logged before the column existed.
                     toolVersion: TOOL_VERSION_FROM_TITLE(),
                     // [TOOL-VERSION-LOG-END]
+                    // [BODY-STATE-LOG-START] v3.6.35 (DEF-190). computeFlipHistory has read
+                    // `state` and `daysInState` from every history row since INSTR-5, and no
+                    // row ever carried them: stateFlips 0 across 28 sessions meant "never
+                    // recorded". The state that governed tonight's filter, logged per row
+                    // (App Script v5.9 columns Body_State / Days_In_State). A blank on a
+                    // prior row is unrecorded, not stable.
+                    bodyState: state?.state ?? null,
+                    daysInState: Number.isFinite(state?.daysInState) ? state.daysInState : null,
+                    // [BODY-STATE-LOG-END]
                     // INSTR-3: gate-cost + R2 shadow. Fields always present (the Log
                     // Script write guard keys on !== undefined); null metrics fail
                     // safe to empty tallies, never omitted.
@@ -15621,6 +15652,34 @@
             };
             
             // Copy for Claude review
+            // [RAW-FETCH-DOWNLOAD-START] v3.6.35 (DEF-189). The third gate — "identical to
+            // what tonight's data would give on the previous build" — had no way to run:
+            // every run re-fetches live, so two builds never saw one dataset. This writes
+            // the session's raw inputs (the Nightscout fetch as received, the history rows
+            // as resolved, the config the run used) to a file the replay harness can be
+            // pointed at, so any two builds can be diffed key-by-key on the same fetch.
+            // Nothing is transformed; the token is not included. Download only — no
+            // clipboard, no network.
+            const downloadRawFetch = () => {
+                try {
+                    const nd = analysisResults?.nightscoutData || {};
+                    const payload = {
+                        meta: { kind: 'raw_fetch', toolVersion: TOOL_VERSION_FROM_TITLE(), capturedAt: new Date().toISOString(),
+                                localCapturedAt: new Date().toLocaleString(), timezoneOffsetMin: new Date().getTimezoneOffset(),
+                                analysisWindowDays: basalSignalWindow || 7 },
+                        nightscoutData: { glucose: nd.glucose || [], treatments: nd.treatments || [], deviceStatus: nd.deviceStatus || [], profile: nd.profile ?? null },
+                        history: Array.isArray(cachedSheetsEntries) ? cachedSheetsEntries : null,
+                        config: { basalSignalWindow: basalSignalWindow ?? null, targetBG: CONFIG.targetBG ?? null, pumpIncrement: CONFIG.pumpIncrement ?? null }
+                    };
+                    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url; a.download = `raw_fetch_${(payload.meta.toolVersion || 'v')}_${payload.meta.capturedAt.replace(/[:.]/g, '-')}.json`;
+                    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                } catch (e) { console.error('downloadRawFetch failed:', e); }
+            };
+            // [RAW-FETCH-DOWNLOAD-END]
             const copyForClaudeReview = async () => {
                 console.log('=== copyForClaudeReview called ===');
 
@@ -16417,7 +16476,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.34 — gates declare their negatives (DEF-183, 184, 185)</p>
+                                    <p className="text-gray-400 text-sm">v3.6.35 — DEF-188 loss counts, DEF-189 raw fetch, DEF-190 state log</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
@@ -16783,6 +16842,13 @@
                                             }`}
                                         >
                                             {copyStatus === 'copied' ? '✓ Copied!' : '📋 Copy for Claude Review'}
+                                        </button>
+                                        <button
+                                            onClick={downloadRawFetch}
+                                            title="DEF-189: save this session's raw Nightscout fetch + history rows for replay"
+                                            className="px-4 py-3 bg-gray-700/50 hover:bg-gray-700 text-gray-300 rounded-xl transition-colors"
+                                        >
+                                            ⬇ Raw fetch
                                         </button>
                                         <button
                                             onClick={() => setStep('config')}
