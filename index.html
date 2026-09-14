@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.35</title>
+    <title>Daily Insulin Settings Review v3.6.37</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2718,6 +2718,27 @@
             if (status.openaps?.iob?.basaliob != null) return status.openaps.iob.basaliob;
             return null;
         };
+        // [CORRECTION-AUTHORITY-START] v3.6.36 (DEF-193 Part B). Declared only: how much of
+        // the observed fall the credited correction insulin could account for at the
+        // governing ISF. No threshold is applied and nothing reads it — the share
+        // accumulates so a cut-off can be ruled from the production distribution (n ≥ 6),
+        // the way scheduleShape and DEF-148 were ruled, not from one event.
+        const computeCorrectionAuthority = (units, isfEntry, highBG, lowBG) => {
+            const u = Number.isFinite(units) ? units : null;
+            const isf = (isfEntry && Number.isFinite(isfEntry.value)) ? isfEntry.value : null;
+            const fall = (Number.isFinite(highBG) && Number.isFinite(lowBG)) ? highBG - lowBG : null;
+            const authority = (u !== null && isf !== null) ? u * isf : null;
+            return {
+                units: u,
+                isfMgdlPerU: isf,
+                isfTime: (isfEntry && isfEntry.time) ? isfEntry.time : null,
+                authorityMgdl: authority,
+                observedFallMgdl: fall,
+                authorityShare: (authority !== null && fall !== null && fall > 0) ? authority / fall : null,
+                note: 'declared only — no threshold is applied; the gate that suppresses is negative IOB at nadir (DEF-193 Part A)'
+            };
+        };
+        // [CORRECTION-AUTHORITY-END]
         // [EXTRACT-COB-START] v3.6.30 (DEF-172). The canonical COB extractor, beside the
         // IOB one. iAPS (oref) devicestatus carries COB ONLY at openaps.suggested.COB and
         // openaps.enacted.COB — uppercase, a sibling of the openaps.iob object extractIOB
@@ -2765,7 +2786,8 @@
                 case BodyStateType.RECOVERY:
                     return { criterion: 'severity', value: f.severity ?? null, threshold: CONFIG.minSeverityRecoveryState,
                              rule: 'DROPPED when severity < threshold, unless correction_ineffective with diagnosticContext.patternType basal_insufficiency. '
-                                 + 'Sub-threshold findings that are safety types or carry no lever are RESCUED at the boundary (retentionReason safety_type / no_lever) and are not drops.' };
+                                 + 'Sub-threshold findings that are safety types or carry no lever are RESCUED at the boundary (retentionReason safety_type / no_lever) and are not drops. '
+                                 + 'Two mechanisms share the name state filter: RECOVERY drops (this record); TRANSIENT_* and OVERRIDE/UNDETERMINED withhold the lever and keep the finding (withheldBy.state_filtered + retentionCensus).' };
                 case BodyStateType.TRANSIENT_RESISTANCE:
                     return { criterion: 'direction', value: 'strengthen', threshold: 'no strengthening', rule: 'strengthening findings dropped in transient resistance' };
                 case BodyStateType.TRANSIENT_SENSITIVITY:
@@ -2975,11 +2997,12 @@
             const b = gateCostBucket(t, null);
             return b === 'other' ? null : b;
         };
-        const bundlePersistenceKey = (b) => {
-            const det = b?.findings?.[0]?.type || b?.detector || null;
-            const slot = b?.recommendations?.[0]?.scheduleTime || b?.findings?.[0]?.scheduleTime || b?.scheduleTime || null;
-            return (det && slot) ? `${det}@${slot}` : (b?.name || null);
-        };
+        // DEF-194 (v3.6.37): keyed on the bundle NAME — the name is produced from the
+        // headline detector, so a multi-detector bundle persists as itself rather than as
+        // whichever member happened to be findings[0] (Sep 11: `correction_ineffective@13:00`
+        // keyed a bundle named for isf_suppressed_high). Prior watch items carry the name.
+        const BLOCK_PERSISTENCE_KEYED_ON = 'bundle name (headline detector)';
+        const bundlePersistenceKey = (b) => (b && b.name) ? String(b.name) : null;
         const computeBlockPersistence = (bundles, priorRows) => {
             const rows = (Array.isArray(priorRows) ? priorRows : [])
                 .filter(r => r && Array.isArray(r.watchItems))
@@ -3003,7 +3026,7 @@
                     if (!hit) break;
                     streak++; since = r.day; lastDay = r.day;
                 }
-                out.push({ key, name: b.name, bucket,
+                out.push({ key, keyedOn: BLOCK_PERSISTENCE_KEYED_ON, name: b.name, bucket,
                     consecutiveSessions: streak + 1,
                     since: since || getLocalDateString(),
                     priorSessionsScanned: rows.length });
@@ -5351,6 +5374,9 @@
              */
             detectISFInducedLows(lowProblems, nightscoutData, isfSchedule, claimedEvents, analysisWindow, crSchedule = null) { // DQ-D FIX: added crSchedule param
                 const findings = [];
+                // DEF-193 Part C: one record per suppression, [] when none. lastPipelineCensus /
+                // lastIntraPeriodCensus pattern — exposed on the detector, read by the export.
+                this.lastIsfInducedLowSuppressed = [];
                 
                 lowProblems.forEach(low => {
                     const lowId = getEventId(low);
@@ -5526,6 +5552,39 @@
                         return;
                     }
 
+                    // [ISF-LOW-GATE-START] v3.6.36 (DEF-193 Part A). The axis-scoring emitter
+                    // of this same finding type reads IOB at the nadir and refuses ISF
+                    // causation when net AND basal IOB are both negative; this emitter never
+                    // read IOB at all. On Sep 11 the two disagreed about one 66 mg/dL low
+                    // (0.05U of correction against a 116-point fall, IOB −0.20U), collided
+                    // into a slot conflict and blocked the slot. Same helpers, same two-part
+                    // gate, same mandatory before-direction (DEF-032). Either value
+                    // null never suppresses. Computed BEFORE the claims so a suppression
+                    // claims nothing; every suppression is enumerated (Part C).
+                    const totalCorrectionInsulin = genuineCorrections.reduce((sum, c) => sum + (c.insulin || 0), 0);
+                    const isfEntry = getISFForTime(earliestCorrectionTime.toISOString(), isfSchedule);
+                    const correctionAuthority = computeCorrectionAuthority(totalCorrectionInsulin, isfEntry, lastHighReading.sgv, low.bg);
+                    const iobRecordAtNadir = this.findClosestDeviceStatus(nightscoutData.deviceStatus, nadirTime, { direction: 'before' });
+                    let netIobAtNadir = null, basalIobAtNadir = null;
+                    if (iobRecordAtNadir) {
+                        netIobAtNadir = extractIOB(iobRecordAtNadir);
+                        basalIobAtNadir = extractBasalIOB(iobRecordAtNadir);
+                    }
+                    const negIOBAtNadir = (netIobAtNadir != null && basalIobAtNadir != null)
+                        && netIobAtNadir < 0 && basalIobAtNadir < 0;
+                    if (negIOBAtNadir) {
+                        this.lastIsfInducedLowSuppressed.push({
+                            reason: 'negative_iob_at_nadir',
+                            lowBG: low.bg, lowTime: low.localTime || low.time, scheduleTime: isfEntry ? isfEntry.time : null,
+                            nadirBG: nadirReading.sgv, nadirTime: nadirTime.toISOString(),
+                            netIobAtNadir, basalIobAtNadir,
+                            correctionUnits: totalCorrectionInsulin, correctionCount: genuineCorrections.length,
+                            correctionAuthority
+                        });
+                        return;
+                    }
+                    // [ISF-LOW-GATE-END]
+
                     // Claim corrections (but NOT lows - allow multiple attributions)
                     genuineCorrections.forEach(c => {
                         claimedEvents.corrections.add(getEventId(c));
@@ -5533,9 +5592,6 @@
                     highReadings.forEach(h => {
                         claimedEvents.highs.add(getEventId(h));
                     });
-
-                    const totalCorrectionInsulin = genuineCorrections.reduce((sum, c) => sum + (c.insulin || 0), 0);
-                    const isfEntry = getISFForTime(earliestCorrectionTime.toISOString(), isfSchedule);
 
                     // Severity and adjustment
                     const lowSeverity = hasStacking ?
@@ -5580,7 +5636,8 @@
                         claimedEventIds: [...genuineCorrections.map(getEventId), ...highReadings.map(getEventId)],
                         conflictsWith: [],
                         recencyWeight: calculateRecencyWeight(low.localTime || low.time, analysisWindow),
-                        details: details
+                        details: details,
+                        correctionAuthority
                     });
                 });
                 
@@ -7322,7 +7379,10 @@
                                 primaryParameter: 'isf',
                                 suggestedChangePercent: adj,
                                 contributingFactors: [...axisFactors, 'strong_isf'],
-                                details: `Low ${low.bg} mg/dL — ISF axis dominant (${isfScore.toFixed(2)}). Correction overcorrected.`
+                                details: `Low ${low.bg} mg/dL — ISF axis dominant (${isfScore.toFixed(2)}). Correction overcorrected.`,
+                                // DEF-193 Part B. decomp.peakBG is the meal's observed peak (0 when no
+                                // reading rose above the meal-time BG → treated as unavailable, null fall).
+                                correctionAuthority: computeCorrectionAuthority(decomp.correctionTotal, isfEntry, decomp.peakBG > 0 ? decomp.peakBG : null, low.bg)
                             };
                         } else {
                             // CR axis dominant → DIRECT_MEAL_LOW (§5.9)
@@ -10839,7 +10899,10 @@
                         attempts,
                         lateArrivals,
                         attemptCount: attempts.length,
-                        failedCount: attempts.filter(a => a && a.outcome === 'failed').length,
+                        // DEF-148 (v3.6.37): a relabelled attempt still failed its budget — it is
+                        // counted as failed AND named apart, so the retry story stays readable.
+                        failedCount: attempts.filter(a => a && (a.outcome === 'failed' || a.outcome === 'timed_out_then_arrived')).length,
+                        timedOutThenArrivedCount: attempts.filter(a => a && a.outcome === 'timed_out_then_arrived').length,
                         lateArrivalCount: lateArrivals.length,
                         // The budget schedule in force when these were measured. A duration
                         // without the budget it was measured against cannot size anything.
@@ -10909,10 +10972,21 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return {
                         meta: {
-                            version: '3.6.35',
+                            version: '3.6.37',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
+                            // DEF-191 (v3.6.37): the exact string the auto-log writes to Body_State, echoed so the
+                            // written value is confirmable on the artifact that confirms the build. Enum form
+                            // (underscores) — `state.mode` is the display form and is not what is logged.
+                            bodyStateLogged: bodyState?.state ?? null,
+                            // DEF-189 (v3.6.37): pairs this export with the raw-fetch file by the fetch's own timestamp.
+                            dataFetchedAt: analysisResults?.nightscoutData?.fetchedAt ?? null,
+                            // DEF-193 Part C (v3.6.36): every isf_induced_low suppression, [] when none;
+                            // unavailable only if the detector did not run this session.
+                            isfInducedLowSuppressed: Array.isArray(PatternDetectors.lastIsfInducedLowSuppressed)
+                                ? PatternDetectors.lastIsfInducedLowSuppressed
+                                : { unavailable: true, section: 'isfInducedLowSuppressed', reason: 'detector_not_run' },
                             dataQuality: {
                                 glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
                                 coveragePercent: coveragePercentOf(config.basalSignalWindow || 7),
@@ -11096,8 +11170,12 @@
                                         mealCompletionThresholdU: f.mealCompletionThresholdU ?? null,
                                         governingMeal: f.governingMeal ?? null,
                                         iobAtLow: f.iobAtLow ?? null
-                                    } : {})
+                                    } : {}),
                                     // [D5-DISCLOSURE-END]
+                                    // DEF-193 Part B (v3.6.36): the D5 form — gated on the field's
+                                    // presence, never on type, so a finding that computed nothing
+                                    // carries nothing.
+                                    ...(f.correctionAuthority ? { correctionAuthority: f.correctionAuthority } : {})
                                 });
                             }
                             // Signal support from structural findings (fix operator precedence)
@@ -11383,10 +11461,21 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.35',
+                        version: '3.6.37',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
+                        // DEF-191 (v3.6.37): the exact string the auto-log writes to Body_State, echoed so the
+                        // written value is confirmable on the artifact that confirms the build. Enum form
+                        // (underscores) — `state.mode` is the display form and is not what is logged.
+                        bodyStateLogged: bodyState?.state ?? null,
+                        // DEF-189 (v3.6.37): pairs this export with the raw-fetch file by the fetch's own timestamp.
+                        dataFetchedAt: analysisResults?.nightscoutData?.fetchedAt ?? null,
+                        // DEF-193 Part C (v3.6.36): every isf_induced_low suppression, [] when none;
+                        // unavailable only if the detector did not run this session.
+                        isfInducedLowSuppressed: Array.isArray(PatternDetectors.lastIsfInducedLowSuppressed)
+                            ? PatternDetectors.lastIsfInducedLowSuppressed
+                            : { unavailable: true, section: 'isfInducedLowSuppressed', reason: 'detector_not_run' },
                         dataQuality: {
                             glucoseReadings: analysisResults.nightscoutData?.glucose?.length || 0,
                             coveragePercent: coveragePercentOf(config?.analysisWindow || 7),
@@ -13227,8 +13316,22 @@
                     if (yVal !== null && tVal !== null) {
                         const prevAbs = Math.abs(yVal);
                         const currAbs = Math.abs(tVal);
-                        const arrow = currAbs < prevAbs - 3 ? '↓ improving' : currAbs > prevAbs + 3 ? '↑ worsening' : '→ stable';
-                        metrics.push({ label: `${p.name} dev`, prev: yVal.toFixed(0), curr: tVal.toFixed(0), delta: arrow });
+                        // DEF-192 (v3.6.37): the logged value is the SPLIT median where a split
+                        // applied and the row does not say so; a delta between two medians on
+                        // different populations is not a trend. The cell names today's basis
+                        // and population, and the arrow is suppressed when today's is split.
+                        // `periods` here is the EXPORT's signals.periods (parsed back from the JSON),
+                        // not the raw period objects: the split flag is populationSplit.applied.
+                        // The first cut read p.splitApplied — undefined on this shape — and the
+                        // first raw replay rendered the Sep 11 one-day split as "unsplit".
+                        const split = p.populationSplit?.applied === true || p.splitApplied === true;
+                        const eff = p.effectiveWindowCount ?? p.cleanWindowCount ?? null;
+                        const days = p.effectiveContributingDayCount ?? null;
+                        const basis = split ? `split ${eff}w/${days}d` : `unsplit ${eff}w/${days}d`;
+                        const arrow = split
+                            ? `n/a — split basis today; yesterday's basis unlogged`
+                            : (currAbs < prevAbs - 3 ? '↓ improving' : currAbs > prevAbs + 3 ? '↑ worsening' : '→ stable');
+                        metrics.push({ label: `${p.name} dev`, prev: yVal.toFixed(0), curr: `${tVal.toFixed(0)} (${basis})`, delta: arrow });
                     }
                 }
                 
@@ -13588,7 +13691,9 @@
 
                     console.log('=== fetchNightscoutData complete ===');
 
-                    return { glucose: dedupedGlucose, treatments, deviceStatus: dedupedDeviceStatus, profile };
+                    // DEF-189 (v3.6.37): the fetch's own timestamp, so the raw-fetch file and the
+                    // Copy export can be paired by fact rather than by inference from click times.
+                    return { glucose: dedupedGlucose, treatments, deviceStatus: dedupedDeviceStatus, profile, fetchedAt: new Date().toISOString() };
                     
                 } catch (err) {
                     console.error('Nightscout fetch error:', err);
@@ -13748,6 +13853,11 @@
                         window[callbackName] = () => {
                             const lateBy = Date.now() - issuedAt;
                             jsonpLateArrivals.push({ url, timeoutMs, arrivedAfterMs: lateBy });
+                            // DEF-148 (v3.6.37, closed as characterised): the attempt completed —
+                            // late, not failed. Relabel its own record so the log reads what
+                            // happened: a cold start that answered after the budget.
+                            const rec = jsonpAttemptLog.find(r => r.url === url && r.attempt === attemptNo && r.outcome === 'failed');
+                            if (rec) { rec.outcome = 'timed_out_then_arrived'; rec.arrivedAfterMs = lateBy; }
                             console.warn('[JSONP-LATE] response arrived ' + lateBy + 'ms after issue ('
                                 + (lateBy - timeoutMs) + 'ms past a ' + timeoutMs + 'ms budget) — '
                                 + 'the endpoint answered, the handler had already been torn down: ' + url);
@@ -15665,6 +15775,7 @@
                     const nd = analysisResults?.nightscoutData || {};
                     const payload = {
                         meta: { kind: 'raw_fetch', toolVersion: TOOL_VERSION_FROM_TITLE(), capturedAt: new Date().toISOString(),
+                                dataFetchedAt: nd.fetchedAt ?? null,
                                 localCapturedAt: new Date().toLocaleString(), timezoneOffsetMin: new Date().getTimezoneOffset(),
                                 analysisWindowDays: basalSignalWindow || 7 },
                         nightscoutData: { glucose: nd.glucose || [], treatments: nd.treatments || [], deviceStatus: nd.deviceStatus || [], profile: nd.profile ?? null },
@@ -16476,7 +16587,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.35 — DEF-188 loss counts, DEF-189 raw fetch, DEF-190 state log</p>
+                                    <p className="text-gray-400 text-sm">v3.6.37 — DEF-193 gate + DEF-148/189/191/192/194 (one run)</p>
                                 </div>
                                 <div className="text-right">
                                     <div className="text-gray-400 text-sm">
