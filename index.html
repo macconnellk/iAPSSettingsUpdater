@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v3.6.38</title>
+    <title>Daily Insulin Settings Review v4.0.0</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -389,9 +389,9 @@
             // detectors' classifications are not exported. The judgement engine still RUNS
             // (its bundles keep the history sheet continuous and feed the owner's A/B) but
             // its output is not in the Copy. false restores the v3.6.37 export exactly.
-            // v3.6.38 ships with the flag OFF (spec_v3.6.38 base: the v4.0.0 build with the
-            // flag off); v4.0.0's deploy flips it.
-            measurementOnly: false,
+            // v3.6.38 shipped with the flag OFF (confirmed Sep 16); v4.0.0 is this file with
+            // the flag ON. false restores v3.6.38 exactly.
+            measurementOnly: true,
             
             // Minimum carb threshold - meals below this are not substantial enough to cause lows
             minMealCarbsForAttribution: 10,
@@ -11348,7 +11348,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '3.6.38',
+                            version: '4.0.0',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -11853,7 +11853,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '3.6.38',
+                        version: '4.0.0',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -17133,7 +17133,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v3.6.38 — persisted history cache (DEF-197) · settled guard (DEF-196) · flip audit (DEF-190) · DEF-200</p>
+                                    <p className="text-gray-400 text-sm">v4.0.0 — measurement-only export · eventLedger · safetyFacts · on v3.6.38 (persisted history cache)</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the Copy carries no bundles, priorities or recommended values — the engine still runs and still logs to the sheet. Press ⬇ Raw fetch before copying.
