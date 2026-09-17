@@ -3029,15 +3029,28 @@
                 // unrelated excursion supply the denominator (Sep 16 04:13: 187 → 179, four hours
                 // after the low, share 10.9 against ~1.5). hyper / correction_window (and meal,
                 // unclassified) keep the DEF-222 construction and its truncation unchanged.
+                // A correction_window has a BEFORE (the high being corrected) and an AFTER (whether
+                // it came down): its peak is the pre-event maximum and its nadir the minimum after
+                // that peak, truncated by the DEF-222 rule from that peak (spec r2 — r1's "same as
+                // hyper" anchored 4 of 9 windows on a new excursion at +213/+214 min).
                 const eventBGValue = readingNear(ms);
-                const preEventPeak = type === 'hypo' ? win.filter(r => new Date(r.dateString).getTime() <= ms).reduce((m, r) => (!m || r.sgv > m.sgv) ? r : m, null) : null;
-                const anchorHypo = type === 'hypo';
-                const fallPeakBG = anchorHypo ? (preEventPeak ? preEventPeak.sgv : null) : (peak ? peak.sgv : null);
-                const fallNadirBG = anchorHypo ? eventBGValue : (postPeakNadir ? postPeakNadir.sgv : null);
+                const anchorHypo = type === 'hypo', anchorCW = type === 'correction_window';
+                const preEventPeak = (anchorHypo || anchorCW) ? win.filter(r => new Date(r.dateString).getTime() <= ms).reduce((m, r) => (!m || r.sgv > m.sgv) ? r : m, null) : null;
+                const prePeakMs = preEventPeak ? new Date(preEventPeak.dateString).getTime() : null;
+                const cwTrunc = (anchorCW && prePeakMs !== null) ? treatments.filter(t => t && t.created_at && ((t.carbs > 0) || (t.insulin > 0 && !(t.eventType && String(t.eventType).includes('SMB')))))
+                    .map(t => ({ t, at: new Date(t.created_at).getTime() })).filter(x => x.at > prePeakMs && x.at <= windowEndMs).sort((a, b) => a.at - b.at)[0] || null : null;
+                const cwEndMs = anchorCW ? (cwTrunc ? cwTrunc.at : windowEndMs) : null;
+                const cwNadir = (anchorCW && prePeakMs !== null) ? win.filter(r => { const t = new Date(r.dateString).getTime(); return t > prePeakMs && t <= cwEndMs; }).reduce((m, r) => (!m || r.sgv < m.sgv) ? r : m, null) : null;
+                const fallPeakBG = (anchorHypo || anchorCW) ? (preEventPeak ? preEventPeak.sgv : null) : (peak ? peak.sgv : null);
+                const fallNadirBG = anchorHypo ? eventBGValue : anchorCW ? (cwNadir ? cwNadir.sgv : null) : (postPeakNadir ? postPeakNadir.sgv : null);
+                const minAt = (t) => t === null ? null : Math.round((t - ms) / 60000);
                 const fallAnchor = {
-                    rule: anchorHypo ? 'hypo: pre-event peak (max in [windowStart, eventTime]) → eventBG' : 'hyper/correction_window: window peak → post-peak nadir, truncated (DEF-222)',
-                    peakBG: fallPeakBG, peakAtMin: anchorHypo ? (preEventPeak ? Math.round((new Date(preEventPeak.dateString) - ms) / 60000) : null) : (peak ? Math.round((peakMs - ms) / 60000) : null),
-                    nadirBG: fallNadirBG, nadirAtMin: anchorHypo ? (eventBGValue === null ? null : 0) : (postPeakNadir ? Math.round((postPeakNadirMs - ms) / 60000) : null)
+                    rule: anchorHypo ? 'hypo: pre-event peak (max in [windowStart, eventTime]) → eventBG'
+                        : anchorCW ? 'correction_window: pre-event peak (max in [windowStart, eventTime]) → minimum after that peak, truncated at the next non-SMB bolus or carb entry after the peak'
+                        : 'hyper: window peak → post-peak nadir, truncated (DEF-222)',
+                    peakBG: fallPeakBG, peakAtMin: (anchorHypo || anchorCW) ? minAt(prePeakMs) : (peak ? minAt(peakMs) : null),
+                    nadirBG: fallNadirBG, nadirAtMin: anchorHypo ? (eventBGValue === null ? null : 0) : anchorCW ? (cwNadir ? minAt(new Date(cwNadir.dateString).getTime()) : null) : (postPeakNadir ? minAt(postPeakNadirMs) : null),
+                    truncatedAtMin: anchorHypo ? null : anchorCW ? (cwTrunc ? minAt(cwTrunc.at) : null) : (fallTrunc ? minAt(fallTrunc.at) : null)
                 };
                 const correctionAuthority = { ...computeCorrectionAuthority(corrUnits, isfAt, fallPeakBG, fallNadirBG),
                     basis: 'computed in ledger window',
@@ -3120,12 +3133,25 @@
         const buildSafetyFacts = ({ eventLedger, nightscoutData, schedules, agp7day, periods, analysisWindowDays }) => {
             const hs = agp7day?.hourlyStats || {};
             const hourlyLowMass = [];
+            // DEF-234 (v4.0.4): the near-low tier, 70–80 inclusive, DECLARE ONLY — owner-ruled
+            // "a 79 should not block". Both bounds already exist (70 is Rule 1's low, 80 the
+            // fingerstick threshold). Counted over the last analysisWindowDays of the fetched trace
+            // by local hour, with its own denominator (the trace's readings in that hour); lowPct
+            // keeps calculateAGP's population and is untouched. Emitted on every hour, at zero too.
+            const glucoseAll = (nightscoutData?.glucose || []).filter(r => r && r.dateString && Number.isFinite(r.sgv));
+            const latestMs = glucoseAll.reduce((m, r) => Math.max(m, new Date(r.dateString).getTime()), -Infinity);
+            const nearWindowFrom = latestMs - (analysisWindowDays || 7) * 24 * 3600000;
+            const nearLowByHour = Array.from({ length: 24 }, () => ({ near: 0, n: 0 }));
+            glucoseAll.forEach(r => { const t = new Date(r.dateString).getTime(); if (t < nearWindowFrom) return; const b = nearLowByHour[new Date(r.dateString).getHours()]; b.n++; if (r.sgv >= 70 && r.sgv <= 80) b.near++; });
             for (let h = 0; h < 24; h++) {
                 const st = hs[h] || null;
                 // calculateAGP's hourly shape: { hour, count, mean, tir: { veryLow, low, inRange, ... } } — percent units.
                 // lowPct here is BELOW 70 (low + veryLow), the figure the bimodal gate compared to 4%.
-                hourlyLowMass.push(st ? { hour: h, lowPct: (Number(st.tir?.low) || 0) + (Number(st.tir?.veryLow) || 0), veryLowPct: st.tir?.veryLow ?? null, tir: st.tir?.inRange ?? null, mean: st.mean ?? null, readings: st.count ?? null }
-                                      : { hour: h, lowPct: null, veryLowPct: null, tir: null, mean: null, readings: 0 });
+                const nb = nearLowByHour[h];
+                hourlyLowMass.push(st ? { hour: h, lowPct: (Number(st.tir?.low) || 0) + (Number(st.tir?.veryLow) || 0), veryLowPct: st.tir?.veryLow ?? null, tir: st.tir?.inRange ?? null, mean: st.mean ?? null, readings: st.count ?? null,
+                                          nearLowPct: nb.n > 0 ? (nb.near / nb.n) * 100 : 0, nearLowReadings: nb.near, nearLowBasis: '70 ≤ sgv ≤ 80 over the trace\'s readings in this local hour within analysisWindowDays; declared only, no gate reads it' }
+                                      : { hour: h, lowPct: null, veryLowPct: null, tir: null, mean: null, readings: 0,
+                                          nearLowPct: nb.n > 0 ? (nb.near / nb.n) * 100 : 0, nearLowReadings: nb.near, nearLowBasis: '70 ≤ sgv ≤ 80 over the trace\'s readings in this local hour within analysisWindowDays; declared only, no gate reads it' });
             }
             const spansOf = (param, sched) => {
                 const sorted = (sched || []).slice().sort((a, b) => a.time.localeCompare(b.time));
@@ -3248,6 +3274,29 @@
         // The paste under the flag: the JSON and a header that says what it is. No rendered
         // tables (§11c call 1), no bundle text, no detector vocabulary — the review reads
         // eventLedger + safetyFacts + signals.periods and nothing else (close condition 5).
+        // [DECISION-LOG-START] v4.0.4 (DEF-233). The decision log is prose, not a table: §11c of
+        // spec_v4.0.0 removed the rendered markdown TABLES from the paste and the log's prose went
+        // with them unnoticed; nothing was deleted, it stopped being emitted. Emitted as structured
+        // text — the last DECISION_LOG_WINDOW_DAYS days of Decision_Log rows, newest first — on the
+        // export and, rendered exactly as v3.6.38's trend section rendered it, in the paste header.
+        // 14 is the existing trend window; no new number.
+        const DECISION_LOG_WINDOW_DAYS = 14;
+        const buildDecisionLog = (historyRows, asOf = new Date()) => {
+            const cutoff = new Date(asOf).getTime() - DECISION_LOG_WINDOW_DAYS * 24 * 3600000;
+            const rows = (Array.isArray(historyRows) ? historyRows : []).filter(r => r && (r.date || r.timestamp))
+                .map(r => ({ date: r.date || r.timestamp, text: String(r.decisionLog || r.Decision_Log || r.notes || '').trim() }))
+                .filter(r => r.text.length > 0 && !isNaN(new Date(r.date).getTime()) && new Date(r.date).getTime() >= cutoff)
+                .sort((a, b) => new Date(b.date) - new Date(a.date));
+            return { windowDays: DECISION_LOG_WINDOW_DAYS, asOf: new Date(asOf).toISOString(), count: rows.length, source: 'history Decision_Log column (the sheet), rows within windowDays of the fetch, newest first',
+                     entries: rows.map(r => ({ date: new Date(r.date).toISOString(), headline: r.text.split('\n').find(l => l.trim())?.trim() ?? '', text: r.text })) };
+        };
+        const formatDecisionLogMarkdown = (log) => {
+            if (!log || !Array.isArray(log.entries) || log.entries.length === 0) return '## Decision Log History\n\n_No Decision_Log rows within the last ' + (log?.windowDays ?? DECISION_LOG_WINDOW_DAYS) + ' days._\n\n';
+            let out = '## Decision Log History\n\n_Prior session notes and override context — use to interpret anomalous rows above._\n\n';
+            for (const e of log.entries) { const date = new Date(e.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); out += `- **${date}:** ${e.text}\n`; }
+            return out + '\n';
+        };
+        // [DECISION-LOG-END]
         const formatMeasurementOnlyHeader = (exp) => {
             const m = exp?.meta || {};
             const c = m.eventCensus || {};
@@ -3260,7 +3309,8 @@
                 + '- Data fetched at: ' + (m.dataFetchedAt || 'unknown') + '\n'
                 + '- Event census: detected ' + (c.detected ?? '?') + ' → ' + byType + '; dropped as signal ' + (c.droppedAsSignal ?? '?')
                 + ', structural ' + (c.droppedAsStructural ?? '?') + ', deduplicated ' + (c.dedupedDuplicates ?? '?') + '; emitted ' + (c.emittedRecords ?? '?') + '\n'
-                + '- Body state logged: ' + (m.bodyStateLogged ?? 'unknown') + ' (a fact; not applied as a filter to anything above)\n\n---\n\n';
+                + '- Body state logged: ' + (m.bodyStateLogged ?? 'unknown') + ' (a fact; not applied as a filter to anything above)\n\n'
+                + formatDecisionLogMarkdown(exp?.decisionLog) + '---\n\n';
         };
         // [MEASUREMENT-ONLY-END]
         // [EXTRACT-COB-START] v3.6.30 (DEF-172). The canonical COB extractor, beside the
@@ -11624,6 +11674,7 @@
                                 ? 'DEF-112 direction wiring ON: single-family compound grades use the scale their direction selects.'
                                 : 'DEF-112 direction wiring OFF: compound grades are byte-identical to v3.6.27; the audit still declares the mismatch.' },
                         shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
+                        decisionLog: buildDecisionLog(cachedHistory, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date()),
                         historyAvailable: hMeta.historyAvailable,
                         historyEntryCount: hMeta.historyEntryCount ?? (cachedHistory || []).length,
                         // DEF-137: the count never travelled with the window it covers.
@@ -12194,6 +12245,7 @@
                             ? 'DEF-112 direction wiring ON: single-family compound grades use the scale their direction selects.'
                             : 'DEF-112 direction wiring OFF: compound grades are byte-identical to v3.6.27; the audit still declares the mismatch.' },
                     shadowUnblock: formatShadowSurface(analysisResults?.shadowUnblock),
+                    decisionLog: buildDecisionLog(cachedHistory, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date()),
                     // INSTR-2: derived from history snapshots every run (auto-backfilling)
                     historyAvailable: hMeta.historyAvailable,
                     historyEntryCount: hMeta.historyEntryCount ?? (cachedHistory || []).length,
