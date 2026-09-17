@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.0.3</title>
+    <title>Daily Insulin Settings Review v4.0.4</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3023,8 +3023,25 @@
                 const isfAt = weightedIsf ? { time: weightedIsf.time, value: weightedIsf.value } : null;
                 // Computed uniformly from the ledger's own window — a finding-carried authority
                 // is never read (DEF-203): it came out of a detector this build stops trusting.
-                const correctionAuthority = { ...computeCorrectionAuthority(corrUnits, isfAt, peak ? peak.sgv : null, postPeakNadir ? postPeakNadir.sgv : null),
+                // DEF-230 (v4.0.4): the fall must be ANCHORED to the event, not merely ordered around
+                // it. On a hypo the event IS the nadir of interest and the peak is the pre-event
+                // maximum in [windowStart, eventTime]; DEF-222's post-peak construction let a later,
+                // unrelated excursion supply the denominator (Sep 16 04:13: 187 → 179, four hours
+                // after the low, share 10.9 against ~1.5). hyper / correction_window (and meal,
+                // unclassified) keep the DEF-222 construction and its truncation unchanged.
+                const eventBGValue = readingNear(ms);
+                const preEventPeak = type === 'hypo' ? win.filter(r => new Date(r.dateString).getTime() <= ms).reduce((m, r) => (!m || r.sgv > m.sgv) ? r : m, null) : null;
+                const anchorHypo = type === 'hypo';
+                const fallPeakBG = anchorHypo ? (preEventPeak ? preEventPeak.sgv : null) : (peak ? peak.sgv : null);
+                const fallNadirBG = anchorHypo ? eventBGValue : (postPeakNadir ? postPeakNadir.sgv : null);
+                const fallAnchor = {
+                    rule: anchorHypo ? 'hypo: pre-event peak (max in [windowStart, eventTime]) → eventBG' : 'hyper/correction_window: window peak → post-peak nadir, truncated (DEF-222)',
+                    peakBG: fallPeakBG, peakAtMin: anchorHypo ? (preEventPeak ? Math.round((new Date(preEventPeak.dateString) - ms) / 60000) : null) : (peak ? Math.round((peakMs - ms) / 60000) : null),
+                    nadirBG: fallNadirBG, nadirAtMin: anchorHypo ? (eventBGValue === null ? null : 0) : (postPeakNadir ? Math.round((postPeakNadirMs - ms) / 60000) : null)
+                };
+                const correctionAuthority = { ...computeCorrectionAuthority(corrUnits, isfAt, fallPeakBG, fallNadirBG),
                     basis: 'computed in ledger window',
+                    fallAnchor,
                     isfBasis: 'volume-weighted over candidateBlocks.isf (each correction at its own ISF)',
                     fallBasis: 'peak → post-peak nadir (glucose.postPeakNadirBG), truncated at the next non-SMB bolus or carb entry after the peak (glucose.fallTruncatedAt); null when no reading follows the peak',
                     fallWindowMin: peak ? [Math.round((peakMs - ms) / 60000), Math.round((fallEndMs - ms) / 60000)] : null,
@@ -3034,7 +3051,7 @@
                     type, eventTime: evDate.toISOString(), hour: evDate.getHours(), period: ledgerPeriodOf(evDate),
                     threshold: type === 'hypo' ? { kind: 'bg_below', value: CONFIG.lowThreshold } : (type === 'hyper' || type === 'meal') ? { kind: 'bg_above', value: CONFIG.highThreshold }
                              : type === 'correction_window' ? { kind: 'corrections_not_reaching_target', value: null } : { kind: 'unclassified', value: null },
-                    eventBG: readingNear(ms),
+                    eventBG: eventBGValue,
                     glucose: { entryBG: win.length ? win[0].sgv : null, nadirBG: nadir ? nadir.sgv : null, nadirAtMin: nadir ? Math.round((new Date(nadir.dateString) - ms) / 60000) : null,
                                peakBG: peak ? peak.sgv : null, peakAtMin: peak ? Math.round((new Date(peak.dateString) - ms) / 60000) : null,
                                postPeakNadirBG: postPeakNadir ? postPeakNadir.sgv : null, postPeakNadirAtMin: postPeakNadir ? Math.round((postPeakNadirMs - ms) / 60000) : null,
@@ -3151,14 +3168,43 @@
             glucose.forEach(r => {
                 const t = new Date(r.dateString).getTime();
                 if (r.sgv < CONFIG.lowThreshold) {
-                    if (cur && t - cur.lastMs <= 30 * 60000) { cur.lastMs = t; if (r.sgv < cur.bg) { cur.bg = r.sgv; cur.time = r.dateString; } }
-                    else { if (cur) lowEvents.push(cur); cur = { time: r.dateString, bg: r.sgv, lastMs: t }; }
+                    if (cur && t - cur.lastMs <= 30 * 60000) { cur.lastMs = t; cur.readings.push(r); if (r.sgv < cur.bg) { cur.bg = r.sgv; cur.time = r.dateString; } }
+                    else { if (cur) lowEvents.push(cur); cur = { time: r.dateString, bg: r.sgv, lastMs: t, readings: [r] }; }
                 }
             });
             if (cur) lowEvents.push(cur);
-            const lows = lowEvents.map(e => { const rec = findDeviceStatusAt(nightscoutData?.deviceStatus || [], new Date(e.time), { direction: 'before' });
-                return { time: new Date(e.time).toISOString(), bg: e.bg, hour: new Date(e.time).getHours(), netIob: rec ? extractIOB(rec) : null, basalIob: rec ? extractBasalIOB(rec) : null, treatmentCarbsImputed: null }; });
-            return { hourlyLowMass, parameterSpans, slotAge, recurrence, populationBasis, lowEvents: lows,
+            // [LOW-SHAPE-START] v4.0.4 (DEF-231). The pressure-artifact shape, declared clause by
+            // clause — the detector's `likelyPressureLow` ANDs rapidRecovery, isolated and
+            // nadir < 55, and DEF-232 showed the nadir gate misses fingerstick-confirmed artifacts
+            // (Sep 16 04:13: 67 on the CGM, 95 on the meter). Every clause and constant is the
+            // detector's own; nothing here is a new number, and no gate reads it. A CGM gap can
+            // counterfeit `isolated`, so the gaps around the event are counted beside it.
+            const lowShape = (e) => {
+                const lowTime = new Date(e.time); const lowMs = lowTime.getTime();
+                const rapidRecovery = glucose.some(r => { const m = (new Date(r.dateString).getTime() - lowMs) / 60000; return m > 0 && m <= 20 && r.sgv > 90; });
+                const isolated = !glucose.some(r => { const m = Math.abs(new Date(r.dateString).getTime() - lowMs) / 60000; return m > 5 && m <= 45 && r.sgv <= 70 && r.dateString !== e.time; });
+                const near = glucose.filter(r => Math.abs(new Date(r.dateString).getTime() - lowMs) <= 45 * 60000).map(r => new Date(r.dateString).getTime()).sort((a, b) => a - b);
+                let gapsNearEvent = 0; for (let i = 1; i < near.length; i++) if (near[i] - near[i - 1] > 7.5 * 60000) gapsNearEvent++;
+                const shapeFlagged = rapidRecovery && isolated && gapsNearEvent === 0;
+                return { rapidRecovery, isolated, gapsNearEvent, readingsNearEvent: near.length, shapeFlagged };
+            };
+            const LOW_SHAPE_RULE = 'shapeFlagged = rapidRecovery (a reading > 90 within 20 min after the low) && isolated (no reading ≤ 70 between 5 and 45 min of it) && gapsNearEvent === 0 (no interval > 7.5 min in ±45 min); no nadir threshold (DEF-232) — declared only, no gate reads it';
+            const lows = lowEvents.map(e => { const rec = findDeviceStatusAt(nightscoutData?.deviceStatus || [], new Date(e.time), { direction: 'before' }); const shape = lowShape(e);
+                return { time: new Date(e.time).toISOString(), bg: e.bg, hour: new Date(e.time).getHours(), netIob: rec ? extractIOB(rec) : null, basalIob: rec ? extractBasalIOB(rec) : null, treatmentCarbsImputed: null,
+                         rapidRecovery: shape.rapidRecovery, isolated: shape.isolated, gapsNearEvent: shape.gapsNearEvent, readingsNearEvent: shape.readingsNearEvent, shapeFlagged: shape.shapeFlagged, readingsInEvent: e.readings.length }; });
+            // hourlyLowMass's second figure: lowPct with the shape-flagged events' own readings removed
+            // from the low count, over the same hourly denominator (calculateAGP's count); emitted on
+            // every hour, equal or not (DEF-183 — silence must not read as agreement).
+            const flaggedByHour = {};
+            lowEvents.forEach((e, i) => { if (lows[i].shapeFlagged) e.readings.forEach(r => { const h = new Date(r.dateString).getHours(); flaggedByHour[h] = (flaggedByHour[h] || 0) + 1; }); });
+            hourlyLowMass.forEach(row => {
+                if (row.lowPct === null || !(row.readings > 0)) { row.lowPctExcludingShapeFlagged = row.lowPct; row.shapeFlaggedReadings = 0; return; }
+                const removed = flaggedByHour[row.hour] || 0;
+                row.shapeFlaggedReadings = removed;
+                row.lowPctExcludingShapeFlagged = Math.max(0, row.lowPct - (removed / row.readings) * 100);
+            });
+            // [LOW-SHAPE-END]
+            return { hourlyLowMass, parameterSpans, slotAge, recurrence, populationBasis, lowEvents: lows, lowShapeRule: LOW_SHAPE_RULE,
                      note: 'ingredients only — no forward-risk window is precomputed for any parameter; the reviewer applies the lag they will defend' };
         };
         // [SAFETY-FACTS-END]
@@ -11516,7 +11562,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.0.3',
+                            version: '4.0.4',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -12025,7 +12071,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.0.3',
+                        version: '4.0.4',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -17310,7 +17356,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.0.3 — measurement-only export · DEF-228 ledger reads the detectors' pre-aggregation output (one record per event, not per slot) · v4.0.2 fixes DEF-220…226 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.0.4 — measurement-only export · DEF-230 correction authority anchored to the event (hypo: pre-event peak → eventBG) · DEF-231 low-event artifact shape declared clause by clause, hourlyLowMass second figure · v4.0.3 DEF-228 underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the Copy carries no bundles, priorities or recommended values — the engine still runs and still logs to the sheet. Press ⬇ Raw fetch before copying.
