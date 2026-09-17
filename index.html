@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.0.1</title>
+    <title>Daily Insulin Settings Review v4.0.3</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2833,13 +2833,92 @@
             });
             return out;
         };
-        const buildEventLedger = ({ findings, suppressed, nightscoutData, schedules, now = new Date() }) => {
+        // DEF-221 (v4.0.2): a meal is an EPISODE — consecutive carb entries with no readable COB
+        // record at zero between them. The loop's own COB is the boundary; no clock constant.
+        // Where no readable COB record lies between two entries the chain continues: a wrongly
+        // merged episode enlarges the plan, which points AWAY from a phantom over-delivery.
+        // The chain runs backward from the governing entry (the last one before the event).
+        const ledgerStatusMs = (s) => { if (!s || !s.created_at) return NaN; const internal = s.openaps?.iob?.time; let ts = internal ? new Date(internal).getTime() : NaN; if (isNaN(ts)) ts = new Date(s.created_at).getTime(); return ts; };
+        const ledgerMealEpisode = (govCarb, treatments, deviceStatus) => {
+            if (!govCarb) return [];
+            const carbs = (treatments || []).filter(t => t && t.created_at && t.carbs > 0).sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+            const idx = carbs.indexOf(govCarb);
+            if (idx < 0) return [govCarb];
+            const cobZeroBetween = (aMs, bMs) => (deviceStatus || []).some(s => { const t = ledgerStatusMs(s); return !isNaN(t) && t > aMs && t < bMs && extractCOB(s).value === 0; });
+            const episode = [govCarb];
+            for (let i = idx - 1; i >= 0; i--) {
+                if (cobZeroBetween(new Date(carbs[i].created_at).getTime(), new Date(episode[0].created_at).getTime())) break;
+                episode.unshift(carbs[i]);
+            }
+            return episode;
+        };
+        // DEF-225 (v4.0.2, completing DEF-218): the bolus that paid for a carb entry is the FIRST
+        // non-SMB bolus in [−2, +90] min of the entry — _decomposeSMBs's upfront rule, reused. A
+        // bolus pairs with one entry only; an entry with no bolus in its window pairs with none.
+        const ledgerPairMealBoluses = (episode, treatments) => {
+            const nonSmb = (treatments || []).filter(t => t && t.created_at && t.insulin > 0 && !(t.eventType && String(t.eventType).includes('SMB')))
+                .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+            const used = new Set();
+            return (episode || []).map(entry => {
+                const cMs = new Date(entry.created_at).getTime();
+                const bolus = nonSmb.find(t => { if (used.has(t)) return false; const m = (new Date(t.created_at).getTime() - cMs) / 60000; return m >= -2 && m <= 90; }) || null;
+                if (bolus) used.add(bolus);
+                return { entry, bolus };
+            });
+        };
+        // DEF-220 (v4.0.2): the plan is the episode's; the bounds NEST BY CONSTRUCTION. Lower is
+        // the paired meal boluses (certain meal insulin); Upper is every insulin record in the
+        // horizon [first entry −2 min, last entry +180 min]. The record is determinate when every
+        // non-SMB bolus in the horizon is a paired meal bolus — then, by the instrument's own
+        // claim (every SMB inside a meal window is meal-attributed), delivered = Upper and the
+        // bounds collapse onto deliveredShareOfPlan. Indeterminate: bounds only, no share (§3g).
+        // budgetRatioLegacy (upfront + categorised SMBs) is a scoring exclusion, not a meal
+        // attribution; it stays in the instrument for census and leaves the ledger.
+        const ledgerEpisodePlan = (episode, pairs, treatments, crSchedule) => {
+            const empty = { expectedUnits: null, upfrontShare: null, deliveredUnits: null, deliveredShareOfPlan: null, budgetDeterminate: null, budgetRatioLower: null, budgetRatioUpper: null,
+                            mealBolusUnits: null, smbUnitsInHorizon: null, unpairedBolusUnits: null, unpairedBolusCount: null, horizon: null, note: 'no governing carb entry — no plan' };
+            if (!episode || !episode.length) return empty;
+            const perEntry = episode.map(c => { const e = ledgerEntryAt(crSchedule, new Date(c.created_at)); return (e && e.value > 0) ? c.carbs / e.value : null; });
+            const expected = perEntry.every(x => Number.isFinite(x)) ? perEntry.reduce((a, x) => a + x, 0) : null;
+            const fromMs = new Date(episode[0].created_at).getTime() - 2 * 60000;
+            const toMs = new Date(episode[episode.length - 1].created_at).getTime() + 180 * 60000;
+            const inHorizon = (treatments || []).filter(t => t && t.created_at && t.insulin > 0 && new Date(t.created_at).getTime() >= fromMs && new Date(t.created_at).getTime() <= toMs);
+            const isSmb = (t) => !!(t.eventType && String(t.eventType).includes('SMB'));
+            const paired = (pairs || []).map(p => p.bolus).filter(Boolean);
+            const same = (a, b) => new Date(a.created_at).getTime() === new Date(b.created_at).getTime() && a.insulin === b.insulin;
+            const delivered = inHorizon.reduce((a, t) => a + t.insulin, 0);
+            const smbUnits = inHorizon.filter(isSmb).reduce((a, t) => a + t.insulin, 0);
+            const unpaired = inHorizon.filter(t => !isSmb(t) && !paired.some(b => same(t, b)));
+            const unpairedUnits = unpaired.reduce((a, t) => a + t.insulin, 0);
+            const pairedUnits = paired.reduce((a, t) => a + t.insulin, 0);
+            const determinate = expected !== null && expected > 0 && unpaired.length === 0;
+            const r3 = (x) => x === null ? null : parseFloat(x.toFixed(3));
+            const upper = (expected !== null && expected > 0) ? delivered / expected : null;
+            const lower = (expected !== null && expected > 0) ? (determinate ? upper : pairedUnits / expected) : null;
+            return {
+                expectedUnits: expected, upfrontShare: CONFIG.IAPS_UPFRONT_BOLUS_FRACTION ?? null,
+                deliveredUnits: r3(delivered), deliveredShareOfPlan: determinate ? upper : null,
+                budgetDeterminate: determinate, budgetRatioLower: lower, budgetRatioUpper: upper,
+                mealBolusUnits: r3(pairedUnits), smbUnitsInHorizon: r3(smbUnits), unpairedBolusUnits: r3(unpairedUnits), unpairedBolusCount: unpaired.length,
+                horizon: { fromISO: new Date(fromMs).toISOString(), toISO: new Date(toMs).toISOString(), rule: '[first entry −2 min, last entry +180 min]' },
+                basis: 'episode plan — expected Σ grams_i / CR(t_i); delivered = every insulin record in the horizon; Lower = paired meal boluses, Upper = delivered; Lower ≤ Upper by construction',
+                note: expected === null ? 'no CR for an entry in the episode — no plan'
+                    : determinate ? 'determinate — every non-SMB bolus in the horizon is a paired meal bolus; bounds collapse onto deliveredShareOfPlan'
+                    : `indeterminate — ${unpaired.length} unpaired non-SMB bolus(es) in the horizon; bounds only, no share`
+            };
+        };
+        const buildEventLedger = ({ findings, findingsBasis = 'unstated', suppressed, nightscoutData, schedules, now = new Date() }) => {
             const glucose = (nightscoutData?.glucose || []).slice().sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
             const treatments = nightscoutData?.treatments || [];
             const deviceStatus = nightscoutData?.deviceStatus || [];
             const basalS = schedules?.basal || [], crS = schedules?.cr || [], isfS = schedules?.isf || [];
             const census = { detectedByType: {}, droppedAsSignal: 0, droppedAsStructural: 0, dedupedDuplicates: 0, emittedRecords: 0, unclassified: 0,
                              fromSuppressedGate: 0,
+                             // DEF-228 (v4.0.3): which list this ledger was built from. aggregateFindings keeps
+                             // one finding per (type, slot, parameter) — the first inserted — so a ledger
+                             // built from `findings` sees one event per slot, the newest, and last night's
+                             // record vanishes when tonight's arrives. pre_aggregation is the detectors' output.
+                             inputBasis: findingsBasis,
                              note: 'detected − droppedAsSignal − droppedAsStructural − dedupedDuplicates === emittedRecords' };
             // The DEF-193 gate withholds isf_induced_low from `findings` when IOB at nadir is
             // negative. That is a judgement about cause; the record it withholds carries facts
@@ -2880,6 +2959,21 @@
                 const nadir = win.reduce((m, r) => (!m || r.sgv < m.sgv) ? r : m, null);
                 const peak = win.reduce((m, r) => (!m || r.sgv > m.sgv) ? r : m, null);
                 let gapsInWindow = 0; for (let i = 1; i < win.length; i++) if (new Date(win[i].dateString) - new Date(win[i - 1].dateString) > 15 * 60000) gapsInWindow++;
+                // DEF-222 (v4.0.2): the fall the corrections can be measured against runs from the
+                // peak FORWARD — the window minimum may precede the peak, and peak − that minimum is
+                // a rise. The fall ends at the next non-SMB bolus or carb entry after the peak (a
+                // later intervention's fall is not this window's authority); SMBs do not truncate —
+                // they fire every five minutes in a hyper and would null the fall on every record —
+                // so their volume between peak and nadir is emitted beside the truncation instead.
+                const peakMs = peak ? new Date(peak.dateString).getTime() : null;
+                const windowEndMs = ms + 240 * 60000;
+                const fallTrunc = peakMs === null ? null : treatments.filter(t => t && t.created_at && ((t.carbs > 0) || (t.insulin > 0 && !(t.eventType && String(t.eventType).includes('SMB')))))
+                    .map(t => ({ t, at: new Date(t.created_at).getTime() })).filter(x => x.at > peakMs && x.at <= windowEndMs).sort((a, b) => a.at - b.at)[0] || null;
+                const fallEndMs = fallTrunc ? fallTrunc.at : windowEndMs;
+                const postPeakNadir = peakMs === null ? null : win.filter(r => { const t = new Date(r.dateString).getTime(); return t > peakMs && t <= fallEndMs; }).reduce((m, r) => (!m || r.sgv < m.sgv) ? r : m, null);
+                const postPeakNadirMs = postPeakNadir ? new Date(postPeakNadir.dateString).getTime() : null;
+                const smbUnitsPeakToNadir = postPeakNadirMs === null ? null : parseFloat(treatments.filter(t => t && t.created_at && t.insulin > 0 && t.eventType && String(t.eventType).includes('SMB'))
+                    .filter(t => { const at = new Date(t.created_at).getTime(); return at > peakMs && at <= postPeakNadirMs; }).reduce((a, t) => a + t.insulin, 0).toFixed(3));
                 // insulin facts
                 const iob = lookupIOB(deviceStatus, evDate, { direction: 'before' });
                 const nadirDate = nadir ? new Date(nadir.dateString) : evDate;
@@ -2895,31 +2989,25 @@
                 const carbEntries = treatments.filter(t => t && t.created_at && t.carbs > 0 && new Date(t.created_at).getTime() <= ms && new Date(t.created_at).getTime() >= ms - 6 * 3600000)
                     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
                 const govCarb = ledgerParseTime(f.governingMealTime) ? (treatments.find(t => t && t.carbs > 0 && t.created_at && Math.abs(new Date(t.created_at) - ledgerParseTime(f.governingMealTime)) < 60000) || carbEntries[0] || null) : (carbEntries[0] || null);
-                // DEF-218 (v4.0.1): iAPS logs a meal bolus as a separate insulin-only record, which
-                // isTrueCorrection admits. The meal bolus is the non-SMB bolus nearest the governing
-                // carb entry — the pairing `plan` is judged against — and it is excluded from the
-                // corrections by EXACT record identity (time and units), no tolerance, no constant.
-                // bolusTime/bolusUnits stay what they were (the LAST non-SMB bolus in the window);
-                // the excluded bolus is named as insulin.mealBolus so the exclusion is visible.
-                // Residual, declared not fixed: where bolusCount > 1 a second meal bolus survives.
-                const mealBolus = (govCarb && boluses.length)
-                    ? boluses.slice().sort((a, b) => Math.abs(new Date(a.created_at) - new Date(govCarb.created_at)) - Math.abs(new Date(b.created_at) - new Date(govCarb.created_at)))[0]
-                    : null;
+                // DEF-221 (v4.0.2): the governing entry is the LAST entry of an episode; the plan is
+                // the episode's. DEF-225 (v4.0.2, completing DEF-218): each entry's meal bolus is the
+                // first non-SMB bolus in [−2, +90] min of that entry — _decomposeSMBs's own upfront
+                // rule — and every paired bolus is excluded from the corrections by exact identity.
+                // A paired bolus outside the record's [−180, 0] window excludes nothing (Sep 13
+                // 23:09: the 1.8 U meal bolus was 236 min out; the nearest-bolus rule had excluded a
+                // manual correction in its place).
+                const episode = ledgerMealEpisode(govCarb, treatments, deviceStatus);
+                const pairs = ledgerPairMealBoluses(episode, treatments);
+                const pairedBoluses = pairs.map(p => p.bolus).filter(Boolean);
+                const sameRecord = (a, b) => new Date(a.created_at).getTime() === new Date(b.created_at).getTime() && a.insulin === b.insulin;
+                const inWindow = (t) => { const at = new Date(t.created_at).getTime(); return at >= ms - 180 * 60000 && at <= ms; };
+                const govPair = pairs.length ? pairs[pairs.length - 1] : null;
+                const mealBolus = govPair && govPair.bolus ? govPair.bolus : null;
                 const corrections = insulinInWindow.filter(t => isTrueCorrection(t, treatments, crS))
-                    .filter(t => !(mealBolus && new Date(t.created_at).getTime() === new Date(mealBolus.created_at).getTime() && t.insulin === mealBolus.insulin));
+                    .filter(t => !pairedBoluses.some(b => sameRecord(t, b)));
                 const recAtEvent = findDeviceStatusAt(deviceStatus, evDate, { direction: 'before' });
                 const cobRead = recAtEvent ? extractCOB(recAtEvent) : { value: null, source: null };
-                // plan: the decomposition's facts only, when a governing meal exists
-                let plan = { expectedUnits: null, upfrontShare: null, deliveredUnits: null, deliveredShareOfPlan: null, budgetDeterminate: null, budgetRatioLower: null, budgetRatioUpper: null, note: 'no governing carb entry — no plan to decompose' };
-                if (govCarb) {
-                    try {
-                        const d = PatternDetectors._decomposeSMBs(treatments, glucose, new Date(govCarb.created_at), govCarb.carbs, crS);
-                        plan = { expectedUnits: d.expectedBudget ?? null, upfrontShare: CONFIG.IAPS_UPFRONT_BOLUS_FRACTION ?? null, deliveredUnits: d.actualTotal ?? null,
-                                 deliveredShareOfPlan: (d.budgetDeterminate && d.expectedBudget > 0 && Number.isFinite(d.actualTotal)) ? d.actualTotal / d.expectedBudget : null,
-                                 budgetDeterminate: d.budgetDeterminate ?? null, budgetRatioLower: d.budgetRatioLegacy ?? null, budgetRatioUpper: d.budgetRatioUpper ?? null,
-                                 note: d.budgetDeterminate ? 'delivered against the CR plan for the governing carb entry' : 'budget indeterminate — bounds only, no share' };
-                    } catch (e) { plan.note = 'decomposition threw: ' + e.message; }
-                }
+                const plan = ledgerEpisodePlan(episode, pairs, treatments, crS);
                 // DEF-218 (v4.0.1): the authority's ISF is the record's OWN per-correction lookup
                 // (candidateBlocks.isf), volume-weighted — one field pointing at another in the
                 // same record, so the two cannot disagree about which ISF governed the insulin.
@@ -2935,10 +3023,13 @@
                 const isfAt = weightedIsf ? { time: weightedIsf.time, value: weightedIsf.value } : null;
                 // Computed uniformly from the ledger's own window — a finding-carried authority
                 // is never read (DEF-203): it came out of a detector this build stops trusting.
-                const correctionAuthority = { ...computeCorrectionAuthority(corrUnits, isfAt, peak ? peak.sgv : null, nadir ? nadir.sgv : null),
+                const correctionAuthority = { ...computeCorrectionAuthority(corrUnits, isfAt, peak ? peak.sgv : null, postPeakNadir ? postPeakNadir.sgv : null),
                     basis: 'computed in ledger window',
                     isfBasis: 'volume-weighted over candidateBlocks.isf (each correction at its own ISF)',
-                    note: 'true corrections in [−180, 0] min, excluding the record\'s own meal bolus (insulin.mealBolus), against the peak→nadir fall in [−180, +240] min; declared only, no threshold' };
+                    fallBasis: 'peak → post-peak nadir (glucose.postPeakNadirBG), truncated at the next non-SMB bolus or carb entry after the peak (glucose.fallTruncatedAt); null when no reading follows the peak',
+                    fallWindowMin: peak ? [Math.round((peakMs - ms) / 60000), Math.round((fallEndMs - ms) / 60000)] : null,
+                    smbUnitsPeakToNadir,
+                    note: 'true corrections in [−180, 0] min, excluding the episode\'s paired meal boluses (insulin.mealBoluses), against the peak→post-peak-nadir fall; declared only, no threshold' };
                 const record = {
                     type, eventTime: evDate.toISOString(), hour: evDate.getHours(), period: ledgerPeriodOf(evDate),
                     threshold: type === 'hypo' ? { kind: 'bg_below', value: CONFIG.lowThreshold } : (type === 'hyper' || type === 'meal') ? { kind: 'bg_above', value: CONFIG.highThreshold }
@@ -2946,16 +3037,31 @@
                     eventBG: readingNear(ms),
                     glucose: { entryBG: win.length ? win[0].sgv : null, nadirBG: nadir ? nadir.sgv : null, nadirAtMin: nadir ? Math.round((new Date(nadir.dateString) - ms) / 60000) : null,
                                peakBG: peak ? peak.sgv : null, peakAtMin: peak ? Math.round((new Date(peak.dateString) - ms) / 60000) : null,
+                               postPeakNadirBG: postPeakNadir ? postPeakNadir.sgv : null, postPeakNadirAtMin: postPeakNadir ? Math.round((postPeakNadirMs - ms) / 60000) : null,
+                               fallTruncatedAt: fallTrunc ? { time: new Date(fallTrunc.at).toISOString(), atMin: Math.round((fallTrunc.at - ms) / 60000), kind: fallTrunc.t.carbs > 0 ? 'carb_entry' : 'bolus',
+                                                             grams: fallTrunc.t.carbs > 0 ? fallTrunc.t.carbs : null, units: fallTrunc.t.insulin > 0 ? fallTrunc.t.insulin : null } : null,
                                bgAtMin180: readingNear(ms + 180 * 60000), bgAtMin240: readingNear(ms + 240 * 60000), readingsInWindow: win.length, gapsInWindow,
                                windowMin: [-180, 240] },
                     insulin: { iobAtEvent: iob.value ?? null, iobSource: iob.value == null ? null : 'openaps.iob (before-record)', iobRecordAgeMin: iob.ageMinutes ?? null,
                                netIobAtNadir, basalIobAtNadir,
                                bolusUnits: lastBolus ? lastBolus.insulin : null, bolusTime: lastBolus ? new Date(lastBolus.created_at).toISOString() : null, bolusCount: boluses.length,
-                               mealBolus: mealBolus ? { time: new Date(mealBolus.created_at).toISOString(), units: mealBolus.insulin, excludedFromCorrections: true } : null,
+                               mealBolus: mealBolus ? { time: new Date(mealBolus.created_at).toISOString(), units: mealBolus.insulin, excludedFromCorrections: inWindow(mealBolus) } : null,
+                               mealBoluses: pairs.map(p => ({ carbEntryTime: new Date(p.entry.created_at).toISOString(), grams: p.entry.carbs,
+                                                              time: p.bolus ? new Date(p.bolus.created_at).toISOString() : null, units: p.bolus ? p.bolus.insulin : null,
+                                                              excludedFromCorrections: p.bolus ? inWindow(p.bolus) : false })),
+                               mealBolusRule: 'first non-SMB bolus in [−2, +90] min of each carb entry (_decomposeSMBs upfront rule); excluded from corrections by exact identity when inside [−180, 0]',
                                smbUnitsInWindow: parseFloat(smbs.reduce((a, t) => a + t.insulin, 0).toFixed(3)), correctionUnitsInWindow: parseFloat(corrUnits.toFixed(3)), correctionCount: corrections.length,
                                corrections: corrections.map(t => ({ time: new Date(t.created_at).toISOString(), units: t.insulin })) },
-                    carbs: { grams: govCarb ? govCarb.carbs : null, entryTime: govCarb ? new Date(govCarb.created_at).toISOString() : null,
-                             cobAtEvent: cobRead.value, cobSource: cobRead.source, minsFromCarbEntryToEvent: govCarb ? Math.round((ms - new Date(govCarb.created_at)) / 60000) : null },
+                    carbs: { grams: episode.length ? episode.reduce((a, c) => a + c.carbs, 0) : null,
+                             entryTime: episode.length ? new Date(episode[0].created_at).toISOString() : null,
+                             latestEntryTime: govCarb ? new Date(govCarb.created_at).toISOString() : null,
+                             entries: pairs.map(p => { const e = ledgerEntryAt(crS, new Date(p.entry.created_at)); return { time: new Date(p.entry.created_at).toISOString(), grams: p.entry.carbs,
+                                 cr: e ? { time: e.time, value: e.value } : null, expectedUnits: (e && e.value > 0) ? p.entry.carbs / e.value : null,
+                                 mealBolus: p.bolus ? { time: new Date(p.bolus.created_at).toISOString(), units: p.bolus.insulin } : null }; }),
+                             episodeRule: 'consecutive carb entries with no readable COB record at zero between them (loop COB is the boundary, not a clock); no readable record between two entries → same episode',
+                             cobAtEvent: cobRead.value, cobSource: cobRead.source,
+                             minsFromCarbEntryToEvent: episode.length ? Math.round((ms - new Date(episode[0].created_at)) / 60000) : null,
+                             minsFromLatestEntryToEvent: govCarb ? Math.round((ms - new Date(govCarb.created_at)) / 60000) : null },
                     plan,
                     governingAtEventTime: { basal: ledgerEntryAt(basalS, evDate), isf: ledgerEntryAt(isfS, evDate), cr: ledgerEntryAt(crS, evDate),
                                             targetBG: (() => { const t = ledgerEntryAt((schedules?.targetBG || []).map(x => ({ time: x.time, value: x.midpoint ?? x.targetLow })), evDate); return t ? t.value : CONFIG.targetBG; })() },
@@ -2963,7 +3069,7 @@
                         basal: { method: 'inverse of basalEffectWindow', lag: { minH: CONFIG.basalEffectLagH[0], maxH: CONFIG.basalEffectLagH[1], source: 'CONFIG.basalEffectLagH', basis: 'ASSERTED — not measured. See lagProvenance.' },
                                  blocks: ledgerBasalCandidates(basalS, evDate) },
                         cr:  { method: 'getCRForTime at each carb entry timestamp', lag: null,
-                               blocks: (govCarb ? [govCarb] : []).map(c => { const e = ledgerEntryAt(crS, new Date(c.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs }; }) },
+                               blocks: episode.map(c => { const e = ledgerEntryAt(crS, new Date(c.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs }; }) },
                         isf: { method: 'getISFForTime at each correction timestamp', lag: null,
                                blocks: corrections.map(t => { const e = ledgerEntryAt(isfS, new Date(t.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, correctionTime: new Date(t.created_at).toISOString(), units: t.insulin }; }) }
                     },
@@ -3066,7 +3172,7 @@
             'directionWiring', 'informationalFindings', 'delta', 'recommendation'];
         const toMeasurementOnlyExport = (structured, ctx) => {
             if (!structured || typeof structured !== 'object') return structured;
-            const { eventLedger, eventCensus } = buildEventLedger({ findings: ctx.findings, suppressed: ctx.suppressed, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules });
+            const { eventLedger, eventCensus } = buildEventLedger({ findings: ctx.findings, findingsBasis: ctx.findingsBasis, suppressed: ctx.suppressed, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules });
             const safetyFacts = buildSafetyFacts({ eventLedger, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, agp7day: ctx.agp7day,
                                                    periods: ctx.periods, analysisWindowDays: ctx.analysisWindowDays });
             const meta = { ...(structured.meta || {}) };
@@ -5258,6 +5364,9 @@
             if (status.openaps?.iob?.iob != null) return 'openaps_net';
             return null;
         };
+        // DEF-226 (v4.0.2): `now` is the data fetch time at both export sites, not the Copy
+        // click — every other field is as-of the fetch, and a Copy pressed more than
+        // IOB_LOOKUP_WINDOW_MS after it read `no_record_in_window` against a record that was there.
         const currentIOBDiagnostic = (deviceStatus, now = new Date()) => {
             const asOf = now.toISOString();
             const r = lookupIOB(deviceStatus, now, { direction: 'before' });
@@ -7168,6 +7277,7 @@
                     // v3.6.00: the bound and the verdict replace the point estimate.
                     deliveredUpperBound, budgetRatioUpper, budgetVerdict,
                     budgetDeterminate, bolusesInWindow, budgetRatioLegacy,
+                    upfrontBolusEntry: upfrontBolusEntry || null,
                     correctionTotal, cat1SMBs, cat2SMBs, cat3SMBs,
                     cat1Total, cat2Total, cat3Total,
                     peakBG, peakTime, corrections
@@ -9488,6 +9598,31 @@
                             + 'Declared only — nothing reads this.'
                     };
                     // [FASTED-POP-END]
+                    // [FASTED-ON-SPLIT-START] v4.0.2 (DEF-224). The same fasted rule over the
+                    // SPLIT (effective) population, so "post-change AND fasted" is readable. On
+                    // Sep 15 Morning's split kept 16 windows from one day and none was fasted;
+                    // the split median was a post-breakfast tail reported at severity 0.95.
+                    // Declared only — nothing reads this.
+                    const effectiveFastedWindows = effectiveWindows.filter(w => {
+                        const at = w.time.getTime();
+                        const cutoff = at - FASTED_LOOKBACK_MS;
+                        return !fastedTreatments.some(ms => ms > cutoff && ms <= at);
+                    });
+                    const effectiveFastedByDate = {};
+                    effectiveFastedWindows.forEach(w => { if (w.date) effectiveFastedByDate[w.date] = (effectiveFastedByDate[w.date] || 0) + 1; });
+                    const effectiveFastedDeviations = effectiveFastedWindows.map(w => w.deviation).sort((a, b) => a - b);
+                    fastedPopulation.onSplitPopulation = {
+                        splitApplied: splitApplied === true,
+                        candidateWindows: effectiveWindows.length,
+                        windowCount: effectiveFastedWindows.length,
+                        dayCount: Object.keys(effectiveFastedByDate).length,
+                        dates: Object.keys(effectiveFastedByDate).sort(),
+                        windowsByDate: effectiveFastedByDate,
+                        medianDeviation: effectiveFastedDeviations.length ? medianOf(effectiveFastedDeviations) : null,
+                        shareOfSplit: effectiveWindows.length > 0 ? parseFloat((effectiveFastedWindows.length / effectiveWindows.length).toFixed(4)) : null,
+                        note: 'the fasted rule over the split (effective) population; a split median whose fasted windowCount is 0 is not a fasting signal'
+                    };
+                    // [FASTED-ON-SPLIT-END]
                     // [COB-GATE-REPORT-START] v3.6.31 (DEF-172 switch; PM condition 2). The
                     // v3.6.30 parallel population (cobFiltered) IS the population now, so the
                     // emission inverts: this block carries the gate's cost and the population
@@ -10204,6 +10339,9 @@
         // OUTPUT FORMATTER
         // =========================================================================
         
+        // DEF-223 (v4.0.2): the problem-hour LOWS threshold, named once. The instructions read
+        // agp.problemHourRule.lowsThresholdPct rather than carrying the number.
+        const PROBLEM_HOUR_LOWS_THRESHOLD_PCT = 4;
         const OutputFormatter = {
             // Period-to-hours mapping (shared constant)
             PERIOD_HOURS: {
@@ -11365,7 +11503,8 @@
                 // v4.0.0: both emitters finish their object and hand it to the boundary; the
                 // transform is the ONLY place the flag is read on the export path.
                 const measurementCtx = () => ({
-                    findings: analysisResults?.findings || [],
+                    findings: analysisResults?.rawFindings ?? analysisResults?.findings ?? [],
+                    findingsBasis: analysisResults?.rawFindings ? 'pre_aggregation' : 'aggregated_fallback',
                     suppressed: Array.isArray(PatternDetectors.lastIsfInducedLowSuppressed) ? PatternDetectors.lastIsfInducedLowSuppressed : [],
                     nightscoutData: analysisResults?.nightscoutData,
                     schedules, agp7day,
@@ -11377,7 +11516,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.0.1',
+                            version: '4.0.3',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -11467,7 +11606,7 @@
                         // section; an unavailable history DECLARES rather than emitting [].
                         monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
                         appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal) : UNAVAILABLE('appliedBasalDelta'),
-                        currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus)
+                        currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date())
                     });
                 }
                 
@@ -11824,6 +11963,10 @@
                 }));
                 
                 // Build problem hours from AGP
+                // DEF-223 (v4.0.2): LOWS at > 4 % below 70 — the instructions' canon and the
+                // bimodal gate's figure — computed from the unrounded hourly value that
+                // safetyFacts.hourlyLowMass carries, and emitted unrounded beside the flag so the
+                // two never disagree (hour 8 read `lowPct 5, LOW_TIR` at 4.94 % under `> 5`).
                 const problemHours = [];
                 if (agp7day?.hourlyStats) {
                     agp7day.hourlyStats.forEach((stats, hour) => {
@@ -11831,14 +11974,14 @@
                         const totalLow = stats.tir.low + stats.tir.veryLow;
                         const totalHigh = stats.tir.high + stats.tir.veryHigh;
                         let flag = null;
-                        if (totalLow > 5) flag = 'LOWS';
+                        if (totalLow > PROBLEM_HOUR_LOWS_THRESHOLD_PCT) flag = 'LOWS';
                         else if (stats.tir.inRange < 70) flag = 'LOW_TIR';
                         if (flag) {
                             problemHours.push({
                                 hour,
                                 tir: Math.round(stats.tir.inRange),
                                 highPct: Math.round(totalHigh),
-                                lowPct: Math.round(totalLow),
+                                lowPct: totalLow,
                                 mean: Math.round(stats.mean),
                                 flag
                             });
@@ -11882,7 +12025,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.0.1',
+                        version: '4.0.3',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12039,7 +12182,7 @@
                     monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
                     appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal) : UNAVAILABLE('appliedBasalDelta'),
                     // v3.5.91: run-time IOB vs the pill — verification aid, no consumer
-                    currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus),
+                    currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date()),
                     informationalFindings: (analysisResults.findings || [])
                         .filter(f => f.type === FindingType.DAWN_CORRECTION_PATTERN)
                         .map(f => ({
@@ -12110,7 +12253,8 @@
                             delta: trend48hDelta,
                             problemHoursDelta: problemHoursDelta
                         } : null,
-                        problemHours
+                        problemHours,
+                        problemHourRule: { lowsThresholdPct: PROBLEM_HOUR_LOWS_THRESHOLD_PCT, lowsBasis: 'lowPct (below 70, unrounded) > lowsThresholdPct → LOWS; else inRange < 70 → LOW_TIR' }
                     },
                     recentChanges: ChangeRecord.available() ? {
                         autoDetected: (detectedChanges || []).map(c => ({
@@ -16094,6 +16238,10 @@
 
                     setAnalysisResults({
                         findings: aggregatedFindings,
+                        // DEF-228 (v4.0.3): the detectors' output BEFORE aggregateFindings folds it
+                        // one-per-(type, slot). The measurement layer reads this list; the engine
+                        // and the screen keep reading `findings`.
+                        rawFindings: allFindings.slice(),
                         signalAnalysis,
                         lowCount: lowProblems.length,
                         nightscoutData,
@@ -17162,7 +17310,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.0.1 — measurement-only export · DEF-216 midnight window · DEF-217 local recurrence · DEF-218 own-bolus exclusion + per-correction ISF</p>
+                                    <p className="text-gray-400 text-sm">v4.0.3 — measurement-only export · DEF-228 ledger reads the detectors' pre-aggregation output (one record per event, not per slot) · v4.0.2 fixes DEF-220…226 underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the Copy carries no bundles, priorities or recommended values — the engine still runs and still logs to the sheet. Press ⬇ Raw fetch before copying.
