@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.0.5</title>
+    <title>Daily Insulin Settings Review v4.1.0</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2912,13 +2912,14 @@
             const treatments = nightscoutData?.treatments || [];
             const deviceStatus = nightscoutData?.deviceStatus || [];
             const basalS = schedules?.basal || [], crS = schedules?.cr || [], isfS = schedules?.isf || [];
-            const census = { detectedByType: {}, droppedAsSignal: 0, droppedAsStructural: 0, dedupedDuplicates: 0, emittedRecords: 0, unclassified: 0,
+            const census = { emittedByType: {}, droppedAsSignalByType: {}, droppedAsSignal: 0, droppedAsStructural: 0, dedupedDuplicates: 0, emittedRecords: 0, unclassified: 0,
                              fromSuppressedGate: 0,
                              // DEF-228 (v4.0.3): which list this ledger was built from. aggregateFindings keeps
                              // one finding per (type, slot, parameter) — the first inserted — so a ledger
                              // built from `findings` sees one event per slot, the newest, and last night's
                              // record vanishes when tonight's arrives. pre_aggregation is the detectors' output.
                              inputBasis: findingsBasis,
+                             byTypeBasis: 'emittedByType keys the four observable types over the records that reached the ledger; droppedAsSignalByType keys the FINDING type, because a dropped signal has no observable type (DEF-246)',
                              note: 'detected − droppedAsSignal − droppedAsStructural − dedupedDuplicates === emittedRecords' };
             // The DEF-193 gate withholds isf_induced_low from `findings` when IOB at nadir is
             // negative. That is a judgement about cause; the record it withholds carries facts
@@ -2937,12 +2938,19 @@
             let detected = 0;
             (findings || []).concat(suppressedInputs).forEach(f => {
                 if (!f || !f.type) return;
-                if (LEDGER_DROPPED_AS_SIGNAL.has(f.type)) { census.droppedAsSignal++; return; }
+                if (LEDGER_DROPPED_AS_SIGNAL.has(f.type)) { census.droppedAsSignal++;
+                    // DEF-246 (v4.1.0): the dropped set carries the same breakdown as the emitted one.
+                    // In a census whose purpose is proving nothing went missing, silence about the 9
+                    // dropped events was indistinguishable from their absence.
+                    // Keyed by the FINDING type, not the four observable types: a dropped signal has
+                    // no observable type by construction (LEDGER_TYPE_OF has no entry for it), so
+                    // four keys of zero would be a breakdown that explains nothing.
+                    census.droppedAsSignalByType[f.type] = (census.droppedAsSignalByType[f.type] || 0) + 1; return; }
                 if (f.type === 'basal_ratio_exceeded') { census.droppedAsStructural++; return; }
                 detected++;
                 if (f.fromSuppressedGate === true) census.fromSuppressedGate++;
                 const type = LEDGER_TYPE_OF[f.type] || 'unclassified_observation';
-                census.detectedByType[type] = (census.detectedByType[type] || 0) + 1;
+                census.emittedByType[type] = (census.emittedByType[type] || 0) + 1;
                 const evDate = ledgerParseTime(f.eventTime) || ledgerParseTime(f.events?.[0]?.time) || ledgerParseTime(f.detectedAt);
                 const gaps = [];
                 if (!ledgerParseTime(f.eventTime)) gaps.push('eventTime taken from ' + (ledgerParseTime(f.events?.[0]?.time) ? 'events[0].time' : 'detectedAt'));
@@ -2998,13 +3006,33 @@
                 // manual correction in its place).
                 const episode = ledgerMealEpisode(govCarb, treatments, deviceStatus);
                 const pairs = ledgerPairMealBoluses(episode, treatments);
-                const pairedBoluses = pairs.map(p => p.bolus).filter(Boolean);
                 const sameRecord = (a, b) => new Date(a.created_at).getTime() === new Date(b.created_at).getTime() && a.insulin === b.insulin;
                 const inWindow = (t) => { const at = new Date(t.created_at).getTime(); return at >= ms - 180 * 60000 && at <= ms; };
+                // DEF-238 (v4.1.0): the exclusion set is WINDOW-scoped, not episode-scoped. A meal
+                // bolus paired to a DIFFERENT episode inside [−180, 0] survived isTrueCorrection and
+                // scored as a correction — one bolus classified two ways in two records 95 min apart.
+                // A bolus inside the window can only pair with a carb entry in [−270, 0] (the pairing
+                // rule is [−2, +90] of the entry), so pairing that span and keeping the pairs whose
+                // BOLUS lands in the window is the complete set, with nothing inferred. One call
+                // preserves ledgerPairMealBoluses' one-bolus-one-entry rule across the whole span.
+                const windowCarbEntries = treatments.filter(t => t && t.created_at && t.carbs > 0
+                        && new Date(t.created_at).getTime() <= ms && new Date(t.created_at).getTime() >= ms - 270 * 60000)
+                    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+                const windowPairs = ledgerPairMealBoluses(windowCarbEntries, treatments).filter(p => p.bolus && inWindow(p.bolus));
+                const pairedBoluses = windowPairs.map(p => p.bolus);
+                const sameEntry = (a, b) => new Date(a.created_at).getTime() === new Date(b.created_at).getTime() && a.carbs === b.carbs;
                 const govPair = pairs.length ? pairs[pairs.length - 1] : null;
                 const mealBolus = govPair && govPair.bolus ? govPair.bolus : null;
-                const corrections = insulinInWindow.filter(t => isTrueCorrection(t, treatments, crS))
-                    .filter(t => !pairedBoluses.some(b => sameRecord(t, b)));
+                const correctionCandidates = insulinInWindow.filter(t => isTrueCorrection(t, treatments, crS));
+                const corrections = correctionCandidates.filter(t => !pairedBoluses.some(b => sameRecord(t, b)));
+                // The exclusion set itself, enumerated — auditable, not inferred. removedFromCorrections
+                // says whether this bolus is one isTrueCorrection would otherwise have scored: false
+                // means the exclusion and the classifier agree, and only the classifier was needed.
+                const excludedFromCorrections = windowPairs.map(p => ({
+                    time: new Date(p.bolus.created_at).toISOString(), units: p.bolus.insulin,
+                    carbEntryTime: new Date(p.entry.created_at).toISOString(), grams: p.entry.carbs,
+                    inGoverningEpisode: (episode || []).some(e => sameEntry(e, p.entry)),
+                    removedFromCorrections: correctionCandidates.some(t => sameRecord(t, p.bolus)) }));
                 const recAtEvent = findDeviceStatusAt(deviceStatus, evDate, { direction: 'before' });
                 const cobRead = recAtEvent ? extractCOB(recAtEvent) : { value: null, source: null };
                 const plan = ledgerEpisodePlan(episode, pairs, treatments, crS);
@@ -3059,7 +3087,7 @@
                     fallBasis: 'peak → post-peak nadir (glucose.postPeakNadirBG), truncated at the next non-SMB bolus or carb entry after the peak (glucose.fallTruncatedAt); null when no reading follows the peak',
                     fallWindowMin: peak ? [Math.round((peakMs - ms) / 60000), Math.round((fallEndMs - ms) / 60000)] : null,
                     smbUnitsPeakToNadir,
-                    note: 'true corrections in [−180, 0] min, excluding the episode\'s paired meal boluses (insulin.mealBoluses), against the peak→post-peak-nadir fall; declared only, no threshold' };
+                    note: 'true corrections in [−180, 0] min, excluding every paired meal bolus whose bolus falls in that window (insulin.excludedFromCorrections), against the peak→post-peak-nadir fall; declared only, no threshold' };
                 const record = {
                     type, eventTime: evDate.toISOString(), hour: evDate.getHours(), period: ledgerPeriodOf(evDate),
                     threshold: type === 'hypo' ? { kind: 'bg_below', value: CONFIG.lowThreshold } : (type === 'hyper' || type === 'meal') ? { kind: 'bg_above', value: CONFIG.highThreshold }
@@ -3081,7 +3109,9 @@
                                                               excludedFromCorrections: p.bolus ? inWindow(p.bolus) : false })),
                                mealBolusRule: 'first non-SMB bolus in [−2, +90] min of each carb entry (_decomposeSMBs upfront rule); excluded from corrections by exact identity when inside [−180, 0]',
                                smbUnitsInWindow: parseFloat(smbs.reduce((a, t) => a + t.insulin, 0).toFixed(3)), correctionUnitsInWindow: parseFloat(corrUnits.toFixed(3)), correctionCount: corrections.length,
-                               corrections: corrections.map(t => ({ time: new Date(t.created_at).toISOString(), units: t.insulin })) },
+                               corrections: corrections.map(t => ({ time: new Date(t.created_at).toISOString(), units: t.insulin })),
+                               excludedFromCorrections,
+                               exclusionBasis: 'every paired meal bolus whose bolus falls in [−180, 0], episode-independent (DEF-238); inGoverningEpisode false is a bolus from another episode inside the window' },
                     carbs: { grams: episode.length ? episode.reduce((a, c) => a + c.carbs, 0) : null,
                              entryTime: episode.length ? new Date(episode[0].created_at).toISOString() : null,
                              latestEntryTime: govCarb ? new Date(govCarb.created_at).toISOString() : null,
@@ -3132,6 +3162,18 @@
         // [SAFETY-FACTS-START] v4.0.0 (§5). No window model: the ingredients, unjoined.
         const buildSafetyFacts = ({ eventLedger, nightscoutData, schedules, agp7day, periods, analysisWindowDays }) => {
             const hs = agp7day?.hourlyStats || {};
+            // DEV-l (v4.1.0, PM-accepted Sep 18): declare-only. calculateAGP's window runs
+            // midnight-to-midnight and INCLUDES today's partial day, so every clock hour later than
+            // the fetch hour is computed from one fewer day than every hour before it — and the
+            // boundary moves with the time of day the owner presses Fetch. Rule 1 is a safety gate
+            // on hourly low mass, so an overnight hour can be a day thinner than a morning hour with
+            // nothing saying so. The windowing is NOT changed here; the count is declared beside the
+            // denominator so the reader can see it. Counted over the SAME population as `readings`.
+            const DAYS_CONTRIBUTING_BASIS = 'distinct local dates contributing to this hour over the same population as readings (DEV-l); calculateAGP\'s window is midnight-to-midnight and includes today\'s partial day, so hours later than the fetch hour carry one fewer day — declared, not corrected';
+            const agpDaysByHour = Array.from({ length: 24 }, (_, h) => {
+                const st = hs[h] || null;
+                return st && Number.isFinite(st.daysContributing) ? st.daysContributing : null;
+            });
             const hourlyLowMass = [];
             // DEF-234 (v4.0.4): the near-low tier, 70–80 inclusive, DECLARE ONLY — owner-ruled
             // "a 79 should not block". Both bounds already exist (70 is Rule 1's low, 80 the
@@ -3149,8 +3191,10 @@
                 // lowPct here is BELOW 70 (low + veryLow), the figure the bimodal gate compared to 4%.
                 const nb = nearLowByHour[h];
                 hourlyLowMass.push(st ? { hour: h, lowPct: (Number(st.tir?.low) || 0) + (Number(st.tir?.veryLow) || 0), veryLowPct: st.tir?.veryLow ?? null, tir: st.tir?.inRange ?? null, mean: st.mean ?? null, readings: st.count ?? null,
+                                          daysContributing: agpDaysByHour[h], daysContributingBasis: DAYS_CONTRIBUTING_BASIS,
                                           nearLowPct: nb.n > 0 ? (nb.near / nb.n) * 100 : 0, nearLowReadings: nb.near, nearLowBasis: '70 ≤ sgv ≤ 80 over the trace\'s readings in this local hour within analysisWindowDays; declared only, no gate reads it' }
                                       : { hour: h, lowPct: null, veryLowPct: null, tir: null, mean: null, readings: 0,
+                                          daysContributing: agpDaysByHour[h], daysContributingBasis: DAYS_CONTRIBUTING_BASIS,
                                           nearLowPct: nb.n > 0 ? (nb.near / nb.n) * 100 : 0, nearLowReadings: nb.near, nearLowBasis: '70 ≤ sgv ≤ 80 over the trace\'s readings in this local hour within analysisWindowDays; declared only, no gate reads it' });
             }
             const spansOf = (param, sched) => {
@@ -3215,9 +3259,46 @@
                 return { rapidRecovery, isolated, gapsNearEvent, readingsNearEvent: near.length, shapeFlagged };
             };
             const LOW_SHAPE_RULE = 'shapeFlagged = rapidRecovery (a reading > 90 within 20 min after the low) && isolated (no reading ≤ 70 between 5 and 45 min of it) && gapsNearEvent === 0 (no interval > 7.5 min in ±45 min); no nadir threshold (DEF-232) — declared only, no gate reads it';
+            // DEF-241 (v4.1.0): every low event names the blocks that could have produced it, not
+            // just the three that reached the ledger. Rule 1 joins hourly low mass to a parameter's
+            // own clock span, and a completion crash lands in the NEXT block's span — by the letter
+            // the rule then permits strengthening the block that just produced a 53. Same two
+            // constructions the ledger already declares (ledgerBasalCandidates, ledgerMealEpisode
+            // + getCRForTime); lag semantics carried by reference to meta.lagProvenance, not copied.
+            const sfTreatments = nightscoutData?.treatments || [];
+            const sfBasal = schedules?.basal || [], sfCr = schedules?.cr || [];
+            const lowCandidateBlocks = (evDate) => {
+                const carbEntries = sfTreatments.filter(t => t && t.created_at && t.carbs > 0
+                        && new Date(t.created_at).getTime() <= evDate.getTime()
+                        && new Date(t.created_at).getTime() >= evDate.getTime() - 6 * 3600000)
+                    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+                const govCarb = carbEntries[0] || null;
+                const episode = ledgerMealEpisode(govCarb, sfTreatments, nightscoutData?.deviceStatus || []);
+                // Where this event IS ledgered, the ledger's cr attribution wins: its governing entry
+                // comes from the finding (governingMealTime), which this path cannot see. Two fields
+                // in one export naming different blocks for the same event is the defect class this
+                // build is closing, not one to introduce.
+                const ledgered = (eventLedger || []).find(r => r && r.eventTime === evDate.toISOString() && r.candidateBlocks);
+                if (ledgered) return { ...ledgered.candidateBlocks, isf: null,
+                    isfOmittedReason: 'out of scope (DEF-241, v4.1.0): corrections-in-window attribution is a separate question and was not started',
+                    crOmittedReason: ledgered.candidateBlocks.cr ? null : 'no governing carb entry',
+                    basis: 'carried from eventLedger[].candidateBlocks for the same event — one attribution, not two' };
+                return {
+                    basal: { method: 'inverse of basalEffectWindow', lag: { minH: CONFIG.basalEffectLagH[0], maxH: CONFIG.basalEffectLagH[1], source: 'CONFIG.basalEffectLagH', basis: 'ASSERTED — not measured. See meta.lagProvenance.' },
+                             blocks: ledgerBasalCandidates(sfBasal, evDate) },
+                    cr: govCarb ? { method: 'getCRForTime at each carb entry timestamp of the governing episode', lag: null,
+                                    blocks: episode.map(c => { const en = ledgerEntryAt(sfCr, new Date(c.created_at)); return { time: en ? en.time : null, value: en ? en.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs }; }) }
+                                 : null,
+                    crOmittedReason: govCarb ? null : 'no governing carb entry',
+                    isf: null,
+                    isfOmittedReason: 'out of scope (DEF-241, v4.1.0): corrections-in-window attribution for non-ledgered lows is a separate question and was not started',
+                    basis: 'same constructions as eventLedger[].candidateBlocks; this event is not ledgered, so the governing carb entry is the latest entry within 6 h before it; episode rule and lag provenance by reference, not by copy'
+                };
+            };
             const lows = lowEvents.map(e => { const rec = findDeviceStatusAt(nightscoutData?.deviceStatus || [], new Date(e.time), { direction: 'before' }); const shape = lowShape(e);
                 return { time: new Date(e.time).toISOString(), bg: e.bg, hour: new Date(e.time).getHours(), netIob: rec ? extractIOB(rec) : null, basalIob: rec ? extractBasalIOB(rec) : null, treatmentCarbsImputed: null,
-                         rapidRecovery: shape.rapidRecovery, isolated: shape.isolated, gapsNearEvent: shape.gapsNearEvent, readingsNearEvent: shape.readingsNearEvent, shapeFlagged: shape.shapeFlagged, readingsInEvent: e.readings.length }; });
+                         rapidRecovery: shape.rapidRecovery, isolated: shape.isolated, gapsNearEvent: shape.gapsNearEvent, readingsNearEvent: shape.readingsNearEvent, shapeFlagged: shape.shapeFlagged, readingsInEvent: e.readings.length,
+                         candidateBlocks: lowCandidateBlocks(new Date(e.time)) }; });
             // hourlyLowMass's second figure: lowPct with the shape-flagged events' own readings removed
             // from the low count, over the same hourly denominator (calculateAGP's count); emitted on
             // every hour, equal or not (DEF-183 — silence must not read as agreement).
@@ -3254,6 +3335,20 @@
             if (Array.isArray(meta.isfInducedLowSuppressed)) {
                 meta.isfInducedLowSuppressed = meta.isfInducedLowSuppressed.map(r => (r && typeof r === 'object' && 'scheduleTime' in r) ? { ...r, scheduleTime: null } : r);
             }
+            // DEF-243 (v4.1.0): the header is a contract about what follows — "no bundles,
+            // priorities, severities, recommended values, or detector classifications" — and
+            // retentionCensus was carrying severities, five pre-v4.0.0 detector classes and the
+            // engine judgement `no_lever`. v4.0.0's transform ran over the emitted record set;
+            // stateFlipAudit is assembled separately in meta and was never walked. Stripped here,
+            // at the boundary, so flag-off stays byte-identical and the internal census (which the
+            // register's own tests read) is untouched. state, retainedCount, lowestBG are facts.
+            // Expression form, not a branch: INSTR5-T8's invariant is that nothing in this file
+            // reads the audit inside a condition. A boundary strip is not a decision, and the
+            // invariant is kept literally rather than relaxed.
+            const retentionFactsOnly = ({ bySeverity, byType, byRetentionReason, ...facts }) => facts;
+            meta.stateFlipAudit = meta.stateFlipAudit?.retentionCensus
+                ? { ...meta.stateFlipAudit, retentionCensus: retentionFactsOnly(meta.stateFlipAudit.retentionCensus) }
+                : meta.stateFlipAudit;
             meta.measurementOnly = true;
             // §12d: an observable, not a reminder. false is a value and is emitted as one.
             meta.rawCaptureTaken = ctx.rawCaptureTaken === true;
@@ -3301,19 +3396,38 @@
         // dashboard header, this paste header, the auto-log row's Notes — not in meta.
         const historyAgeLabel = (ageHours) => Number.isFinite(ageHours) ? ageHours.toFixed(1) : '?';
         const historyCachedFirstLine = (source, ageHours) => source === 'persisted_cache' ? 'HISTORY: CACHED, ' + historyAgeLabel(ageHours) + ' h old' : null;
+        // DEF-242 (v4.1.0): staleness is measured at Copy time and declared in the PASTE header —
+        // the owner works from the Copy output, not the dashboard (owner, Sep 18). Declared, never
+        // refused: a stale copy is exactly how this export reaches the engineering desk, and
+        // blocking it would close the channel that caught the defect.
+        const pageAgeHoursOf = (dataFetchedAt, at = new Date()) => {
+            const f = dataFetchedAt ? new Date(dataFetchedAt).getTime() : NaN;
+            const t = at instanceof Date ? at.getTime() : new Date(at).getTime();
+            return (Number.isFinite(f) && Number.isFinite(t)) ? (t - f) / 3600000 : null;
+        };
+        const dataAgeFirstLine = (dataFetchedAt, pageAgeHours) => {
+            if (!Number.isFinite(pageAgeHours) || !(pageAgeHours > 1)) return null;
+            const f = new Date(dataFetchedAt);
+            const hh = String(f.getHours()).padStart(2, '0'), mm = String(f.getMinutes()).padStart(2, '0');
+            return 'DATA AGE: fetched ' + pageAgeHours.toFixed(1) + ' h ago (' + hh + ':' + mm + ' local) — this page has not re-read Nightscout';
+        };
         const formatMeasurementOnlyHeader = (exp) => {
             const m = exp?.meta || {};
             const c = m.eventCensus || {};
-            const byType = Object.entries(c.detectedByType || {}).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
+            const fmtByType = (o) => Object.entries(o || {}).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
+            const emittedByType = fmtByType(c.emittedByType);
+            const droppedByType = fmtByType(c.droppedAsSignalByType);
             const cached = historyCachedFirstLine(exp?.historySource, exp?.historyAgeHours);
-            return (cached ? cached + '\n\n' : '') + '# MEASUREMENT-ONLY EXPORT — v' + (m.version || '?') + '\n\n'
+            const dataAge = dataAgeFirstLine(m.dataFetchedAt, m.pageAgeHours);
+            return (dataAge ? dataAge + '\n\n' : '') + (cached ? cached + '\n\n' : '') + '# MEASUREMENT-ONLY EXPORT — v' + (m.version || '?') + '\n\n'
                 + '_This build emits what the tool measured. It carries no bundles, priorities, severities, recommended values, '
                 + 'or detector classifications. Read `eventLedger`, `safetyFacts` and `signals.periods` under the measurement-only '
                 + 'clinical instructions; the basal effect lag in `candidateBlocks.basal` is asserted, not measured (`meta.lagProvenance`)._\n\n'
                 + '- Raw capture taken this page load: **' + (m.rawCaptureTaken === true ? 'YES' : 'NO — press ⬇ Raw fetch before pasting; T1/close condition 3 cannot run without it') + '**\n'
                 + '- Data fetched at: ' + (m.dataFetchedAt || 'unknown') + '\n'
-                + '- Event census: detected ' + (c.detected ?? '?') + ' → ' + byType + '; dropped as signal ' + (c.droppedAsSignal ?? '?')
-                + ', structural ' + (c.droppedAsStructural ?? '?') + ', deduplicated ' + (c.dedupedDuplicates ?? '?') + '; emitted ' + (c.emittedRecords ?? '?') + '\n'
+                + '- Event census: detected ' + (c.detected ?? '?') + '; emitted ' + (c.emittedRecords ?? '?') + ' → ' + emittedByType + '\n'
+                + '- Dropped: as signal ' + (c.droppedAsSignal ?? '?') + ' → ' + droppedByType
+                + '; structural ' + (c.droppedAsStructural ?? '?') + '; deduplicated ' + (c.dedupedDuplicates ?? '?') + '\n'
                 + '- Body state logged: ' + (m.bodyStateLogged ?? 'unknown') + ' (a fact; not applied as a filter to anything above)\n\n'
                 + formatDecisionLogMarkdown(exp?.decisionLog) + '---\n\n';
         };
@@ -4573,28 +4687,62 @@
             };
             const verdictOf = (ch) => {
                 const i = ch.sessionIndex;
+                // DEF-239 (v4.1.0, owner ruling Sep 18): "compute the low fields on every row and
+                // leave the verdict alone." The windows and their figures are computed BEFORE the
+                // REVERTED / VOIDED / CONFOUNDED branches, which used to return a bare verdict, so
+                // every row carries preDeviation/postDeviation/preLowPct/postLowPct whenever the
+                // windows hold readings. The verdict ladder below is untouched: a populated
+                // preLowPct on a CONFOUNDED row is an observation, not a reclassification.
+                const postEnd = i + LEDGER_POST - 1;
+                const preRows0 = sessions.slice(Math.max(0, i - LEDGER_PRE), i);
+                const postRows0 = sessions.slice(i, i + LEDGER_POST);
+                const measurePeriods0 = (ch.effectPeriods && ch.effectPeriods.length)
+                    ? ch.effectPeriods
+                    : (ch.period ? [ch.period] : []);
+                const figuresOf = (periodName, preR, postR) => {
+                    const pd = preR.map(s => periodName ? s.dev(periodName) : null).filter(v => v !== null);
+                    const qd = postR.map(s => periodName ? s.dev(periodName) : null).filter(v => v !== null);
+                    return {
+                        period: periodName,
+                        preDevs: pd, postDevs: qd,
+                        preLow: meanOf(preR.map(s => periodName ? s.low(periodName) : null)),
+                        postLow: meanOf(postR.map(s => periodName ? s.low(periodName) : null)),
+                        preDeviation: meanOf(pd), postDeviation: meanOf(qd)
+                    };
+                };
+                const lead = figuresOf(measurePeriods0[0] || null, preRows0, postRows0);
+                const omittedReason = (f) => {
+                    if (!f.period) return 'no effect period on this change — the windows have no population to read';
+                    const empties = [f.preLow === null ? 'pre' : null, f.postLow === null ? 'post' : null].filter(Boolean);
+                    return empties.length ? empties.join(' and ') + ' window carries no low-mass row for ' + f.period : null;
+                };
+                const lowFields = {
+                    preDeviation: lead.preDeviation, postDeviation: lead.postDeviation,
+                    preLowPct: lead.preLow, postLowPct: lead.postLow,
+                    lowFieldsBasis: 'computed on every row regardless of verdict (DEF-239, owner ruling Sep 18); a populated preLowPct/postLowPct is an observation, not a verdict',
+                    lowFieldsOmittedReason: omittedReason(lead)
+                };
                 // 1. REVERTED — later opposite-direction touch on the same block
                 const reverted = changes.some(o =>
                     o !== ch && o.param === ch.param && o.block === ch.block &&
                     o.sessionIndex > i && o.sessionIndex - i <= LEDGER_HORIZON &&
                     o.direction !== ch.direction);
-                if (reverted) return { verdict: 'REVERTED' };
+                if (reverted) return { verdict: 'REVERTED', ...lowFields };
                 // 2. VOIDED — strict VOIDS: token within ±3 sessions
                 for (let j = Math.max(0, i - 3); j <= Math.min(sessions.length - 1, i + 3); j++) {
                     if (sessions[j].voids.some(v => v.param === ch.param && v.block === ch.block)) {
-                        return { verdict: 'VOIDED' };
+                        return { verdict: 'VOIDED', ...lowFields };
                     }
                 }
                 // 3. CONFOUNDED — same-period sibling change in the post window, or override post-row
-                const postEnd = i + LEDGER_POST - 1;
                 const confounder = changes.find(o =>
                     o !== ch && o.period === ch.period && ch.period != null &&
                     o.sessionIndex >= i && o.sessionIndex <= postEnd);
                 if (confounder) {
-                    return { verdict: 'CONFOUNDED', confounder: `${confounder.param}@${confounder.block} (${confounder.date})` };
+                    return { verdict: 'CONFOUNDED', confounder: `${confounder.param}@${confounder.block} (${confounder.date})`, ...lowFields };
                 }
                 for (let j = i; j <= Math.min(sessions.length - 1, postEnd); j++) {
-                    if (sessions[j].isOverride) return { verdict: 'CONFOUNDED', confounder: `override session ${sessions[j].date}` };
+                    if (sessions[j].isOverride) return { verdict: 'CONFOUNDED', confounder: `override session ${sessions[j].date}`, ...lowFields };
                 }
                 // [LEDGER-BASIS-CONFOUND-START] v3.6.32 (DEF-178).
                 {
@@ -4602,29 +4750,18 @@
                     const bases = [...new Set(win.map(s => s.basis))];
                     if (bases.length > 1) {
                         const first = win.find(s => s.basis !== win[0].basis);
-                        return { verdict: 'CONFOUNDED', confounder: `population basis change ${bases.join(' → ')} at session ${first ? first.date : '?'} (DEF-178)` };
+                        return { verdict: 'CONFOUNDED', confounder: `population basis change ${bases.join(' → ')} at session ${first ? first.date : '?'} (DEF-178)`, ...lowFields };
                     }
                 }
                 // [LEDGER-BASIS-CONFOUND-END]
-                // Windows. Post includes session i — the first day under the change.
-                const preRows = sessions.slice(Math.max(0, i - LEDGER_PRE), i);
-                const postRows = sessions.slice(i, i + LEDGER_POST);
+                // Windows. Post includes session i — the first day under the change. Hoisted above
+                // the early-return branches by DEF-239; these are the same rows.
+                const preRows = preRows0;
+                const postRows = postRows0;
                 // v3.6.02 A2: measure on the EFFECT period. For CR and ISF, effectPeriods
                 // is the clock period, so this is byte-identical to v3.6.01 for them.
-                const measurePeriods = (ch.effectPeriods && ch.effectPeriods.length)
-                    ? ch.effectPeriods
-                    : (ch.period ? [ch.period] : []);
-                const figuresFor = (periodName) => {
-                    const pd = preRows.map(s => periodName ? s.dev(periodName) : null).filter(v => v !== null);
-                    const qd = postRows.map(s => periodName ? s.dev(periodName) : null).filter(v => v !== null);
-                    return {
-                        period: periodName,
-                        preDevs: pd, postDevs: qd,
-                        preLow: meanOf(preRows.map(s => periodName ? s.low(periodName) : null)),
-                        postLow: meanOf(postRows.map(s => periodName ? s.low(periodName) : null)),
-                        preDeviation: meanOf(pd), postDeviation: meanOf(qd)
-                    };
-                };
+                const measurePeriods = measurePeriods0;
+                const figuresFor = (periodName) => figuresOf(periodName, preRows, postRows);
                 // Two periods → the window is indeterminate. Report BOTH and elect
                 // neither, rather than choosing one and reporting it as authoritative.
                 if (measurePeriods.length > 1) {
@@ -4642,7 +4779,8 @@
                         // reads preDeviation/postDeviation without knowing this verdict
                         // still gets a number rather than undefined.
                         preDeviation: byPeriod[0].preDeviation, postDeviation: byPeriod[0].postDeviation,
-                        preLowPct: byPeriod[0].preLow, postLowPct: byPeriod[0].postLow
+                        preLowPct: byPeriod[0].preLow, postLowPct: byPeriod[0].postLow,
+                        lowFieldsBasis: lowFields.lowFieldsBasis, lowFieldsOmittedReason: omittedReason(byPeriod[0])
                     };
                 }
                 const f0 = figuresFor(measurePeriods[0] || null);
@@ -4651,6 +4789,7 @@
                 const metrics = {
                     preDeviation: f0.preDeviation, postDeviation: f0.postDeviation,
                     preLowPct: preLow, postLowPct: postLow,
+                    lowFieldsBasis: lowFields.lowFieldsBasis, lowFieldsOmittedReason: omittedReason(f0),
                     schedulePeriod: ch.schedulePeriod || ch.period || null,
                     effectPeriods: measurePeriods
                 };
@@ -4718,6 +4857,7 @@
                         verdict: v.verdict,
                         preDeviation: v.preDeviation ?? null, postDeviation: v.postDeviation ?? null,
                         preLowPct: v.preLowPct ?? null, postLowPct: v.postLowPct ?? null,
+                        lowFieldsBasis: v.lowFieldsBasis ?? null, lowFieldsOmittedReason: v.lowFieldsOmittedReason ?? null,
                         confounder: v.confounder || null
                     };
                 })
@@ -6647,7 +6787,10 @@
                                     tirBelowThreshold: hourlyAgpStats7d[h].tir < INTRA_PERIOD_TIR_THRESHOLD,
                                     lowPctWithinThreshold: hourlyAgpStats7d[h].lowPct <= INTRA_PERIOD_LOW_THRESHOLD };
                             census.entries.push({
-                                time: entry.time, coveredHours, emitted: independentlyFailing,
+                                // DEV-k (v4.1.0): `emitted` was engine residue. The field reports a
+                                // threshold test whose thresholds are declared in the same object —
+                                // measurement, not judgement — so it is named for what it measures.
+                                time: entry.time, coveredHours, meetsThreshold: independentlyFailing,
                                 qualifyingHour: hourRec(qualifyingHour),
                                 bestHour: independentlyFailing ? null : hourRec(bestHour),
                                 hoursWithoutStats: coveredHours.length - withStats.length
@@ -11617,7 +11760,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.0.5',
+                            version: '4.1.0',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -11627,6 +11770,10 @@
                             bodyStateLogged: bodyState?.state ?? null,
                             // DEF-189 (v3.6.37): pairs this export with the raw-fetch file by the fetch's own timestamp.
                             dataFetchedAt: analysisResults?.nightscoutData?.fetchedAt ?? null,
+                            // DEF-242 (v4.1.0): the PAGE's age, not the sheet's. historyAgeHours is how old
+                            // the history rows are; this is how long ago this page last read Nightscout.
+                            // Two ages, two sources, never again one name.
+                            pageAgeHours: pageAgeHoursOf(analysisResults?.nightscoutData?.fetchedAt ?? null),
                             // DEF-193 Part C (v3.6.36): every isf_induced_low suppression, [] when none;
                             // unavailable only if the detector did not run this session.
                             isfInducedLowSuppressed: Array.isArray(PatternDetectors.lastIsfInducedLowSuppressed)
@@ -11739,10 +11886,10 @@
                     const agpCheck = getAGPCheckForPeriod(period.name);
                     const signalDir = period.medianDeviation < -10 ? 'LOW' : period.medianDeviation > 10 ? 'HIGH' : 'NEUTRAL';
                     if (signalDir === 'LOW' && agpCheck.status === 'HIGH') {
-                        return { type: 'SIGNAL_LOW_AGP_HIGH', recommendation: 'CR/timing issue, NOT basal' };
+                        return { type: 'SIGNAL_LOW_AGP_HIGH' };
                     }
                     if (signalDir === 'HIGH' && agpCheck.status === 'LOW') {
-                        return { type: 'SIGNAL_HIGH_AGP_LOW', recommendation: 'Check for overcorrection cycles or aggressive ISF' };
+                        return { type: 'SIGNAL_HIGH_AGP_LOW' };
                     }
                     return null;
                 };
@@ -12116,18 +12263,21 @@
                 // unavailability — the same "clean subset of evidence" principle that
                 // keeps eventsLast24h and compound-effect arithmetic intact.
                 const basalRatioBlock = analysisResults.basalRatioInfo ? {
+                    // DEF-244 (v4.1.0): cap is null, so exceedsCap had one reachable value and
+                    // blockedRecommendations counted an engine decision. Under measurement-only the
+                    // tool declares the ratio and the instructions own the 3.1:1 threshold. Owner-
+                    // reversible: if the cap belongs in the tool, this inverts to cap: 3.1 with a
+                    // working comparison.
                     value: analysisResults.basalRatioInfo.ratio,
                     cap: analysisResults.basalRatioInfo.cap,
-                    exceedsCap: analysisResults.basalRatioInfo.exceedsCap,
                     maxRate: { value: analysisResults.basalRatioInfo.maxRate, hour: analysisResults.basalRatioInfo.maxHour },
-                    minRate: { value: analysisResults.basalRatioInfo.minRate, hour: analysisResults.basalRatioInfo.minHour },
-                    blockedRecommendations: bundles.filter(b => b.blockedBy && b.blockedBy.includes('basal ratio')).length
+                    minRate: { value: analysisResults.basalRatioInfo.minRate, hour: analysisResults.basalRatioInfo.minHour }
                 } : null;
 
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.0.5',
+                        version: '4.1.0',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12137,6 +12287,10 @@
                         bodyStateLogged: bodyState?.state ?? null,
                         // DEF-189 (v3.6.37): pairs this export with the raw-fetch file by the fetch's own timestamp.
                         dataFetchedAt: analysisResults?.nightscoutData?.fetchedAt ?? null,
+                        // DEF-242 (v4.1.0): the PAGE's age, not the sheet's. historyAgeHours is how old
+                        // the history rows are; this is how long ago this page last read Nightscout.
+                        // Two ages, two sources, never again one name.
+                        pageAgeHours: pageAgeHoursOf(analysisResults?.nightscoutData?.fetchedAt ?? null),
                         // DEF-193 Part C (v3.6.36): every isf_induced_low suppression, [] when none;
                         // unavailable only if the detector did not run this session.
                         isfInducedLowSuppressed: Array.isArray(PatternDetectors.lastIsfInducedLowSuppressed)
@@ -12384,9 +12538,14 @@
                     glucoseTrace24h: (() => {
                         const allGlucose = analysisResults.nightscoutData?.glucose;
                         if (!allGlucose || allGlucose.length === 0) return null;
-                        const now = new Date();
-                        const dayStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-                        const dayEnd = now;
+                        // DEF-242 (v4.1.0): the window is the FETCH's 24 hours, not the render's. A
+                        // paste copied the next morning was labelling a window whose last reading was
+                        // 13 h before its stated end — the readings are keyed to the fetch, so the
+                        // label must be too. Falls back to the clock only when the fetch is unknown.
+                        const fetchedAt = analysisResults?.nightscoutData?.fetchedAt
+                            ? new Date(analysisResults.nightscoutData.fetchedAt) : null;
+                        const dayEnd = (fetchedAt && Number.isFinite(fetchedAt.getTime())) ? fetchedAt : new Date();
+                        const dayStart = new Date(dayEnd.getTime() - 24 * 60 * 60 * 1000);
                         const todayReadings = allGlucose
                             .filter(r => {
                                 const t = new Date(r.dateString);
@@ -12430,6 +12589,7 @@
                         return {
                             windowStart: toLocalTimeStr(dayStart),
                             windowEnd: toLocalTimeStr(dayEnd),
+                            windowBasis: (fetchedAt && Number.isFinite(fetchedAt.getTime())) ? 'dataFetchedAt' : 'render clock — dataFetchedAt unavailable',
                             intervalMinutes: 15,
                             readingCount: readings.length,
                             readings,
@@ -12908,14 +13068,21 @@
                 
                 // Hourly statistics
                 const hourlyBuckets = {};
+                // DEV-l (v4.1.0): the distinct local dates contributing to each hour's bucket, over
+                // this same windowed, deduplicated population. Declared only — nothing reads it and
+                // the window is unchanged.
+                const hourlyDays = {};
                 for (let h = 0; h < 24; h++) {
                     hourlyBuckets[h] = [];
+                    hourlyDays[h] = new Set();
                 }
                 
                 readings.forEach(r => {
-                    const hour = new Date(r.dateString).getHours();
+                    const d = new Date(r.dateString);
+                    const hour = d.getHours();
                     if (r.sgv && r.sgv > 20 && r.sgv < 500) {
                         hourlyBuckets[hour].push(r.sgv);
+                        hourlyDays[hour].add(d.toDateString());
                     }
                 });
                 
@@ -12961,6 +13128,7 @@
                     hourlyStats.push({
                         hour: h,
                         count: vals.length,
+                        daysContributing: hourlyDays[h].size,
                         min: Math.min(...vals),
                         max: Math.max(...vals),
                         mean: hMean,
@@ -17479,7 +17647,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.0.5 — measurement-only export · DEF-236 the screen shows what the Copy shows · DEF-237 a failed live history read stops the tool; the cache is an option behind a button that names its age · v4.0.4 anchoring underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.1.0 — measurement-only export · DEF-238 the correction exclusion set is window-scoped · DEF-239 low fields on every ledger row · DEF-241 every low names its candidate blocks · DEF-242 the paste declares its own data age · DEV-l hourly day counts declared · v4.0.5 stop-on-failed-read underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the screen, the Copy and the sheet row carry no bundles, priorities or recommended values. Press ⬇ Raw fetch before copying.
