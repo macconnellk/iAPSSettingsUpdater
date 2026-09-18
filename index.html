@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.0.4</title>
+    <title>Daily Insulin Settings Review v4.0.5</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3297,11 +3297,16 @@
             return out + '\n';
         };
         // [DECISION-LOG-END]
+        // DEF-237 (v4.0.5): a cached session says so in the FIRST line of every surface — the
+        // dashboard header, this paste header, the auto-log row's Notes — not in meta.
+        const historyAgeLabel = (ageHours) => Number.isFinite(ageHours) ? ageHours.toFixed(1) : '?';
+        const historyCachedFirstLine = (source, ageHours) => source === 'persisted_cache' ? 'HISTORY: CACHED, ' + historyAgeLabel(ageHours) + ' h old' : null;
         const formatMeasurementOnlyHeader = (exp) => {
             const m = exp?.meta || {};
             const c = m.eventCensus || {};
             const byType = Object.entries(c.detectedByType || {}).map(([k, v]) => `${k} ${v}`).join(', ') || 'none';
-            return '# MEASUREMENT-ONLY EXPORT — v' + (m.version || '?') + '\n\n'
+            const cached = historyCachedFirstLine(exp?.historySource, exp?.historyAgeHours);
+            return (cached ? cached + '\n\n' : '') + '# MEASUREMENT-ONLY EXPORT — v' + (m.version || '?') + '\n\n'
                 + '_This build emits what the tool measured. It carries no bundles, priorities, severities, recommended values, '
                 + 'or detector classifications. Read `eventLedger`, `safetyFacts` and `signals.periods` under the measurement-only '
                 + 'clinical instructions; the basal effect lag in `candidateBlocks.basal` is asserted, not measured (`meta.lagProvenance`)._\n\n'
@@ -11612,7 +11617,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.0.4',
+                            version: '4.0.5',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -12122,7 +12127,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.0.4',
+                        version: '4.0.5',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -14163,7 +14168,10 @@
         // [FETCH-LOG-END]
         const DailyInsulinReview = () => {
             // State
-            const [step, setStep] = useState('config'); // config, analyzing, results
+            const [step, setStep] = useState('config'); // config, analyzing, results, history_stop (DEF-237)
+            const [historyStop, setHistoryStop] = useState(null);      // DEF-237: the failed-read stop panel's facts
+            const [historyServed, setHistoryServed] = useState(null);  // DEF-237: { source, ageHours } of the history this run rendered
+            const measurementOnlyScreen = CONFIG.measurementOnly === true;   // DEF-236: the screen shows what the Copy shows
             const [analysisWindow, setAnalysisWindow] = useState(3);
             const [basalSignalWindow, setBasalSignalWindow] = useState(7);
             const [targetBG, setTargetBG] = useState(110);
@@ -14680,7 +14688,12 @@
             // later in the same run. Reset per run so a failed fetch cannot serve stale rows.
             let resolvedHistoryForRun = { rows: [], meta: { historyAvailable: false,
                 historyEntryCount: 0, historyUnavailableReason: 'not_resolved', historySource: null } };
-            const loadDynamicTarget = async () => {
+            // DEF-237 (v4.0.5): a failed live read STOPS the tool. The persisted cache is served
+            // only when the owner has clicked the button that names its age (opts.useCache);
+            // an unauthorised failure throws a tagged error that runAnalysis turns into the
+            // stop panel — no analysis, no Copy, no auto-log row.
+            const loadDynamicTarget = async (opts) => {
+                opts = opts || {};
                 console.log('=== loadDynamicTarget called ===');
                 
                 if (!sheetsWebAppUrl) {
@@ -14699,6 +14712,19 @@
                     // source and age declared; when none is present the run degrades exactly
                     // as before — nothing is fabricated, nothing partially renders.
                     let data;
+                    // [DEF-237-ELECTED-START] v4.0.5: the owner elected the cache on the stop panel. Serve it
+                    // directly — re-running the live attempt would cost the 30 s the button exists
+                    // to avoid. If the cache has gone since the stop rendered, fall through to a
+                    // live attempt and let the normal path decide.
+                    const electedCache = opts.useCache === true ? readHistoryCache() : { present: false };
+                    if (electedCache.present) {
+                        historyRunProvenance = { ...HISTORY_RUN_PROVENANCE_RESET(), source: 'persisted_cache', readAt: electedCache.writtenAt,
+                                                 historyAgeHours: electedCache.ageHours, cachePersisted: null, cacheReadError: null,
+                                                 liveReadError: 'owner elected the cache after a failed live read' };
+                        console.warn('[HISTORY-CACHE] owner elected the cache: ' + electedCache.rows.length + ' rows written ' + electedCache.writtenAt + ' (' + electedCache.ageHours + ' h ago)');
+                        data = { success: true, entries: electedCache.rows };
+                    } else {
+                    // [DEF-237-ELECTED-END]
                     try {
                         data = await jsonpFetchWithRetry(`${sheetsWebAppUrl}?action=read&days=365`);
                         console.log('Dynamic target: Received data', data);
@@ -14707,14 +14733,28 @@
                         if (!cache.present) {
                             historyRunProvenance = { ...HISTORY_RUN_PROVENANCE_RESET(), source: 'unavailable', cacheReadError: cache.cacheReadError };
                             console.warn('[HISTORY-CACHE] live read failed and no usable cache (' + (cache.cacheReadError || 'absent') + ')');
-                            throw liveErr;
+                            // [DEF-237-STOP-A-START] v4.0.5: no cache — the run stops instead of degrading.
+                            throw Object.assign(new Error('history_live_read_failed'), { historyStop: {
+                                liveError: (liveErr && liveErr.message) || String(liveErr), attempts: jsonpRecordsForRun(jsonpAttemptLog), budgetsMs: JSONP_ATTEMPT_BUDGETS_MS.slice(),
+                                cache: { present: false, ageHours: null, rows: 0, writtenAt: null, cacheReadError: cache.cacheReadError } } });
+                            // [DEF-237-STOP-A-END]
                         }
+                        // [DEF-237-STOP-B-START] v4.0.5: a cache exists, but it cannot be taken unknowingly.
+                        if (opts.useCache !== true) {
+                            historyRunProvenance = { ...HISTORY_RUN_PROVENANCE_RESET(), source: 'unavailable', cacheReadError: null };
+                            console.warn('[HISTORY-CACHE] live read failed (' + (liveErr && liveErr.message) + ') — a cache ' + cache.ageHours + ' h old is present; STOPPING until the owner elects it');
+                            throw Object.assign(new Error('history_live_read_failed'), { historyStop: {
+                                liveError: (liveErr && liveErr.message) || String(liveErr), attempts: jsonpRecordsForRun(jsonpAttemptLog), budgetsMs: JSONP_ATTEMPT_BUDGETS_MS.slice(),
+                                cache: { present: true, ageHours: cache.ageHours, rows: cache.rows.length, writtenAt: cache.writtenAt, cacheReadError: null } } });
+                        }
+                        // [DEF-237-STOP-B-END]
                         historyRunProvenance = { ...HISTORY_RUN_PROVENANCE_RESET(), source: 'persisted_cache', readAt: cache.writtenAt,
                                                  historyAgeHours: cache.ageHours, cachePersisted: null, cacheReadError: null,
                                                  liveReadError: 'fetch_failed: ' + (liveErr && liveErr.message) };
                         console.warn('[HISTORY-CACHE] live read failed (' + (liveErr && liveErr.message) + ') — serving ' + cache.rows.length
                             + ' rows from the persisted cache written ' + cache.writtenAt + ' (' + cache.ageHours + ' h ago)');
                         data = { success: true, entries: cache.rows };
+                    }
                     }
                     
                     if (!data.success || !data.entries || data.entries.length === 0) {
@@ -14891,6 +14931,7 @@
                     };
                     
                 } catch (error) {
+                    if (error && error.historyStop) throw error;   // [DEF-237-RETHROW] the stop is not a degraded run
                     console.error('Dynamic target: Error loading', error);
                     // v3.6.09: three conditions no longer collapse to one null — the change
                     // record needs to know WHY, and "not configured" is not "fetch failed".
@@ -14914,6 +14955,10 @@
                 
                 // Use passed target or fall back to configured
                 const targetPercent = effectiveTarget || basalTDDPercent;
+                // DEF-236 (v4.0.5): under the flag the engine's output does not reach the sheet —
+                // Primary_Actions, Watch_Items, Gate_Cost_JSON, Shadow_Unblock_JSON are omitted from
+                // the payload (the App Script writes only keys that are present). Read once here.
+                const logEngineOutput = CONFIG.measurementOnly !== true;
                 
                 // Check if URL is configured
                 if (!sheetsWebAppUrl) {
@@ -15042,7 +15087,7 @@
                     incrementsApplied: incrementsNeeded,
                     direction: direction,
                     isOverride: isOverrideActive,
-                    notes: isOverrideActive ? 'Auto-logged (override)' : 'Auto-logged',
+                    notes: (historyCachedFirstLine(historyRunProvenance.source, historyAgeHoursNow()) ? historyCachedFirstLine(historyRunProvenance.source, historyAgeHoursNow()) + ' | ' : '') + (isOverrideActive ? 'Auto-logged (override)' : 'Auto-logged'),
                     // NEW: TDD and Carb tracking  
                     tdd24h: tdd24h ? tdd24h.toFixed(1) : '',
                     tdd2wk: tdd2Week ? tdd2Week.toFixed(1) : '',
@@ -15108,6 +15153,7 @@
                             lowSleepOnset: getLow('Sleep Onset'),
                         };
                     })(),
+                    ...(!logEngineOutput ? {} : {
                     primaryActions: (() => {
                         try {
                             const primary = (processedBundles || []).filter(b => b.priority === 'PRIMARY');
@@ -15133,6 +15179,7 @@
                             })));
                         } catch(e) { return '[]'; }
                     })(),
+                    }),
                     safetyLowSlots: deriveSafetyLowSlots(findings),
                     // [TOOL-VERSION-LOG-START] v3.6.32 (DEF-178). The version that produced
                     // this row, read from the title stamp (one source, already asserted equal
@@ -15152,12 +15199,15 @@
                     // INSTR-3: gate-cost + R2 shadow. Fields always present (the Log
                     // Script write guard keys on !== undefined); null metrics fail
                     // safe to empty tallies, never omitted.
+                    // DEF-236 (v4.0.5): except under the flag — the engine's output does not reach the sheet.
+                    ...(!logEngineOutput ? {} : {
                     gateCost: (instrMetrics && instrMetrics.gateCost)
                         ? instrMetrics.gateCost
                         : { generated: 0, actionable: 0, blocked: {} },
                     shadowUnblock: (instrMetrics && Array.isArray(instrMetrics.shadowUnblock))
                         ? instrMetrics.shadowUnblock
                         : [],
+                    }),
                     // v3.6.38 (DEF-197, §3b): the run's history provenance, logged to the ROW so a
                     // degraded night leaves a trace the by-date upsert cannot erase.
                     historySource: historyRunProvenance.source,
@@ -15212,13 +15262,16 @@
             };
             
             // Run Analysis
-            const runAnalysis = async () => {
+            const runAnalysis = async (opts) => {
+                opts = opts || {};
                 console.log('=== runAnalysis started ===');
                 jsonpRunId += 1;
                 historyRunProvenance = HISTORY_RUN_PROVENANCE_RESET();
                 setStep('analyzing');
                 setError(null);
                 setTargetLoadError(null);
+                setHistoryStop(null);
+                setHistoryServed(null);
                 
                 try {
                     // Load dynamic basal target from history (BUG-018)
@@ -15227,7 +15280,19 @@
                     let effectiveTargetSource = 'configured';
                     let yesterdayFinal = null;
                     
-                    const dynamicResult = await loadDynamicTarget();
+                    let dynamicResult;
+                    try {
+                        dynamicResult = await loadDynamicTarget(opts);
+                    } catch (loadErr) {
+                        if (loadErr && loadErr.historyStop) {
+                            // DEF-237: stop here. Nothing below runs — no analysis, no results, no Copy, no auto-log row.
+                            setHistoryStop(loadErr.historyStop);
+                            setStep('history_stop');
+                            return;
+                        }
+                        throw loadErr;
+                    }
+                    setHistoryServed({ source: historyRunProvenance.source, ageHours: historyRunProvenance.historyAgeHours });
                     console.log('Dynamic target result:', dynamicResult);
                     
 
@@ -16994,9 +17059,10 @@
                         );
                     }
                     
+                    const cachedFirstLine = historyCachedFirstLine(structuredForPaste?.historySource, structuredForPaste?.historyAgeHours);
                     const combinedOutput = measurementOnlyPaste
                         ? formatMeasurementOnlyHeader(structuredForPaste) + structuredJSON
-                        : structuredJSON + trendSection + enrichedOutput;
+                        : (cachedFirstLine ? cachedFirstLine + '\n\n' : '') + structuredJSON + trendSection + enrichedOutput;
                     
                     if (measurementOnlyPaste && !structuredJSON) {
                         console.error('copyForClaudeReview: measurement-only export failed to generate');
@@ -17246,7 +17312,7 @@
                     incrementsApplied: incrementsNeeded,
                     direction: direction,
                     isOverride: bodyState?.state === BodyStateType.OVERRIDE_ACTIVE,
-                    notes: loggingNotes || 'Manual',
+                    notes: (historyCachedFirstLine(historyRunProvenance.source, historyAgeHoursNow()) ? historyCachedFirstLine(historyRunProvenance.source, historyAgeHoursNow()) + ' | ' : '') + (loggingNotes || 'Manual'),
                     // Schedule snapshots for change detection (FEATURE-004)
                     schedules: {
                         basal: scheduleToObject(basalSchedule),
@@ -17304,6 +17370,7 @@
                             return tir !== null ? tir.toString() : '';
                         } catch(e) { return ''; }
                     })(),
+                    ...(CONFIG.measurementOnly === true ? {} : {   // DEF-236 (v4.0.5)
                     primaryActions: (() => {
                         try {
                             const primary = (bundles || []).filter(b => b.priority === 'PRIMARY');
@@ -17329,6 +17396,7 @@
                             })));
                         } catch(e) { return '[]'; }
                     })()
+                    })
                 };
                 
                 try {
@@ -17405,13 +17473,16 @@
                         <div className="glass-card rounded-2xl p-6 mb-6">
                             <div className="flex items-center justify-between">
                                 <div>
+                                    {historyServed && historyServed.source === 'persisted_cache' && (
+                                        <p className="text-red-300 font-bold text-sm mb-1">HISTORY: CACHED, {historyAgeLabel(historyServed.ageHours)} h old</p>
+                                    )}
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.0.4 — measurement-only export · DEF-230 correction authority anchored to the event (hypo: pre-event peak → eventBG) · DEF-231 low-event artifact shape declared clause by clause, hourlyLowMass second figure · v4.0.3 DEF-228 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.0.5 — measurement-only export · DEF-236 the screen shows what the Copy shows · DEF-237 a failed live history read stops the tool; the cache is an option behind a button that names its age · v4.0.4 anchoring underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
-                                            MEASUREMENT-ONLY: the Copy carries no bundles, priorities or recommended values — the engine still runs and still logs to the sheet. Press ⬇ Raw fetch before copying.
+                                            MEASUREMENT-ONLY: the screen, the Copy and the sheet row carry no bundles, priorities or recommended values. Press ⬇ Raw fetch before copying.
                                         </p>
                                     )}
                                 </div>
@@ -17618,6 +17689,35 @@
                             </div>
                         )}
                         
+                        {/* [HISTORY-STOP-START] v4.0.5 (DEF-237). The live 365-day read failed: the tool
+                            stops here. No analysis ran, nothing is copyable, no row was logged. The
+                            persisted cache is an OPTION behind one button that names its age. */}
+                        {step === 'history_stop' && historyStop && (
+                            <div className="glass-card rounded-2xl p-6 border-l-4 border-l-red-500">
+                                <h2 className="text-xl font-bold text-red-300 mb-2">STOPPED — the live history read failed</h2>
+                                <p className="text-gray-300 text-sm mb-3">No analysis ran. Nothing was copied or logged. Reason: {historyStop.liveError}</p>
+                                <div className="text-gray-400 text-sm mb-3">
+                                    <div className="font-medium text-gray-300 mb-1">Attempts this run (budgets {historyStop.budgetsMs.map(b => (b / 1000) + ' s').join(', ')})</div>
+                                    {(historyStop.attempts || []).length === 0 && <div>— no attempt records —</div>}
+                                    {(historyStop.attempts || []).map((a, i) => (
+                                        <div key={i}>#{a.attempt ?? i + 1}: {a.outcome ?? '?'}{a.elapsedMs != null ? ' after ' + (a.elapsedMs / 1000).toFixed(1) + ' s' : ''}{a.reason ? ' — ' + a.reason : ''}</div>
+                                    ))}
+                                </div>
+                                {historyStop.cache.present ? (
+                                    <div>
+                                        <p className="text-gray-300 text-sm mb-2">A persisted cache is available: {historyStop.cache.rows} rows, written {historyStop.cache.writtenAt}, <span className="text-amber-300 font-bold">{historyAgeLabel(historyStop.cache.ageHours)} h old</span>.</p>
+                                        <button onClick={() => runAnalysis({ useCache: true })} className="px-4 py-3 rounded-xl font-medium bg-amber-600 hover:bg-amber-500 text-white">
+                                            {`Use cached history (${historyAgeLabel(historyStop.cache.ageHours)} h old)`}
+                                        </button>
+                                    </div>
+                                ) : (
+                                    <p className="text-gray-400 text-sm">No persisted cache is available{historyStop.cache.cacheReadError ? ' (' + historyStop.cache.cacheReadError + ')' : ''}. Retry the live read when the sheet responds.</p>
+                                )}
+                                <div className="mt-4"><button onClick={() => setStep('config')} className="px-4 py-2 rounded-xl text-sm bg-white/10 hover:bg-white/20 text-gray-200">Back</button></div>
+                            </div>
+                        )}
+                        {/* [HISTORY-STOP-END] */}
+                        
                         {/* Results */}
                         {step === 'results' && analysisResults && bodyState && (
                             <div className="space-y-6">
@@ -17638,13 +17738,15 @@
                                                 ? `Override ${bodyState.overridePercent || 100}%`
                                                 : bodyState.state === BodyStateType.UNDETERMINED
                             ? 'state undetermined'
-                            : `Day ${bodyState.daysInState}`
+                            : measurementOnlyScreen ? 'a fact — basis below' : `Day ${bodyState.daysInState}`
                                             }
                                         </span>
                                     </div>
+                                    {!measurementOnlyScreen && (
                                     <p className="text-gray-300 text-sm mb-3">
                                         {STATE_DESCRIPTIONS[bodyState.state]}
                                     </p>
+                                    )}
                                     {bodyState.contributingFactors?.length > 0 && (
                                         <ul className="text-gray-400 text-sm list-disc list-inside">
                                             {bodyState.contributingFactors.map((factor, i) => (
@@ -17652,7 +17754,7 @@
                                             ))}
                                         </ul>
                                     )}
-                                    {bodyState.recommendedOverride && (
+                                    {!measurementOnlyScreen && bodyState.recommendedOverride && (
                                         <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
                                             <p className="text-blue-400 font-medium">
                                                 Recommended: Apply {bodyState.recommendedOverride}% profile override
@@ -17761,9 +17863,11 @@
                                                 {analysisResults.signalAnalysis.weightedDeviation.toFixed(1)} mg/dL from target
                                             </div>
                                         )}
+                                        {!measurementOnlyScreen && (
                                         <div className="mt-2 text-xs text-gray-600 italic">
                                             Basal recommendations are driven by parametric findings, not this ratio.
                                         </div>
+                                        )}
                                     </div>
                                 )}
                                 
@@ -17987,7 +18091,9 @@
                                     </div>
                                 )}
                                 
-                                {/* Tonight's Action - now supports multiple PRIMARY bundles */}
+                                {/* Tonight's Action - now supports multiple PRIMARY bundles.
+                                    DEF-236 (v4.0.5): under the flag nothing renders here — absence, not a message about absence. */}
+                                {!measurementOnlyScreen && (
                                 <div className="glass-card rounded-2xl p-6">
                                     <h2 className="text-xl font-bold text-white mb-4">Tonight's Action</h2>
                                     
@@ -18186,9 +18292,11 @@
                                         );
                                     })()}
                                 </div>
+                                )}
                                 
                                 {/* Watch List */}
                                 {(() => {
+                                    if (measurementOnlyScreen) return null;   // DEF-236 (v4.0.5)
                                     // Include bundles with recommendations OR special bundles like conflicts and ratio warnings
                                     const watchBundles = bundles.filter(b => 
                                         b.priority === 'REFERENCE' && 
