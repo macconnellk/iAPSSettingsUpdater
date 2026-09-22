@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.1.0</title>
+    <title>Daily Insulin Settings Review v4.1.1</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2874,11 +2874,13 @@
         // bounds collapse onto deliveredShareOfPlan. Indeterminate: bounds only, no share (§3g).
         // budgetRatioLegacy (upfront + categorised SMBs) is a scoring exclusion, not a meal
         // attribution; it stays in the instrument for census and leaves the ledger.
-        const ledgerEpisodePlan = (episode, pairs, treatments, crSchedule) => {
+        // DEF-251 (v4.1.1): crAtTime resolves each entry's own profile; the default keeps the
+        // single-schedule behaviour for every caller that has no history.
+        const ledgerEpisodePlan = (episode, pairs, treatments, crSchedule, crAtTime = null) => {
             const empty = { expectedUnits: null, upfrontShare: null, deliveredUnits: null, deliveredShareOfPlan: null, budgetDeterminate: null, budgetRatioLower: null, budgetRatioUpper: null,
                             mealBolusUnits: null, smbUnitsInHorizon: null, unpairedBolusUnits: null, unpairedBolusCount: null, horizon: null, note: 'no governing carb entry — no plan' };
             if (!episode || !episode.length) return empty;
-            const perEntry = episode.map(c => { const e = ledgerEntryAt(crSchedule, new Date(c.created_at)); return (e && e.value > 0) ? c.carbs / e.value : null; });
+            const perEntry = episode.map(c => { const e = ledgerEntryAt(crAtTime ? crAtTime(c.created_at) : crSchedule, new Date(c.created_at)); return (e && e.value > 0) ? c.carbs / e.value : null; });
             const expected = perEntry.every(x => Number.isFinite(x)) ? perEntry.reduce((a, x) => a + x, 0) : null;
             const fromMs = new Date(episode[0].created_at).getTime() - 2 * 60000;
             const toMs = new Date(episode[episode.length - 1].created_at).getTime() + 180 * 60000;
@@ -2901,17 +2903,27 @@
                 budgetDeterminate: determinate, budgetRatioLower: lower, budgetRatioUpper: upper,
                 mealBolusUnits: r3(pairedUnits), smbUnitsInHorizon: r3(smbUnits), unpairedBolusUnits: r3(unpairedUnits), unpairedBolusCount: unpaired.length,
                 horizon: { fromISO: new Date(fromMs).toISOString(), toISO: new Date(toMs).toISOString(), rule: '[first entry −2 min, last entry +180 min]' },
-                basis: 'episode plan — expected Σ grams_i / CR(t_i); delivered = every insulin record in the horizon; Lower = paired meal boluses, Upper = delivered; Lower ≤ Upper by construction',
+                basis: 'episode plan — expected Σ grams_i / CR(t_i); delivered = every insulin record in the horizon; Lower = paired meal boluses, Upper = delivered; Lower ≤ Upper by construction; CR(t_i) is the profile in effect at t_i (DEF-251)',
                 note: expected === null ? 'no CR for an entry in the episode — no plan'
                     : determinate ? 'determinate — every non-SMB bolus in the horizon is a paired meal bolus; bounds collapse onto deliveredShareOfPlan'
                     : `indeterminate — ${unpaired.length} unpaired non-SMB bolus(es) in the horizon; bounds only, no share`
             };
         };
-        const buildEventLedger = ({ findings, findingsBasis = 'unstated', suppressed, nightscoutData, schedules, now = new Date() }) => {
+        const buildEventLedger = ({ findings, findingsBasis = 'unstated', suppressed, nightscoutData, schedules, profileHistory = [], now = new Date() }) => {
+            // DEF-247 (v4.1.1): every as-of in this builder is the FETCH's, not the render's.
+            const ledgerAsOf = nightscoutData?.fetchedAt ?? null;
+            // DEF-249 (v4.1.1): what the loop was actually running under when the event happened.
+            const ledgerOverride = buildOverrideObserved(nightscoutData);
             const glucose = (nightscoutData?.glucose || []).slice().sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
             const treatments = nightscoutData?.treatments || [];
             const deviceStatus = nightscoutData?.deviceStatus || [];
             const basalS = schedules?.basal || [], crS = schedules?.cr || [], isfS = schedules?.isf || [];
+            // DEF-251 (v4.1.1): the CURRENT profile is the fallback, not the answer. Every lookup
+            // below resolves the profile that governed ITS OWN timestamp: the event's for the
+            // block-level facts, each carb entry's for the plan (a multi-entry episode may straddle
+            // an upload, and plan.basis has always said Σ gᵢ / CR(tᵢ)).
+            const profileTally = newProfileLookupTally();
+            const schedAt = (dateLike) => { const r = schedulesAt(profileHistory, schedules, dateLike); tallyProfileLookup(profileTally, r.source); return r; };
             const census = { emittedByType: {}, droppedAsSignalByType: {}, droppedAsSignal: 0, droppedAsStructural: 0, dedupedDuplicates: 0, emittedRecords: 0, unclassified: 0,
                              fromSuppressedGate: 0,
                              // DEF-228 (v4.0.3): which list this ledger was built from. aggregateFindings keeps
@@ -3035,11 +3047,14 @@
                     removedFromCorrections: correctionCandidates.some(t => sameRecord(t, p.bolus)) }));
                 const recAtEvent = findDeviceStatusAt(deviceStatus, evDate, { direction: 'before' });
                 const cobRead = recAtEvent ? extractCOB(recAtEvent) : { value: null, source: null };
-                const plan = ledgerEpisodePlan(episode, pairs, treatments, crS);
+                const evSched = schedAt(evDate);
+                const evBasalS = evSched.schedules?.basal || basalS, evCrS = evSched.schedules?.cr || crS, evIsfS = evSched.schedules?.isf || isfS;
+                const crAtEntry = (at) => (schedAt(at).schedules?.cr || crS);
+                const plan = ledgerEpisodePlan(episode, pairs, treatments, crS, crAtEntry);
                 // DEF-218 (v4.0.1): the authority's ISF is the record's OWN per-correction lookup
                 // (candidateBlocks.isf), volume-weighted — one field pointing at another in the
                 // same record, so the two cannot disagree about which ISF governed the insulin.
-                const isfPerCorrection = corrections.map(t => { const e = ledgerEntryAt(isfS, new Date(t.created_at)); return { units: t.insulin || 0, isf: e ? e.value : null, time: e ? e.time : null }; });
+                const isfPerCorrection = corrections.map(t => { const e = ledgerEntryAt(schedAt(t.created_at).schedules?.isf || isfS, new Date(t.created_at)); return { units: t.insulin || 0, isf: e ? e.value : null, time: e ? e.time : null }; });
                 const corrUnits = corrections.reduce((a, t) => a + (t.insulin || 0), 0);
                 const weightedIsf = (() => {
                     const known = isfPerCorrection.filter(x => Number.isFinite(x.isf) && x.units > 0);
@@ -3115,7 +3130,7 @@
                     carbs: { grams: episode.length ? episode.reduce((a, c) => a + c.carbs, 0) : null,
                              entryTime: episode.length ? new Date(episode[0].created_at).toISOString() : null,
                              latestEntryTime: govCarb ? new Date(govCarb.created_at).toISOString() : null,
-                             entries: pairs.map(p => { const e = ledgerEntryAt(crS, new Date(p.entry.created_at)); return { time: new Date(p.entry.created_at).toISOString(), grams: p.entry.carbs,
+                             entries: pairs.map(p => { const ps = schedAt(p.entry.created_at); const e = ledgerEntryAt(ps.schedules?.cr || crS, new Date(p.entry.created_at)); return { time: new Date(p.entry.created_at).toISOString(), grams: p.entry.carbs, profileStartDate: ps.source.profileStartDate,
                                  cr: e ? { time: e.time, value: e.value } : null, expectedUnits: (e && e.value > 0) ? p.entry.carbs / e.value : null,
                                  mealBolus: p.bolus ? { time: new Date(p.bolus.created_at).toISOString(), units: p.bolus.insulin } : null }; }),
                              episodeRule: 'consecutive carb entries with no readable COB record at zero between them (loop COB is the boundary, not a clock); no readable record between two entries → same episode',
@@ -3123,21 +3138,23 @@
                              minsFromCarbEntryToEvent: episode.length ? Math.round((ms - new Date(episode[0].created_at)) / 60000) : null,
                              minsFromLatestEntryToEvent: govCarb ? Math.round((ms - new Date(govCarb.created_at)) / 60000) : null },
                     plan,
-                    governingAtEventTime: { basal: ledgerEntryAt(basalS, evDate), isf: ledgerEntryAt(isfS, evDate), cr: ledgerEntryAt(crS, evDate),
-                                            targetBG: (() => { const t = ledgerEntryAt((schedules?.targetBG || []).map(x => ({ time: x.time, value: x.midpoint ?? x.targetLow })), evDate); return t ? t.value : CONFIG.targetBG; })() },
+                    governingAtEventTime: { basal: ledgerEntryAt(evBasalS, evDate), isf: ledgerEntryAt(evIsfS, evDate), cr: ledgerEntryAt(evCrS, evDate),
+                                            targetBG: (() => { const t = ledgerEntryAt(((evSched.schedules?.targetBG || schedules?.targetBG) || []).map(x => ({ time: x.time, value: x.midpoint ?? x.targetLow })), evDate); return t ? t.value : CONFIG.targetBG; })() },
+                    scheduleSource: evSched.source,
+                    overrideAtEvent: overrideAtTime(ledgerOverride, evDate),
                     candidateBlocks: {
                         basal: { method: 'inverse of basalEffectWindow', lag: { minH: CONFIG.basalEffectLagH[0], maxH: CONFIG.basalEffectLagH[1], source: 'CONFIG.basalEffectLagH', basis: 'ASSERTED — not measured. See lagProvenance.' },
-                                 blocks: ledgerBasalCandidates(basalS, evDate) },
-                        cr:  { method: 'getCRForTime at each carb entry timestamp', lag: null,
-                               blocks: episode.map(c => { const e = ledgerEntryAt(crS, new Date(c.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs }; }) },
-                        isf: { method: 'getISFForTime at each correction timestamp', lag: null,
-                               blocks: corrections.map(t => { const e = ledgerEntryAt(isfS, new Date(t.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, correctionTime: new Date(t.created_at).toISOString(), units: t.insulin }; }) }
+                                 blocks: ledgerBasalCandidates(evBasalS, evDate) },
+                        cr:  { method: 'getCRForTime at each carb entry timestamp, on the profile in effect at that entry (DEF-251)', lag: null,
+                               blocks: episode.map(c => { const e = ledgerEntryAt(crAtEntry(c.created_at), new Date(c.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs }; }) },
+                        isf: { method: 'getISFForTime at each correction timestamp, on the profile in effect at that correction (DEF-251)', lag: null,
+                               blocks: corrections.map(t => { const e = ledgerEntryAt(schedAt(t.created_at).schedules?.isf || isfS, new Date(t.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, correctionTime: new Date(t.created_at).toISOString(), units: t.insulin }; }) }
                     },
                     correctionAuthority,
                     context: { daysSinceBlockChanged: {
-                                   basal: (() => { const e = ledgerEntryAt(basalS, evDate); return e ? ChangeRecord.daysSinceChange('basal', e.time) : null; })(),
-                                   isf: (() => { const e = ledgerEntryAt(isfS, evDate); return e ? ChangeRecord.daysSinceChange('isf', e.time) : null; })(),
-                                   cr: (() => { const e = ledgerEntryAt(crS, evDate); return e ? ChangeRecord.daysSinceChange('cr', e.time) : null; })() },
+                                   basal: (() => { const e = ledgerEntryAt(basalS, evDate); return e ? ChangeRecord.daysSinceChange('basal', e.time, ledgerAsOf) : null; })(),
+                                   isf: (() => { const e = ledgerEntryAt(isfS, evDate); return e ? ChangeRecord.daysSinceChange('isf', e.time, ledgerAsOf) : null; })(),
+                                   cr: (() => { const e = ledgerEntryAt(crS, evDate); return e ? ChangeRecord.daysSinceChange('cr', e.time, ledgerAsOf) : null; })() },
                                recurrence: null,   // filled by buildSafetyFacts from the ledger itself
                                treatmentCarbsImputed: null,
                                projectionGaps: gaps.concat(type === 'unclassified_observation' ? ['no observable type for detector output — facts only'] : []) },
@@ -3156,11 +3173,19 @@
                                          note: 'distinct dates in this run\'s ledger — no history column carries an observable-keyed record (DEF-206)' }; });
             census.emittedRecords = ledger.length;
             census.detected = detected + census.droppedAsSignal + census.droppedAsStructural;
-            return { eventLedger: ledger, eventCensus: census };
+            return { eventLedger: ledger, eventCensus: census, profileLookups: profileTally };
         };
         // [EVENT-LEDGER-END]
         // [SAFETY-FACTS-START] v4.0.0 (§5). No window model: the ingredients, unjoined.
-        const buildSafetyFacts = ({ eventLedger, nightscoutData, schedules, agp7day, periods, analysisWindowDays }) => {
+        const buildSafetyFacts = ({ eventLedger, nightscoutData, schedules, agp7day, periods, analysisWindowDays, profileHistory = [] }) => {
+            // DEF-247 (v4.1.1): the fetch is this builder's clock too.
+            const safetyAsOf = nightscoutData?.fetchedAt ?? null;
+            const safetyOverride = buildOverrideObserved(nightscoutData);   // DEF-249
+            // DEF-251: this builder resolves the same way the ledger does, and tallies the same way.
+            const safetyProfileTally = newProfileLookupTally();
+            const sfSchedAt = (dateLike) => { const r = schedulesAt(profileHistory, schedules, dateLike); tallyProfileLookup(safetyProfileTally, r.source); return r; };
+            const safetyWindow = pinnedAnalysisWindow(safetyAsOf, analysisWindowDays,
+                (nightscoutData?.glucose || []).reduce((m, r) => (r && r.dateString ? Math.max(m, new Date(r.dateString).getTime()) : m), -Infinity));
             const hs = agp7day?.hourlyStats || {};
             // DEV-l (v4.1.0, PM-accepted Sep 18): declare-only. calculateAGP's window runs
             // midnight-to-midnight and INCLUDES today's partial day, so every clock hour later than
@@ -3177,25 +3202,26 @@
             const hourlyLowMass = [];
             // DEF-234 (v4.0.4): the near-low tier, 70–80 inclusive, DECLARE ONLY — owner-ruled
             // "a 79 should not block". Both bounds already exist (70 is Rule 1's low, 80 the
-            // fingerstick threshold). Counted over the last analysisWindowDays of the fetched trace
-            // by local hour, with its own denominator (the trace's readings in that hour); lowPct
-            // keeps calculateAGP's population and is untouched. Emitted on every hour, at zero too.
-            const glucoseAll = (nightscoutData?.glucose || []).filter(r => r && r.dateString && Number.isFinite(r.sgv));
-            const latestMs = glucoseAll.reduce((m, r) => Math.max(m, new Date(r.dateString).getTime()), -Infinity);
-            const nearWindowFrom = latestMs - (analysisWindowDays || 7) * 24 * 3600000;
-            const nearLowByHour = Array.from({ length: 24 }, () => ({ near: 0, n: 0 }));
-            glucoseAll.forEach(r => { const t = new Date(r.dateString).getTime(); if (t < nearWindowFrom) return; const b = nearLowByHour[new Date(r.dateString).getHours()]; b.n++; if (r.sgv >= 70 && r.sgv <= 80) b.near++; });
+            // fingerstick threshold).
+            // DEF-245 (v4.1.1): ONE population. The tier used to be counted over a second walk of the
+            // trace, windowed from the latest reading, and divided by that walk's own count while
+            // sitting in an object whose `readings` was calculateAGP's — two denominators under one
+            // name, disagreeing for every clock hour later than the fetch hour. Both numerator and
+            // denominator now come from calculateAGP's hourly bucket, and the denominator is emitted
+            // beside the percentage so a reader never has to infer it again.
+            const NEAR_LOW_BASIS = '70 ≤ sgv ≤ 80, counted over the same readings as this row\'s count and TIR (calculateAGP\'s hourly bucket, deduplicated and windowed to the fetch); nearLowDenominator states it; declared only, no gate reads it';
             for (let h = 0; h < 24; h++) {
                 const st = hs[h] || null;
-                // calculateAGP's hourly shape: { hour, count, mean, tir: { veryLow, low, inRange, ... } } — percent units.
+                // calculateAGP's hourly shape: { hour, count, daysContributing, nearLow, mean, tir: { veryLow, low, inRange, ... } } — percent units.
                 // lowPct here is BELOW 70 (low + veryLow), the figure the bimodal gate compared to 4%.
-                const nb = nearLowByHour[h];
+                const nearN = st && Number.isFinite(st.nearLow) ? st.nearLow : 0;
+                const denom = st && Number.isFinite(st.count) ? st.count : 0;
                 hourlyLowMass.push(st ? { hour: h, lowPct: (Number(st.tir?.low) || 0) + (Number(st.tir?.veryLow) || 0), veryLowPct: st.tir?.veryLow ?? null, tir: st.tir?.inRange ?? null, mean: st.mean ?? null, readings: st.count ?? null,
                                           daysContributing: agpDaysByHour[h], daysContributingBasis: DAYS_CONTRIBUTING_BASIS,
-                                          nearLowPct: nb.n > 0 ? (nb.near / nb.n) * 100 : 0, nearLowReadings: nb.near, nearLowBasis: '70 ≤ sgv ≤ 80 over the trace\'s readings in this local hour within analysisWindowDays; declared only, no gate reads it' }
+                                          nearLowPct: denom > 0 ? (nearN / denom) * 100 : 0, nearLowReadings: nearN, nearLowDenominator: denom, nearLowBasis: NEAR_LOW_BASIS }
                                       : { hour: h, lowPct: null, veryLowPct: null, tir: null, mean: null, readings: 0,
                                           daysContributing: agpDaysByHour[h], daysContributingBasis: DAYS_CONTRIBUTING_BASIS,
-                                          nearLowPct: nb.n > 0 ? (nb.near / nb.n) * 100 : 0, nearLowReadings: nb.near, nearLowBasis: '70 ≤ sgv ≤ 80 over the trace\'s readings in this local hour within analysisWindowDays; declared only, no gate reads it' });
+                                          nearLowPct: 0, nearLowReadings: 0, nearLowDenominator: 0, nearLowBasis: NEAR_LOW_BASIS });
             }
             const spansOf = (param, sched) => {
                 const sorted = (sched || []).slice().sort((a, b) => a.time.localeCompare(b.time));
@@ -3211,8 +3237,30 @@
             const slotAge = parameterSpans.map(sp => {
                 const changes = ChangeRecord.getChangesForSlot(sp.parameter, sp.time);
                 const last = changes.length ? changes[changes.length - 1] : null;
+                // DEF-251 4g (v4.1.1): `lastChanged` is a SHEET-SNAPSHOT diff, and a slot that merely
+                // APPEARS in a snapshot (Monday's 09:30 after a weekend layout with no 09:30) is a
+                // structural add, not a change — so cr 09:30 reported the 13.4→13.9 touch while its
+                // value arrived days later via a different slot. profileBasis answers the other
+                // question from the profile documents themselves: since when has this (parameter,
+                // time) carried this value? Declared only; nothing reads it, and lastChanged is
+                // unchanged. null when the history holds one document — there is nothing to compare.
+                const runOf = (() => {
+                    if (!Array.isArray(profileHistory) || profileHistory.length < 2) return null;
+                    const EPS = 1e-9;
+                    const valueAt = (h) => { const e = (h.schedules?.[sp.parameter] || []).find(x => x.time === sp.time); return e ? e.value : null; };
+                    let since = null;
+                    for (let i = profileHistory.length - 1; i >= 0; i--) {
+                        const v = valueAt(profileHistory[i]);
+                        if (v === null || Math.abs(v - sp.value) > EPS) break;
+                        since = profileHistory[i];
+                    }
+                    if (!since) return null;
+                    const days = Number.isFinite(since.startMs) ? Math.floor(((safetyWindow.endMs) - since.startMs) / 86400000) : null;
+                    return { valueSince: since.startDate, daysSince: days };
+                })();
                 return { parameter: sp.parameter, scheduleTime: sp.time, currentValue: sp.value, lastChanged: last ? last.date : null,
-                         daysSince: ChangeRecord.daysSinceChange(sp.parameter, sp.time) };
+                         daysSince: ChangeRecord.daysSinceChange(sp.parameter, sp.time, safetyAsOf),
+                         basis: 'sheet_snapshot_diff', profileBasis: runOf };
             });
             const recurrence = (() => { const m = {}; (eventLedger || []).forEach(r => { const k = r.context?.recurrence?.key;
                 if (k && !m[k]) m[k] = { key: k, sessions: r.context.recurrence.sessions, of: analysisWindowDays, since: r.context.recurrence.since, basis: 'analysis_window', windowDays: analysisWindowDays }; });
@@ -3232,11 +3280,19 @@
                     coverage: p.concentration?.ceilingUtilization ?? p.ceilingUtilization ?? null,
                     fastedShare: p.fastedPopulation?.shareOfClean ?? null };
             });
-            // lowEvents: every episode of readings below the low threshold in the window, nadir + IOB at nadir, no label
+            // lowEvents: every episode of readings below the low threshold in the window, nadir + IOB
+            // at nadir, no label.
+            // DEF-258 (v4.1.1): "in the window" was a comment, not code — the walk ran the WHOLE
+            // fetched trace. On the Sep 21 export that put two Sep 14 events in lowEvents that
+            // hourlyLowMass had already aged out: Σ readingsInEvent 33 against 27 low readings, two
+            // windows in one paste. It matters because v7.2 makes lowEvents[].candidateBlocks the
+            // Rule 1 source for basal — a dead event would block a live block. Same pinned bounds
+            // as every other population in this builder; the two sums are declared beside it.
             const glucose = (nightscoutData?.glucose || []).slice().sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
             const lowEvents = []; let cur = null;
             glucose.forEach(r => {
                 const t = new Date(r.dateString).getTime();
+                if (t < safetyWindow.startMs || t > safetyWindow.endMs) return;
                 if (r.sgv < CONFIG.lowThreshold) {
                     if (cur && t - cur.lastMs <= 30 * 60000) { cur.lastMs = t; cur.readings.push(r); if (r.sgv < cur.bg) { cur.bg = r.sgv; cur.time = r.dateString; } }
                     else { if (cur) lowEvents.push(cur); cur = { time: r.dateString, bg: r.sgv, lastMs: t, readings: [r] }; }
@@ -3284,10 +3340,10 @@
                     crOmittedReason: ledgered.candidateBlocks.cr ? null : 'no governing carb entry',
                     basis: 'carried from eventLedger[].candidateBlocks for the same event — one attribution, not two' };
                 return {
-                    basal: { method: 'inverse of basalEffectWindow', lag: { minH: CONFIG.basalEffectLagH[0], maxH: CONFIG.basalEffectLagH[1], source: 'CONFIG.basalEffectLagH', basis: 'ASSERTED — not measured. See meta.lagProvenance.' },
-                             blocks: ledgerBasalCandidates(sfBasal, evDate) },
-                    cr: govCarb ? { method: 'getCRForTime at each carb entry timestamp of the governing episode', lag: null,
-                                    blocks: episode.map(c => { const en = ledgerEntryAt(sfCr, new Date(c.created_at)); return { time: en ? en.time : null, value: en ? en.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs }; }) }
+                    basal: { method: 'inverse of basalEffectWindow, on the profile in effect at the low (DEF-251)', lag: { minH: CONFIG.basalEffectLagH[0], maxH: CONFIG.basalEffectLagH[1], source: 'CONFIG.basalEffectLagH', basis: 'ASSERTED — not measured. See meta.lagProvenance.' },
+                             blocks: ledgerBasalCandidates(sfSchedAt(evDate).schedules?.basal || sfBasal, evDate) },
+                    cr: govCarb ? { method: 'getCRForTime at each carb entry timestamp of the governing episode, on the profile in effect at that entry (DEF-251)', lag: null,
+                                    blocks: episode.map(c => { const en = ledgerEntryAt(sfSchedAt(c.created_at).schedules?.cr || sfCr, new Date(c.created_at)); return { time: en ? en.time : null, value: en ? en.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs, profileStartDate: sfSchedAt(c.created_at).source.profileStartDate }; }) }
                                  : null,
                     crOmittedReason: govCarb ? null : 'no governing carb entry',
                     isf: null,
@@ -3298,6 +3354,7 @@
             const lows = lowEvents.map(e => { const rec = findDeviceStatusAt(nightscoutData?.deviceStatus || [], new Date(e.time), { direction: 'before' }); const shape = lowShape(e);
                 return { time: new Date(e.time).toISOString(), bg: e.bg, hour: new Date(e.time).getHours(), netIob: rec ? extractIOB(rec) : null, basalIob: rec ? extractBasalIOB(rec) : null, treatmentCarbsImputed: null,
                          rapidRecovery: shape.rapidRecovery, isolated: shape.isolated, gapsNearEvent: shape.gapsNearEvent, readingsNearEvent: shape.readingsNearEvent, shapeFlagged: shape.shapeFlagged, readingsInEvent: e.readings.length,
+                         overrideAtEvent: overrideAtTime(safetyOverride, new Date(e.time)),
                          candidateBlocks: lowCandidateBlocks(new Date(e.time)) }; });
             // hourlyLowMass's second figure: lowPct with the shape-flagged events' own readings removed
             // from the low count, over the same hourly denominator (calculateAGP's count); emitted on
@@ -3311,7 +3368,15 @@
                 row.lowPctExcludingShapeFlagged = Math.max(0, row.lowPct - (removed / row.readings) * 100);
             });
             // [LOW-SHAPE-END]
+            // The two sums, and whether they agree — declared, not asserted. They can differ
+            // legitimately (a low episode straddling the window edge contributes readings on one
+            // side only), and a reader seeing `equal: false` should look at the edge, not assume a bug.
+            const lowEventReadings = lows.reduce((a, e) => a + (e.readingsInEvent || 0), 0);
+            const hourlyLowMassReadings = hourlyLowMass.reduce((a, h) => a + Math.round(((h.lowPct || 0) / 100) * (h.readings || 0)), 0);
             return { hourlyLowMass, parameterSpans, slotAge, recurrence, populationBasis, lowEvents: lows, lowShapeRule: LOW_SHAPE_RULE,
+                     lowEventsWindow: { start: safetyWindow.start, end: safetyWindow.end, days: safetyWindow.days, basis: 'analysisWindow (DEF-258) — ' + safetyWindow.basis },
+                     lowEventsCoverLowMass: { lowEventReadings, hourlyLowMassReadings, equal: lowEventReadings === hourlyLowMassReadings },
+                     profileLookups: safetyProfileTally,
                      note: 'ingredients only — no forward-risk window is precomputed for any parameter; the reviewer applies the lag they will defend' };
         };
         // [SAFETY-FACTS-END]
@@ -3325,9 +3390,14 @@
             'directionWiring', 'informationalFindings', 'delta', 'recommendation'];
         const toMeasurementOnlyExport = (structured, ctx) => {
             if (!structured || typeof structured !== 'object') return structured;
-            const { eventLedger, eventCensus } = buildEventLedger({ findings: ctx.findings, findingsBasis: ctx.findingsBasis, suppressed: ctx.suppressed, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules });
+            const { eventLedger, eventCensus, profileLookups } = buildEventLedger({ findings: ctx.findings, findingsBasis: ctx.findingsBasis, suppressed: ctx.suppressed, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, profileHistory: ctx.profileHistory || [] });
             const safetyFacts = buildSafetyFacts({ eventLedger, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, agp7day: ctx.agp7day,
-                                                   periods: ctx.periods, analysisWindowDays: ctx.analysisWindowDays });
+                                                   periods: ctx.periods, analysisWindowDays: ctx.analysisWindowDays, profileHistory: ctx.profileHistory || [] });
+            // DEF-249 (v4.1.1): the override record itself, beside the two builders that read it
+            // per event. The walk's working arrays (_rows, _episodes) are internal and never ship.
+            const { _rows, _episodes, ...overrideObserved } = buildOverrideObserved(ctx.nightscoutData);
+            // profileLookups is the builder's own tally; it is reported once, in meta.profileHistory.
+            const { profileLookups: _sfLookups, ...safetyFactsOut } = safetyFacts;
             const meta = { ...(structured.meta || {}) };
             delete meta.pipelineCensus;
             // DEF-205: the one declared exception to "retained keys byte-identical" — the
@@ -3349,6 +3419,20 @@
             meta.stateFlipAudit = meta.stateFlipAudit?.retentionCensus
                 ? { ...meta.stateFlipAudit, retentionCensus: retentionFactsOnly(meta.stateFlipAudit.retentionCensus) }
                 : meta.stateFlipAudit;
+            // DEF-251 (v4.1.1): what history the run had, and what it did with it. The three
+            // counters tally every resolution both builders made — if profileAtTime is 0 on a
+            // multi-document run, the resolver is not being reached and the fix is not working.
+            const ph = Array.isArray(ctx.profileHistory) ? ctx.profileHistory : [];
+            const sfLookups = safetyFacts.profileLookups || { profileAtTime: 0, earliestProfile: 0, currentProfile: 0 };
+            meta.profileHistory = {
+                documents: ph.length,
+                earliestStartDate: ph.length ? ph[0].startDate : null,
+                latestStartDate: ph.length ? ph[ph.length - 1].startDate : null,
+                lookups: { profileAtTime: (profileLookups?.profileAtTime || 0) + sfLookups.profileAtTime,
+                           earliestProfile: (profileLookups?.earliestProfile || 0) + sfLookups.earliestProfile,
+                           currentProfile: (profileLookups?.currentProfile || 0) + sfLookups.currentProfile },
+                basis: 'every per-event and per-carb-entry lookup resolves the profile document in effect at its own timestamp (DEF-251); parameterSpans, slotAge.lastChanged, schedules and scheduleShape stay on the current profile — they describe the schedule as it is'
+            };
             meta.measurementOnly = true;
             // §12d: an observable, not a reminder. false is a value and is emitted as one.
             meta.rawCaptureTaken = ctx.rawCaptureTaken === true;
@@ -3358,9 +3442,9 @@
             Object.keys(structured).forEach(k => {
                 if (k === 'meta' || MEASUREMENT_ONLY_REMOVED_KEYS.includes(k)) return;
                 out[k] = structured[k];
-                if (k === 'signals') { out.eventLedger = eventLedger; out.safetyFacts = safetyFacts; }
+                if (k === 'signals') { out.eventLedger = eventLedger; out.safetyFacts = safetyFactsOut; out.overrideObserved = overrideObserved; }
             });
-            if (!('eventLedger' in out)) { out.eventLedger = eventLedger; out.safetyFacts = safetyFacts; }
+            if (!('eventLedger' in out)) { out.eventLedger = eventLedger; out.safetyFacts = safetyFactsOut; out.overrideObserved = overrideObserved; }
             if (out.summary && typeof out.summary === 'object' && 'watchListCount' in out.summary) {
                 const s = { ...out.summary }; delete s.watchListCount; out.summary = s;
             }
@@ -3396,6 +3480,155 @@
         // dashboard header, this paste header, the auto-log row's Notes — not in meta.
         const historyAgeLabel = (ageHours) => Number.isFinite(ageHours) ? ageHours.toFixed(1) : '?';
         const historyCachedFirstLine = (source, ageHours) => source === 'persisted_cache' ? 'HISTORY: CACHED, ' + historyAgeLabel(ageHours) + ' h old' : null;
+        // [SCHEDULE-AT-TIME-START] v4.1.1 (DEF-251). Every per-event lookup in the ledger and in
+        // safetyFacts used to resolve a historical timestamp against the profile live at FETCH time:
+        // the Sep 21 10:18 breakfast, dosed on the weekend layout (cr@07:00 = 11.0 until 11:00), was
+        // labelled cr {09:30, 14.6} and re-planned 28 % high, three sessions running. Nightscout has
+        // every document iAPS uploaded; this resolves each timestamp against the one that governed it.
+        // A document whose startDate EQUALS the timestamp governs it (startMs <= t).
+        const schedulesAt = (history, current, dateLike) => {
+            const t = new Date(dateLike).getTime();
+            if (!Array.isArray(history) || !history.length || !Number.isFinite(t)) {
+                return { schedules: current, source: { basis: 'current_profile', profileStartDate: null, fallback: 'no_history' } };
+            }
+            let pick = null;
+            for (const h of history) { if (h.startMs <= t) pick = h; else break; }
+            if (!pick) return { schedules: history[0].schedules, source: { basis: 'earliest_profile', profileStartDate: history[0].startDate, fallback: 'before_earliest' } };
+            return { schedules: pick.schedules, source: { basis: 'profile_at_time', profileStartDate: pick.startDate, fallback: null } };
+        };
+        // The three counters meta.profileHistory reports; one tally per run, reset by the builder.
+        const newProfileLookupTally = () => ({ profileAtTime: 0, earliestProfile: 0, currentProfile: 0 });
+        const tallyProfileLookup = (tally, source) => {
+            if (!tally || !source) return source;
+            const k = source.basis === 'profile_at_time' ? 'profileAtTime' : source.basis === 'earliest_profile' ? 'earliestProfile' : 'currentProfile';
+            tally[k]++; return source;
+        };
+        // [SCHEDULE-AT-TIME-END]
+        // [OVERRIDE-OBSERVED-START] v4.1.1 (DEF-249, CORRECTED Sep 22). iAPS records a preset
+        // activation TWICE, and neither place is where the Sep 18 design looked. A treatment
+        // eventType "Exercise" carries the preset name in `notes` and its length in `duration`
+        // minutes; every deviceStatus `openaps.suggested.reason` carries fixed tokens. What is NOT
+        // an override signal: `target_bg` (125/165/130 recur nightly under `Override Off` — the
+        // middleware's dynamic target) and `sensitivityRatio` (autoISF's ratio, 0.95–1.04 while
+        // `Override: 85` ran). The withdrawn design would have declared an override on nine of nine
+        // nights when none ran. Declared only: which preset it was, and whether it should have run,
+        // is the reviewer's.
+        const OVERRIDE_OBSERVED_BASIS = 'treatments eventType "Exercise" (notes = preset, duration = minutes) joined to the Override On/Off, Override: N, SMBs off, Target N and ISF/Basal/CR was/now tokens in deviceStatus openaps.suggested.reason; target_bg and sensitivityRatio are NOT override signals (DEF-249, corrected Sep 22)';
+        const parseOverrideReason = (reason) => {
+            const empty = { active: null, percent: null, smbsOff: null, target: null, effective: { isf: null, basal: null, cr: null } };
+            if (typeof reason !== 'string' || !reason) return empty;
+            const onOff = reason.match(/Override (On|Off)/);
+            if (!onOff) return empty;
+            const num = (re) => { const m = reason.match(re); const v = m ? parseFloat(m[1]) : NaN; return Number.isFinite(v) ? v : null; };
+            const nowOf = (name) => num(new RegExp(name + ' was\\/now [\\d.]+\\/([\\d.]+)'));
+            return { active: onOff[1] === 'On', percent: num(/Override: (\d+)/), smbsOff: /SMBs off/.test(reason),
+                     target: num(/Target:? (\d+)/), effective: { isf: nowOf('ISF'), basal: nowOf('Basal'), cr: nowOf('CR') } };
+        };
+        const buildOverrideObserved = (nightscoutData) => {
+            const iso = (ms) => Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+            const rows = (nightscoutData?.deviceStatus || [])
+                .map(d => ({ t: new Date(d?.created_at || d?.timestamp || 0).getTime(),
+                             reason: d?.openaps?.suggested?.reason ?? null }))
+                .filter(x => Number.isFinite(x.t) && x.t > 0)
+                .map(x => ({ ...x, parsed: parseOverrideReason(x.reason) }))
+                .sort((a, b) => a.t - b.t);
+            const recordsParsed = rows.length;
+            const recordsWithReason = rows.filter(x => typeof x.reason === 'string' && x.reason).length;
+            const exercises = (nightscoutData?.treatments || [])
+                .filter(t => t && t.created_at && /exercise/i.test(String(t.eventType)))
+                .map(t => ({ t: new Date(t.created_at).getTime(), preset: t.notes ?? null,
+                             durationMin: Number.isFinite(t.duration) ? t.duration : null, used: false }))
+                .filter(x => Number.isFinite(x.t)).sort((a, b) => a.t - b.t);
+            const episodes = [];
+            let cur = null;
+            rows.forEach(x => {
+                if (x.parsed.active === true) {
+                    if (!cur) cur = { startMs: x.t, endMs: null, endBasis: null, preset: null, durationMin: null,
+                                      percent: x.parsed.percent, smbsOff: x.parsed.smbsOff, targets: [],
+                                      effective: x.parsed.effective, sources: ['devicestatus.reason'] };
+                    if (x.parsed.target != null && !cur.targets.includes(x.parsed.target)) cur.targets.push(x.parsed.target);
+                } else if (x.parsed.active === false && cur) {
+                    cur.endMs = x.t; cur.endBasis = 'reason_off'; episodes.push(cur); cur = null;
+                }
+            });
+            if (cur) { cur.endMs = null; cur.endBasis = 'open_at_fetch'; episodes.push(cur); }
+            episodes.forEach(ep => {
+                const m = exercises.find(e => !e.used && Math.abs(e.t - ep.startMs) <= 10 * 60000);
+                if (m) { m.used = true; ep.preset = m.preset; ep.durationMin = m.durationMin; ep.sources = ['devicestatus.reason', 'treatments']; }
+            });
+            // An Exercise record the reason strings never confirmed still opens an episode: the
+            // activation happened, and the tool says so from the one source that recorded it.
+            exercises.filter(e => !e.used).forEach(e => episodes.push({
+                startMs: e.t, endMs: Number.isFinite(e.durationMin) ? e.t + e.durationMin * 60000 : null,
+                endBasis: Number.isFinite(e.durationMin) ? 'duration' : 'open_at_fetch',
+                preset: e.preset, durationMin: e.durationMin, percent: null, smbsOff: null, targets: [],
+                effective: { isf: null, basal: null, cr: null }, sources: ['treatments'] }));
+            episodes.sort((a, b) => a.startMs - b.startMs);
+            const out = episodes.map(ep => ({ start: iso(ep.startMs), end: iso(ep.endMs), endBasis: ep.endBasis,
+                preset: ep.preset, durationMin: ep.durationMin, percent: ep.percent, smbsOff: ep.smbsOff,
+                target: ep.targets.length ? ep.targets[0] : null,
+                ...(ep.targets.length > 1 ? { targets: ep.targets } : {}),
+                effective: ep.effective, sources: ep.sources }));
+            const last = rows.length ? rows[rows.length - 1] : null;
+            const openEp = episodes.find(ep => ep.endMs === null && ep.endBasis === 'open_at_fetch') || null;
+            const current = last && last.parsed.active === true
+                ? { active: true, percent: last.parsed.percent ?? (openEp ? openEp.percent : null), preset: openEp ? openEp.preset : null, since: openEp ? iso(openEp.startMs) : null }
+                : { active: last ? (last.parsed.active === false ? false : null) : null, percent: null, preset: null, since: null };
+            return { episodes: out, current, recordsParsed, recordsWithReason, basis: OVERRIDE_OBSERVED_BASIS,
+                     note: 'declared only — which preset it was and whether it should have run is the reviewer\'s',
+                     _rows: rows, _episodes: episodes };
+        };
+        // The per-event read: the nearest deviceStatus record at or before the event, and the preset
+        // of the episode that contains it — the same before-lookup the ledger uses for IOB.
+        const overrideAtTime = (observed, dateLike) => {
+            const t = new Date(dateLike).getTime();
+            const rows = observed?._rows || [];
+            if (!Number.isFinite(t) || !rows.length) return { active: null, percent: null, preset: null };
+            let pick = null;
+            for (const r of rows) { if (r.t <= t) pick = r; else break; }
+            if (!pick || pick.parsed.active === null) return { active: null, percent: null, preset: null };
+            if (pick.parsed.active !== true) return { active: false, percent: null, preset: null };
+            const ep = (observed._episodes || []).find(e => e.startMs <= t && (e.endMs === null || t <= e.endMs)) || null;
+            return { active: true, percent: pick.parsed.percent ?? (ep ? ep.percent : null), preset: ep ? ep.preset : null };
+        };
+        // [OVERRIDE-OBSERVED-END]
+        // [AGP-PIN-START] v4.1.1 (DEF-247). One run, one population. Every AGP object in a run is
+        // computed from the run's own fetch timestamp and memoised on the glucose array it was built
+        // from, so the fifteen call sites that used to recompute on the wall clock now read one
+        // object. The cache is keyed by (glucose array, days, asOf): a different fetch is a different
+        // array and gets its own entry, and nothing is retained after the array is dropped.
+        const AGP_PIN_CACHE = new WeakMap();
+        const agpAt = (glucose, days, asOf) => {
+            if (!Array.isArray(glucose) || !glucose.length) return null;
+            let byKey = AGP_PIN_CACHE.get(glucose);
+            if (!byKey) { byKey = new Map(); AGP_PIN_CACHE.set(glucose, byKey); }
+            const key = days + '@' + (asOf == null ? '' : String(asOf));
+            if (!byKey.has(key)) byKey.set(key, OutputFormatter.calculateAGP(glucose, days, asOf));
+            return byKey.get(key);
+        };
+        const agpForRun = (analysisResults, days) => agpAt(analysisResults?.nightscoutData?.glucose, days,
+                                                          analysisResults?.nightscoutData?.fetchedAt ?? null);
+        // The run's own clock, for every derived quantity that used to read new Date(): the fetch when
+        // there is one, the render clock only when there is not (and then the field says so).
+        const fetchAsOf = (analysisResults) => {
+            const f = analysisResults?.nightscoutData?.fetchedAt;
+            const ms = f == null ? NaN : new Date(f).getTime();
+            return Number.isFinite(ms) ? new Date(ms) : new Date();
+        };
+        // The one window every per-event and per-hour population in the export is cut to. Falls back
+        // in declared steps — never silently to the render clock (DEF-258 T4 asserts the naming).
+        const pinnedAnalysisWindow = (fetchedAt, analysisWindowDays, latestReadingMs = null) => {
+            const fetchMs = fetchedAt == null ? NaN : new Date(fetchedAt).getTime();
+            const days = analysisWindowDays || 7;
+            const endMs = Number.isFinite(fetchMs) ? fetchMs
+                        : Number.isFinite(latestReadingMs) ? latestReadingMs : Date.now();
+            const basis = Number.isFinite(fetchMs) ? 'dataFetchedAt'
+                        : Number.isFinite(latestReadingMs) ? 'latest_reading — dataFetchedAt unavailable'
+                        : 'render clock — dataFetchedAt and readings both unavailable';
+            const startMs = endMs - days * 24 * 3600000;
+            return { startMs, endMs, start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString(), days, basis };
+        };
+        // [AGP-PIN-END]
         // DEF-242 (v4.1.0): staleness is measured at Copy time and declared in the PASTE header —
         // the owner works from the Copy output, not the dashboard (owner, Sep 18). Declared, never
         // refused: a stale copy is exactly how this export reaches the engineering desk, and
@@ -4360,13 +4593,18 @@
                 if (!this.available()) return [];
                 return this._rec.changes.filter(c => c.param === param && c.scheduleTime === scheduleTime);
             },
-            daysSinceChange(param, scheduleTime) {
+            // DEF-247 (v4.1.1): asOf pins "today" for the EXPORT's readers (the ledger's
+            // context block and slotAge), which otherwise aged by a day when the owner pressed
+            // Copy after midnight. The engine's lockout gate calls it without asOf and keeps
+            // the render date — that is tonight's decision and it is not this spec's to move.
+            daysSinceChange(param, scheduleTime, asOf = null) {
                 if (!this.available()) return null;
                 const changes = this.getChangesForSlot(param, scheduleTime);
                 if (changes.length === 0) return null;
                 const last = changes[changes.length - 1];
                 const lastD = localDayStart(last.date);
-                const todayD = localDayStart(getLocalDateString());
+                const asOfMs = asOf == null ? NaN : new Date(asOf).getTime();
+                const todayD = localDayStart(getLocalDateString(Number.isFinite(asOfMs) ? new Date(asOfMs) : new Date()));
                 if (!lastD || !todayD) return null;
                 return Math.floor((todayD - lastD) / (1000 * 60 * 60 * 24));
             },
@@ -4963,7 +5201,7 @@
                         .filter(b => Math.abs(b.t - m.t) <= 15 * 60 * 1000).sort((a, b) => Math.abs(a.t - m.t) - Math.abs(b.t - m.t))[0] || null;
                     const samples = COB_SAMPLE_OFFSETS_MIN.map(off => {
                         const at = m.t + off * 60 * 1000;
-                        if (at > now.getTime()) return { offsetMin: off, cob: null, reason: 'after run time' };
+                        if (at > now.getTime()) return { offsetMin: off, cob: null, reason: 'after the fetch' };
                         if (nextMealT !== null && at >= nextMealT) return { offsetMin: off, cob: null, reason: 'after the next carb entry (+' + Math.round((nextMealT - m.t) / 60000) + ' min)' };
                         const x = nearest(at);
                         return x ? { offsetMin: off, cob: parseFloat(x.cob.toFixed(1)), at: new Date(x.t).toISOString(), cobSource: x.cobSource }
@@ -5002,7 +5240,7 @@
                         bolus: bolus ? { time: new Date(bolus.t).toISOString(), units: bolus.u } : { time: null, units: m.insulin, reason: m.insulin ? 'insulin on the carb entry itself' : 'no user bolus within ±15 min' },
                         samples, seriesComplete,
                         seriesNote: seriesComplete ? null
-                            : samples.some(sm => sm.reason === 'after run time') ? 'meal within 6h of run time — series truncated'
+                            : samples.some(sm => sm.reason === 'after the fetch') ? 'meal within 6h of the fetch — series truncated'
                             : samples.some(sm => /next carb entry/.test(sm.reason || '')) ? 'series ends at the next carb entry'
                             : 'devicestatus gaps inside the series',
                         nextMealOffsetMin: nextMealT === null ? null : Math.round((nextMealT - m.t) / 60000),
@@ -10651,12 +10889,8 @@
                 });
                 
                 // Calculate AGP early so it's available for Signal/AGP reconciliation and no-changes check
-                const agp7day = analysisResults.nightscoutData?.glucose 
-                    ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7) 
-                    : null;
-                const agp48h = analysisResults.nightscoutData?.glucose
-                    ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
-                    : null;
+                const agp7day = agpForRun(analysisResults, 7);   // DEF-247: the run's object, pinned to the fetch
+                const agp48h = agpForRun(analysisResults, 2);
                 
                 // SPEC 4: Check for "No Changes Needed" fast path
                 const primaryBundlesCheck = bundles.filter(b => b.priority === 'PRIMARY' && b.recommendations.length > 0);
@@ -11441,7 +11675,7 @@
                 // [COB-DECAY-RENDER-START] v3.6.29 (DEF-158). The other surface; renders on
                 // zero meals too, with the reason.
                 {
-                    const cd = computeCobDecay(analysisResults?.nightscoutData);
+                    const cd = computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults));
                     output += `## COB Decay (declared only, DEF-158 instrument)\n\n_${cd.statement}_\n\n`;
                     if (cd.meals.length) {
                         output += `| Meal | g | Bolus | COB at +${cd.sampleOffsetsMin.join('/+')} min | Observed g/hr |\n|------|---|-------|-----|---------------|\n`;
@@ -11686,12 +11920,11 @@
                 })() : UNAVAILABLE('fetchTelemetry');
                 // [FETCH-TELEMETRY-END]
                 // Calculate AGP (same as formatForClaude)
-                const agp7day = analysisResults.nightscoutData?.glucose
-                    ? this.calculateAGP(analysisResults.nightscoutData.glucose, 7)
-                    : null;
-                const agp48h = analysisResults.nightscoutData?.glucose
-                    ? this.calculateAGP(analysisResults.nightscoutData.glucose, 2)
-                    : null;
+                const agp7day = agpForRun(analysisResults, 7);   // DEF-247: the same object formatForClaude reads
+                const agp48h = agpForRun(analysisResults, 2);
+                // DEF-249 (v4.1.1): one read of the override record per export — the state fields and
+                // the declared block below both come from it, so they cannot disagree.
+                const overrideObservedForExport = buildOverrideObserved(analysisResults?.nightscoutData);
                 // [COVERAGE-PCT-START] v3.6.28 (DEF-119). One computation, both emitters.
                 // The quiet-night (fast-path) object emitted a SUM OF WINDOW COUNTS under the
                 // name coveragePercent — a count wearing a percent's name. The path is
@@ -11752,6 +11985,7 @@
                     suppressed: Array.isArray(PatternDetectors.lastIsfInducedLowSuppressed) ? PatternDetectors.lastIsfInducedLowSuppressed : [],
                     nightscoutData: analysisResults?.nightscoutData,
                     schedules, agp7day,
+                    profileHistory: analysisResults?.profileHistory || [],
                     periods: analysisResults?.signalAnalysis?.periods || [],
                     analysisWindowDays: config.basalSignalWindow || 7,
                     rawCaptureTaken: runContext?.rawCaptureTaken === true
@@ -11760,7 +11994,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.1.0',
+                            version: '4.1.1',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -11811,7 +12045,7 @@
                         // DEF-157: declares the schedule's shape. Both emitters.
                         scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
                         // DEF-158 instrument. Both emitters.
-                        cobDecay: computeCobDecay(analysisResults?.nightscoutData),
+                        cobDecay: computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults)),
                         // DEF-172: the fast path carries no signals.periods, so the gate's cost
                         // and pre-switch comparison ride here by period — a quiet night must
                         // not hide what the switch removed.
@@ -12277,7 +12511,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.1.0',
+                        version: '4.1.1',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12338,7 +12572,9 @@
                     state: hMeta.historyAvailable ? {
                         mode: this.formatStateName(bodyState.state).toLowerCase(),
                         daysInState: bodyState.daysInState,
-                        overridePercent: bodyState.overridePercent || null,
+                        // DEF-249 (v4.1.1): read from where iAPS records it, not from the device-local
+                        // session state, which has returned null on every export this project has filed.
+                        overridePercent: overrideObservedForExport.current.percent,
                         contributingFactors: bodyState.contributingFactors || [],
                         basalRatio: basalRatioBlock,
                         // v3.6.09 Part D (DEF-094): change history is now device-independent.
@@ -12349,7 +12585,7 @@
                         // profile), and the Sheets isOverride column is written FROM
                         // OVERRIDE_ACTIVE, which derives FROM getActiveOverride — deriving it
                         // back is a loop. Recovery-from-override IS derivable and moved.
-                        overrideStateSource: 'device_local'
+                        overrideStateSource: 'devicestatus.reason'
                     } : {
                         available: false,
                         reason: hMeta.historyUnavailableReason || 'history_unavailable',
@@ -12396,7 +12632,7 @@
                     // DEF-157: declares the schedule's shape. Both emitters.
                     scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
                     // DEF-158 instrument. Both emitters.
-                    cobDecay: computeCobDecay(analysisResults?.nightscoutData),
+                    cobDecay: computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults)),
                     // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
                     directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
                         configValue: CONFIG.directionWiringEnabled === undefined ? 'unset' : CONFIG.directionWiringEnabled,
@@ -12520,7 +12756,7 @@
                             from: c.from,
                             to: c.to,
                             changePercent: c.changePercent,
-                            detectedDate: new Date().toISOString().split('T')[0]
+                            detectedDate: getLocalDateString(fetchAsOf(analysisResults))
                         }))
                     } : UNAVAILABLE('recentChanges'),
                     schedules: {
@@ -12988,14 +13224,21 @@
             },
             
             // Calculate AGP statistics from glucose data
-            calculateAGP(glucoseData, days = 7) {
+            calculateAGP(glucoseData, days = 7, asOf = null) {
                 if (!glucoseData || glucoseData.length === 0) {
                     return null;
                 }
                 
                 // Use midnight-to-midnight boundaries like Clarity
                 // End at midnight tonight (start of today), go back N days
-                const now = new Date();
+                // DEF-247 (v4.1.1): "tonight" is the FETCH's day, not the render's. This function
+                // was called twice per run at two different moments — once during analysis (feeding
+                // intraPeriod) and again at Copy (feeding agp and hourlyLowMass) — so a session that
+                // analysed before local midnight and copied after it carried two seven-day windows in
+                // one paste: Sep 11–17 (1,901 readings) beside Sep 12–18 (1,621). asOf pins it; the
+                // callers go through agpAt/agpForRun so the objects are computed once per run.
+                const asOfMs = asOf == null ? NaN : new Date(asOf).getTime();
+                const now = Number.isFinite(asOfMs) ? new Date(asOfMs) : new Date();
                 const endOfWindow = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
                 const startOfWindow = new Date(endOfWindow);
                 startOfWindow.setDate(startOfWindow.getDate() - days + 1);
@@ -13129,6 +13372,11 @@
                         hour: h,
                         count: vals.length,
                         daysContributing: hourlyDays[h].size,
+                        // DEF-245 (v4.1.1): the near-low tier is counted HERE, on the same readings the
+                        // hour's count and TIR are computed from. It used to be counted over a second,
+                        // differently-windowed walk of the trace and then divided by this count — a
+                        // numerator and a denominator from two populations, which is the defect.
+                        nearLow: vals.filter(v => v >= 70 && v <= 80).length,
                         min: Math.min(...vals),
                         max: Math.max(...vals),
                         mean: hMean,
@@ -14530,16 +14778,22 @@
                     }
                     
                     // Fetch profile - CRITICAL for correct schedule data
-                    const profileUrl = `${baseUrl}/api/v1/profile.json${token ? `?token=${token}` : ''}`;
+                    // DEF-251 (v4.1.1): Nightscout stores EVERY profile document iAPS uploads, each
+                    // with its own startDate. The tool was keeping profiles[0] and resolving every
+                    // historical timestamp against it — so a meal dosed on the weekend layout was
+                    // re-planned on today's, three sessions running. The history is on the server;
+                    // ask for it. profile stays profiles[0] so no existing consumer moves.
+                    const profileUrl = `${baseUrl}/api/v1/profile.json?count=50${token ? `&token=${token}` : ''}`;
                     console.log('Fetching profile...');
                     const profileRes = await fetch(profileUrl, { headers });
                     let profile = null;
+                    let profiles = [];
                     if (profileRes.ok) {
-                        const profiles = await profileRes.json();
-                        // Get the active profile (usually the first one)
-                        if (profiles && profiles.length > 0) {
+                        const body = await profileRes.json();
+                        profiles = Array.isArray(body) ? body : (body ? [body] : []);   // a legacy single object is a one-document history
+                        if (profiles.length > 0) {
                             profile = profiles[0];
-                            console.log('Profile fetched:', profile.defaultProfile);
+                            console.log('Profile fetched:', profile.defaultProfile, '· documents:', profiles.length);
                         }
                     } else {
                         console.warn('Profile fetch failed (non-fatal):', profileRes.status);
@@ -14603,7 +14857,7 @@
 
                     // DEF-189 (v3.6.37): the fetch's own timestamp, so the raw-fetch file and the
                     // Copy export can be paired by fact rather than by inference from click times.
-                    return { glucose: dedupedGlucose, treatments, deviceStatus: dedupedDeviceStatus, profile, fetchedAt: new Date().toISOString() };
+                    return { glucose: dedupedGlucose, treatments, deviceStatus: dedupedDeviceStatus, profile, profiles, fetchedAt: new Date().toISOString() };
                     
                 } catch (err) {
                     console.error('Nightscout fetch error:', err);
@@ -14612,6 +14866,13 @@
             };
             
             // Parse profile to extract schedules
+            // DEF-251 (v4.1.1): the parsed history, beside the parser it uses. Sorted oldest first;
+            // documents without a readable startDate or an unparseable store are dropped rather than
+            // guessed at, so a malformed document cannot silently become "the profile at that time".
+            const parseProfileHistory = (profiles) => (Array.isArray(profiles) ? profiles : [])
+                .map(pr => ({ startDate: pr?.startDate ?? pr?.created_at ?? null, startMs: Date.parse(pr?.startDate ?? pr?.created_at ?? ''), schedules: parseProfile(pr), _id: pr?._id ?? null }))
+                .filter(h => Number.isFinite(h.startMs) && h.schedules)
+                .sort((a, b) => a.startMs - b.startMs);
             const parseProfile = (profile) => {
                 if (!profile || !profile.store) return null;
                 
@@ -15231,7 +15492,7 @@
 
                 // DQ-C FIX (complete): single AGP computation shared by tir7d + all 6 period TIR fields
                 const agp7d_auto = (() => {
-                    try { return OutputFormatter.calculateAGP(nightscoutData?.glucose, 7); }
+                    try { return agpAt(nightscoutData?.glucose, 7, nightscoutData?.fetchedAt ?? null); }
                     catch(e) { return null; }
                 })();
 
@@ -15525,6 +15786,10 @@
                     } else {
                         console.warn('No profile found in Nightscout, using default schedules');
                     }
+                    // DEF-251: the history the fetch kept, parsed once. [] when the server returned
+                    // one document or none — every filed raw before v4.1.1 is that case.
+                    const profileHistory = parseProfileHistory(nightscoutData.profiles || (nightscoutData.profile ? [nightscoutData.profile] : []));
+                    console.log('Profile history documents:', profileHistory.length);
                     
                     // [CHANGE-RECORD-RESOLVE] v3.6.09 (DEF-094). The change record is built
                     // HERE — before StateDetector.detect, before createBundles — from the
@@ -15966,8 +16231,10 @@
                             tir:     stats.tir.inRange || 0,
                             mean:    stats.mean || 0
                         } : null) ?? null;
-                        hourlyAgpStats7d  = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 7));
-                        hourlyAgpStats48h = mapStats(OutputFormatter.calculateAGP(nightscoutData.glucose, 2));
+                        // DEF-247: the detector path and the export path now read ONE object per
+                        // (days, fetch). intraPeriod and hourlyLowMass cannot diverge by a clock again.
+                        hourlyAgpStats7d  = mapStats(agpAt(nightscoutData.glucose, 7, nightscoutData?.fetchedAt ?? null));
+                        hourlyAgpStats48h = mapStats(agpAt(nightscoutData.glucose, 2, nightscoutData?.fetchedAt ?? null));
                     }
 
                     allFindings.push(...PatternDetectors.detectBasalSignals(
@@ -16578,6 +16845,7 @@
                         nightscoutData,
                         basalRatioInfo,
                         activeSchedules,
+                        profileHistory,          // DEF-251 (v4.1.1): resolved per event, never live-only
                         effectiveBasalTarget,
                         effectiveTargetSource,
                         finalPercent,
@@ -16800,7 +17068,8 @@
                                 dataFetchedAt: nd.fetchedAt ?? null,
                                 localCapturedAt: new Date().toLocaleString(), timezoneOffsetMin: new Date().getTimezoneOffset(),
                                 analysisWindowDays: basalSignalWindow || 7 },
-                        nightscoutData: { glucose: nd.glucose || [], treatments: nd.treatments || [], deviceStatus: nd.deviceStatus || [], profile: nd.profile ?? null },
+                        nightscoutData: { glucose: nd.glucose || [], treatments: nd.treatments || [], deviceStatus: nd.deviceStatus || [], profile: nd.profile ?? null,
+                                          profiles: nd.profiles ?? null },   // DEF-251: the replay needs the history, not just the live document
                         history: Array.isArray(cachedSheetsEntries) ? cachedSheetsEntries : null,
                         config: { basalSignalWindow: basalSignalWindow ?? null, targetBG: CONFIG.targetBG ?? null, pumpIncrement: CONFIG.pumpIncrement ?? null }
                     };
@@ -17490,7 +17759,7 @@
                     // SPEC 2: Trend tracking columns
                     tir7d: (() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const agp = agpForRun(analysisResults, 7);
                             return agp ? agp.tir.inRange.toFixed(1) : '';
                         } catch(e) { return ''; }
                     })(),
@@ -17498,42 +17767,42 @@
                     // SPEC 2+: Period TIR tracking
                     tirDeepSleep: (() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const agp = agpForRun(analysisResults, 7);
                             const tir = OutputFormatter.calculatePeriodTIR(agp, 'Deep Sleep');
                             return tir !== null ? tir.toString() : '';
                         } catch(e) { return ''; }
                     })(),
                     tirDawn: (() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const agp = agpForRun(analysisResults, 7);
                             const tir = OutputFormatter.calculatePeriodTIR(agp, 'Dawn');
                             return tir !== null ? tir.toString() : '';
                         } catch(e) { return ''; }
                     })(),
                     tirMorning: (() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const agp = agpForRun(analysisResults, 7);
                             const tir = OutputFormatter.calculatePeriodTIR(agp, 'Morning');
                             return tir !== null ? tir.toString() : '';
                         } catch(e) { return ''; }
                     })(),
                     tirAfternoon: (() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const agp = agpForRun(analysisResults, 7);
                             const tir = OutputFormatter.calculatePeriodTIR(agp, 'Afternoon');
                             return tir !== null ? tir.toString() : '';
                         } catch(e) { return ''; }
                     })(),
                     tirEvening: (() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const agp = agpForRun(analysisResults, 7);
                             const tir = OutputFormatter.calculatePeriodTIR(agp, 'Evening');
                             return tir !== null ? tir.toString() : '';
                         } catch(e) { return ''; }
                     })(),
                     tirSleepOnset: (() => {
                         try {
-                            const agp = OutputFormatter.calculateAGP(analysisResults?.nightscoutData?.glucose, 7);
+                            const agp = agpForRun(analysisResults, 7);
                             const tir = OutputFormatter.calculatePeriodTIR(agp, 'Sleep Onset');
                             return tir !== null ? tir.toString() : '';
                         } catch(e) { return ''; }
@@ -17647,7 +17916,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.1.0 — measurement-only export · DEF-238 the correction exclusion set is window-scoped · DEF-239 low fields on every ledger row · DEF-241 every low names its candidate blocks · DEF-242 the paste declares its own data age · DEV-l hourly day counts declared · v4.0.5 stop-on-failed-read underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.1.1 — measurement-only export · one clock, one profile, one window · DEF-247 every window pinned to the fetch · DEF-245 one per-hour population · DEF-249 the override read from where iAPS records it · DEF-251 each event resolved against the profile that governed it · DEF-258 lowEvents on the analysis window · v4.1.0 underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the screen, the Copy and the sheet row carry no bundles, priorities or recommended values. Press ⬇ Raw fetch before copying.
