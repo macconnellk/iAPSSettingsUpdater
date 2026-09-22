@@ -3437,6 +3437,24 @@
             // §12d: an observable, not a reminder. false is a value and is emitted as one.
             meta.rawCaptureTaken = ctx.rawCaptureTaken === true;
             meta.lagProvenance = ledgerLagProvenance();
+            // DEF-261 (v4.1.1, PM ruling Sep 22): the one clock this build deliberately did NOT pin.
+            // DEF-247 moved every derived quantity in the export onto dataFetchedAt, including the
+            // two age fields this document carries. The engine's recent-change lockout still reads
+            // the render date — it decides tonight, on tonight's date, and pinning it would break
+            // flag-off's byte-for-byte promise for a path no clinical session runs. Declared, not
+            // corrected, so a reader never has to work out which ages moved and which did not.
+            meta.clockProvenance = {
+                pinnedToFetch: ['agp (7-day and 48-hour)', 'hourlyLowMass and its near-low tier', 'lowEvents and lowEventsWindow',
+                                'glucoseTrace24h', 'cobDecay series truncation', 'recentChanges.autoDetected[].detectedDate',
+                                'eventLedger[].context.daysSinceBlockChanged', 'safetyFacts.slotAge[].daysSince'],
+                readsTheRenderClock: [
+                    { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
+                    { field: 'meta.pageAgeHours', why: 'the gap between the fetch and the Copy (DEF-242); it exists to be non-zero' },
+                    { field: 'historyAgeHours', why: 'how old the sheet rows are at the moment they are copied (DEV-o, accepted Sep 22)' },
+                    { field: 'ProtectionSystem recent-change lockout (engine, not emitted under this flag)', why: 'DEF-261: tonight\'s decision is made on tonight\'s date; pinning it would move flag-off clinical behaviour' }
+                ],
+                basis: 'DEF-247 pinned every derived quantity in this export to dataFetchedAt; the four fields above read the render clock because that is what they measure (DEF-261)'
+            };
             meta.eventCensus = eventCensus;
             const out = { meta };
             Object.keys(structured).forEach(k => {
