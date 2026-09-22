@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.1.1</title>
+    <title>Daily Insulin Settings Review v4.1.2</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2725,6 +2725,16 @@
             if (status.openaps?.iob?.iob != null) return status.openaps.iob.iob;
             return null;
         };
+        // DEF-252 (v4.1.2, closed as diagnosed): the net figure was read as a bolus figure. The
+        // Sep 21 currentIOB −0.006 was bolusIob 0.997 + basalIob −1.003 — a unit of bolus insulin
+        // still acting against a unit of scheduled basal withheld by two hours of zero-temp. No
+        // defect in the loop; a missing declaration in the export.
+        const extractBolusIOB = (status) => {
+            if (!status) return null;
+            if (status.iob && typeof status.iob === 'object' && status.iob.bolusiob != null) return status.iob.bolusiob;
+            if (status.openaps?.iob?.bolusiob != null) return status.openaps.iob.bolusiob;
+            return null;
+        };
         const extractBasalIOB = (status) => {
             if (!status) return null;
             if (status.iob && typeof status.iob === 'object' && status.iob.basaliob != null) return status.iob.basaliob;
@@ -3116,6 +3126,9 @@
                                bgAtMin180: readingNear(ms + 180 * 60000), bgAtMin240: readingNear(ms + 240 * 60000), readingsInWindow: win.length, gapsInWindow,
                                windowMin: [-180, 240] },
                     insulin: { iobAtEvent: iob.value ?? null, iobSource: iob.value == null ? null : 'openaps.iob (before-record)', iobRecordAgeMin: iob.ageMinutes ?? null,
+                               // DEF-252: the split, at the event, from the same before-record.
+                               bolusIobAtEvent: (() => { const rec = findDeviceStatusAt(deviceStatus, evDate, { direction: 'before' }); return rec ? extractBolusIOB(rec) : null; })(),
+                               basalIobAtEvent: (() => { const rec = findDeviceStatusAt(deviceStatus, evDate, { direction: 'before' }); return rec ? extractBasalIOB(rec) : null; })(),
                                netIobAtNadir, basalIobAtNadir,
                                bolusUnits: lastBolus ? lastBolus.insulin : null, bolusTime: lastBolus ? new Date(lastBolus.created_at).toISOString() : null, bolusCount: boluses.length,
                                mealBolus: mealBolus ? { time: new Date(mealBolus.created_at).toISOString(), units: mealBolus.insulin, excludedFromCorrections: inWindow(mealBolus) } : null,
@@ -3142,11 +3155,17 @@
                                             targetBG: (() => { const t = ledgerEntryAt(((evSched.schedules?.targetBG || schedules?.targetBG) || []).map(x => ({ time: x.time, value: x.midpoint ?? x.targetLow })), evDate); return t ? t.value : CONFIG.targetBG; })() },
                     scheduleSource: evSched.source,
                     overrideAtEvent: overrideAtTime(ledgerOverride, evDate),
+                    podAgeHours: deviceAgeHoursAt(treatments, 'pod', ms),        // DEF-259
+                    sensorAgeHours: deviceAgeHoursAt(treatments, 'sensor', ms),  // DEF-259
                     candidateBlocks: {
                         basal: { method: 'inverse of basalEffectWindow', lag: { minH: CONFIG.basalEffectLagH[0], maxH: CONFIG.basalEffectLagH[1], source: 'CONFIG.basalEffectLagH', basis: 'ASSERTED — not measured. See lagProvenance.' },
                                  blocks: ledgerBasalCandidates(evBasalS, evDate) },
-                        cr:  { method: 'getCRForTime at each carb entry timestamp, on the profile in effect at that entry (DEF-251)', lag: null,
-                               blocks: episode.map(c => { const e = ledgerEntryAt(crAtEntry(c.created_at), new Date(c.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs }; }) },
+                        cr:  type === 'hypo'
+                             ? { method: CR_EPISODES_METHOD, lag: null, cobAtEvent: cobRead.value ?? null,
+                                 cobBasis: 'the loop reports one COB across all active carbs; it is stated here once, not per episode',
+                                 blocks: ledgerCrEpisodes(evDate, treatments, deviceStatus, crAtEntry, govCarb, (at) => schedAt(at).source.profileStartDate) }
+                             : { method: 'getCRForTime at each carb entry timestamp, on the profile in effect at that entry (DEF-251)', lag: null,
+                                 blocks: episode.map(c => { const e = ledgerEntryAt(crAtEntry(c.created_at), new Date(c.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs }; }) },
                         isf: { method: 'getISFForTime at each correction timestamp, on the profile in effect at that correction (DEF-251)', lag: null,
                                blocks: corrections.map(t => { const e = ledgerEntryAt(schedAt(t.created_at).schedules?.isf || isfS, new Date(t.created_at)); return { time: e ? e.time : null, value: e ? e.value : null, correctionTime: new Date(t.created_at).toISOString(), units: t.insulin }; }) }
                     },
@@ -3342,8 +3361,10 @@
                 return {
                     basal: { method: 'inverse of basalEffectWindow, on the profile in effect at the low (DEF-251)', lag: { minH: CONFIG.basalEffectLagH[0], maxH: CONFIG.basalEffectLagH[1], source: 'CONFIG.basalEffectLagH', basis: 'ASSERTED — not measured. See meta.lagProvenance.' },
                              blocks: ledgerBasalCandidates(sfSchedAt(evDate).schedules?.basal || sfBasal, evDate) },
-                    cr: govCarb ? { method: 'getCRForTime at each carb entry timestamp of the governing episode, on the profile in effect at that entry (DEF-251)', lag: null,
-                                    blocks: episode.map(c => { const en = ledgerEntryAt(sfSchedAt(c.created_at).schedules?.cr || sfCr, new Date(c.created_at)); return { time: en ? en.time : null, value: en ? en.value : null, carbEntryTime: new Date(c.created_at).toISOString(), grams: c.carbs, profileStartDate: sfSchedAt(c.created_at).source.profileStartDate }; }) }
+                    cr: govCarb ? { method: CR_EPISODES_METHOD, lag: null,
+                                    cobAtEvent: (() => { const rec = findDeviceStatusAt(nightscoutData?.deviceStatus || [], evDate, { direction: 'before' }); return rec ? (extractCOB(rec).value ?? null) : null; })(),
+                                    cobBasis: 'the loop reports one COB across all active carbs; it is stated here once, not per episode',
+                                    blocks: ledgerCrEpisodes(evDate, sfTreatments, nightscoutData?.deviceStatus || [], (at) => (sfSchedAt(at).schedules?.cr || sfCr), govCarb, (at) => sfSchedAt(at).source.profileStartDate) }
                                  : null,
                     crOmittedReason: govCarb ? null : 'no governing carb entry',
                     isf: null,
@@ -3355,6 +3376,8 @@
                 return { time: new Date(e.time).toISOString(), bg: e.bg, hour: new Date(e.time).getHours(), netIob: rec ? extractIOB(rec) : null, basalIob: rec ? extractBasalIOB(rec) : null, treatmentCarbsImputed: null,
                          rapidRecovery: shape.rapidRecovery, isolated: shape.isolated, gapsNearEvent: shape.gapsNearEvent, readingsNearEvent: shape.readingsNearEvent, shapeFlagged: shape.shapeFlagged, readingsInEvent: e.readings.length,
                          overrideAtEvent: overrideAtTime(safetyOverride, new Date(e.time)),
+                         podAgeHours: deviceAgeHoursAt(sfTreatments, 'pod', new Date(e.time).getTime()),
+                         sensorAgeHours: deviceAgeHoursAt(sfTreatments, 'sensor', new Date(e.time).getTime()),
                          candidateBlocks: lowCandidateBlocks(new Date(e.time)) }; });
             // hourlyLowMass's second figure: lowPct with the shape-flagged events' own readings removed
             // from the low count, over the same hourly denominator (calculateAGP's count); emitted on
@@ -3368,12 +3391,60 @@
                 row.lowPctExcludingShapeFlagged = Math.max(0, row.lowPct - (removed / row.readings) * 100);
             });
             // [LOW-SHAPE-END]
+            // [RULE1-JOIN-START] v4.1.2 (DEF-254). Rule 1's join, declared per block. v7.2 §1 reads
+            // basal off candidateBlocks.basal, CR off candidateBlocks.cr (the completion-crash join)
+            // and ISF off the clock span until DEF-241's ISF attribution exists — and the reviewer
+            // has been performing that join by hand, nine events against thirty-nine blocks, every
+            // session. The fields have existed since v4.1.0; this is the join, written down.
+            // NO EXCLUSIONS: voids, superseded regimes and fingerstick contradictions stay the
+            // reviewer's, per event, exactly as v7.1 §1 writes them. Nothing reads this field.
+            const rule1Join = parameterSpans.map(sp => {
+                const rows = [];
+                lows.forEach((lw, i) => {
+                    const cb = lw.candidateBlocks || {};
+                    const base = { time: lw.time, bg: lw.bg, hour: lw.hour, readingsInEvent: lw.readingsInEvent, shapeFlagged: lw.shapeFlagged };
+                    if (sp.parameter === 'basal') {
+                        if ((cb.basal?.blocks || []).some(b => b.time === sp.time)) rows.push(base);
+                    } else if (sp.parameter === 'cr') {
+                        // DEF-260: a low is listed under EVERY CR block any of its episodes names,
+                        // with how long before the event that episode's entry was made.
+                        const hit = (cb.cr?.blocks || []).filter(b => b.time === sp.time);
+                        if (hit.length) rows.push({ ...base, minsBeforeEvent: hit[0].minsBeforeEvent ?? null, grams: hit[0].grams ?? null, governing: hit[0].governing ?? null });
+                    } else {
+                        const hours = sp.spansHours || [];
+                        const src = lowEvents[i];
+                        if ((src?.readings || []).some(r => hours.includes(new Date(r.dateString).getHours()))) rows.push(base);
+                    }
+                });
+                return { parameter: sp.parameter, time: sp.time, value: sp.value,
+                         basis: sp.parameter === 'basal' ? 'candidateBlocks.basal — asserted lag, see meta.lagProvenance'
+                              : sp.parameter === 'cr' ? 'candidateBlocks.cr — every episode with a carb entry in [−6 h, 0] (DEF-260)'
+                              : 'clock span — isf attribution not built (DEF-241)',
+                         lowEvents: rows };
+            });
+            // A CR block named by an episode but no longer in the CURRENT schedule has no row above —
+            // the rows are parameterSpans, which is what the reviewer edits. Under DEF-251 that is a
+            // real case: the Sep 19 and Sep 20 lunches were dosed on cr@11:00, a block the weekday
+            // layout has since retired. Silence there would read as clearance, so it is declared.
+            const currentBlocks = new Set(parameterSpans.map(sp => sp.parameter + '@' + sp.time));
+            const retiredHits = {};
+            lows.forEach(lw => (lw.candidateBlocks?.cr?.blocks || []).forEach(b => {
+                if (!b.time || currentBlocks.has('cr@' + b.time)) return;
+                const k = 'cr@' + b.time;
+                (retiredHits[k] = retiredHits[k] || { parameter: 'cr', time: b.time, lowEvents: [] })
+                    .lowEvents.push({ time: lw.time, bg: lw.bg, hour: lw.hour, minsBeforeEvent: b.minsBeforeEvent ?? null, grams: b.grams ?? null });
+            }));
+            const rule1JoinRetiredBlocks = Object.values(retiredHits);
+            // [RULE1-JOIN-END]
             // The two sums, and whether they agree — declared, not asserted. They can differ
             // legitimately (a low episode straddling the window edge contributes readings on one
             // side only), and a reader seeing `equal: false` should look at the edge, not assume a bug.
             const lowEventReadings = lows.reduce((a, e) => a + (e.readingsInEvent || 0), 0);
             const hourlyLowMassReadings = hourlyLowMass.reduce((a, h) => a + Math.round(((h.lowPct || 0) / 100) * (h.readings || 0)), 0);
             return { hourlyLowMass, parameterSpans, slotAge, recurrence, populationBasis, lowEvents: lows, lowShapeRule: LOW_SHAPE_RULE,
+                     rule1Join, rule1JoinRetiredBlocks,
+                     rule1JoinRetiredBasis: 'CR blocks an episode named that the CURRENT schedule no longer carries — they have no row above because the rows are the blocks the reviewer edits, and an empty result there would read as clearance (DEF-183)',
+                     rule1JoinBasis: 'one row per parameterSpans entry; a low appears under a block when the join v7.2 §1 names puts it there. No exclusions are applied — voids, superseded regimes and fingerstick contradictions are the reviewer\'s, per event. Nothing reads this field (DEF-254).',
                      lowEventsWindow: { start: safetyWindow.start, end: safetyWindow.end, days: safetyWindow.days, basis: 'analysisWindow (DEF-258) — ' + safetyWindow.basis },
                      lowEventsCoverLowMass: { lowEventReadings, hourlyLowMassReadings, equal: lowEventReadings === hourlyLowMassReadings },
                      profileLookups: safetyProfileTally,
@@ -3436,6 +3507,11 @@
             meta.measurementOnly = true;
             // §12d: an observable, not a reminder. false is a value and is emitted as one.
             meta.rawCaptureTaken = ctx.rawCaptureTaken === true;
+            meta.rawCaptureSource = ctx.rawCaptureTaken === true ? (ctx.rawCaptureSource ?? null) : null;   // DEF-256
+            meta.rawCaptureError = ctx.rawCaptureError ?? null;
+            meta.profile = ctx.profileFacts || { dia: null, carbsHr: null, startDate: null, defaultProfile: null };   // DEF-257
+            meta.deviceAges = buildDeviceAges(ctx.nightscoutData?.treatments, ctx.nightscoutData?.fetchedAt ?? null,
+                                              pinnedAnalysisWindow(ctx.nightscoutData?.fetchedAt ?? null, ctx.analysisWindowDays).startMs);   // DEF-259
             meta.lagProvenance = ledgerLagProvenance();
             // DEF-261 (v4.1.1, PM ruling Sep 22): the one clock this build deliberately did NOT pin.
             // DEF-247 moved every derived quantity in the export onto dataFetchedAt, including the
@@ -3451,7 +3527,16 @@
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
                     { field: 'meta.pageAgeHours', why: 'the gap between the fetch and the Copy (DEF-242); it exists to be non-zero' },
                     { field: 'historyAgeHours', why: 'how old the sheet rows are at the moment they are copied (DEV-o, accepted Sep 22)' },
-                    { field: 'ProtectionSystem recent-change lockout (engine, not emitted under this flag)', why: 'DEF-261: tonight\'s decision is made on tonight\'s date; pinning it would move flag-off clinical behaviour' }
+                    { field: 'ProtectionSystem recent-change lockout (engine, not emitted under this flag)', why: 'DEF-261: tonight\'s decision is made on tonight\'s date; pinning it would move flag-off clinical behaviour' },
+                    // DEV-p (v4.1.2, found by the two-clock harness on the Sep 22 21:26 raw): both of
+                    // these exclude "today" via isBeforeToday, so a Copy pressed after local midnight
+                    // promotes the current session's row from excluded to counted. Declared rather
+                    // than pinned: excludeToday and lastRowBefore are shared with flag-off surfaces,
+                    // and DEF-261's ruling is that a shared render-date reader is not this build's to
+                    // move. appliedBasalDelta.priorTotal is the one that matters — it is the "what did
+                    // we actually change" figure, and it should not depend on when Copy is pressed.
+                    { field: 'monthlyOutcomes[] (sessions, daysCovered, meanTIR7d, meanTBRunder70)', why: 'DEV-p: buckets by month over excludeToday(rows); a post-midnight Copy counts the current session' },
+                    { field: 'appliedBasalDelta (deltaUPerDay, deltaPercent, priorTotal)', why: 'DEV-p: prior snapshot is lastRowBefore(today); a post-midnight Copy picks a different prior row' }
                 ],
                 basis: 'DEF-247 pinned every derived quantity in this export to dataFetchedAt; the four fields above read the render clock because that is what they measure (DEF-261)'
             };
@@ -3522,6 +3607,85 @@
             tally[k]++; return source;
         };
         // [SCHEDULE-AT-TIME-END]
+        // [DEVICE-AGES-START] v4.1.2 (DEF-259). The treatments carry Site Change and Sensor Start
+        // records; v7.1 §0b makes pod day and sensor day owner-declared every session, and Sep 18's
+        // log read "my count is pod d2, sensor d4" while Sep 21's read "sensor day unconfirmed".
+        // The tool has the record and was not reading it. Declared only — the owner corrects on
+        // disagreement, and a category with no record in the fetch says so rather than reading zero.
+        const DEVICE_AGE_TYPES = { pod: ['site change', 'insulin change'], sensor: ['sensor start', 'sensor change'] };
+        const deviceAgeEvents = (treatments, kind) => (treatments || [])
+            .filter(t => t && t.created_at && t.eventType && DEVICE_AGE_TYPES[kind].includes(String(t.eventType).trim().toLowerCase()))
+            .map(t => new Date(t.created_at).getTime())
+            .filter(ms => Number.isFinite(ms))
+            .sort((a, b) => a - b);
+        const deviceAgeHoursAt = (treatments, kind, atMs) => {
+            const list = deviceAgeEvents(treatments, kind).filter(ms => ms <= atMs);
+            return list.length ? Math.round(((atMs - list[list.length - 1]) / 3600000) * 100) / 100 : null;
+        };
+        const buildDeviceAges = (treatments, fetchedAt, windowStartMs = null) => {
+            const atMs = fetchedAt ? new Date(fetchedAt).getTime() : NaN;
+            const mk = (kind, lastKey, listKey) => {
+                const all = deviceAgeEvents(treatments, kind);
+                const before = Number.isFinite(atMs) ? all.filter(ms => ms <= atMs) : all;
+                if (!before.length) return { [lastKey]: null, ageHoursAtFetch: null, [listKey]: [], reason: 'no record in the fetched treatments' };
+                const last = before[before.length - 1];
+                return { [lastKey]: new Date(last).toISOString(),
+                         ageHoursAtFetch: Number.isFinite(atMs) ? Math.round(((atMs - last) / 3600000) * 100) / 100 : null,
+                         [listKey]: all.filter(ms => windowStartMs === null || ms >= windowStartMs).map(ms => new Date(ms).toISOString()) };
+            };
+            return {
+                pod: mk('pod', 'lastChangeAt', 'changesInWindow'),
+                sensor: mk('sensor', 'lastStartAt', 'startsInWindow'),
+                basis: "treatments eventType 'Site Change' / 'Sensor Start' (also 'Sensor Change', 'Insulin Change' if present); age measured to dataFetchedAt",
+                note: 'declared only'
+            };
+        };
+        // [DEVICE-AGES-END]
+        // [CR-EPISODES-START] v4.1.2 (DEF-260, ruled Sep 22 after the v7.2 T3 run). Rule 1 asks
+        // which CR block could have dosed a low. `candidateBlocks.cr` answered with the GOVERNING
+        // episode only — the latest carb entry before the event — and on the Sep 20 57 that is the
+        // 73 g snack entered thirteen minutes earlier, which could not have dosed it. The breakfast
+        // episode that could (41 g at 13:26Z, on cr 07:00) was absent from the record entirely.
+        // Every episode with a carb entry in [−6 h, 0] is now listed, most recent first, no
+        // threshold and nothing dropped; `governingAtEventTime.cr` and `plan` keep the episode rule,
+        // which is right for them. The loop reports ONE COB for all active carbs, so cobAtEvent is
+        // stated once on the object rather than pretended to be per-episode.
+        const ledgerCrEpisodes = (evDate, treatments, deviceStatus, crAtTime, govCarb, profileStartAt = null) => {
+            const ms = evDate.getTime();
+            const inWindow = (treatments || []).filter(t => t && t.created_at && t.carbs > 0)
+                .filter(t => { const at = new Date(t.created_at).getTime(); return Number.isFinite(at) && at <= ms && at >= ms - 6 * 3600000; })
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const nonSmb = (treatments || []).filter(t => t && t.created_at && t.insulin > 0 && !(t.eventType && String(t.eventType).includes('SMB')))
+                .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+            const used = new Set();
+            const out = [];
+            inWindow.forEach(entry => {
+                if (used.has(entry)) return;
+                const episode = ledgerMealEpisode(entry, treatments, deviceStatus) || [entry];
+                episode.forEach(c => used.add(c));
+                const last = episode[episode.length - 1] || entry;
+                const lastMs = new Date(last.created_at).getTime();
+                const e = ledgerEntryAt(crAtTime(last.created_at), new Date(last.created_at));
+                // The bolus that paid for the episode's governing entry, by the same [−2, +90]
+                // rule the plan uses; its age says whether its insulin could still be acting.
+                const bolus = nonSmb.find(t => { const m = (new Date(t.created_at).getTime() - lastMs) / 60000; return m >= -2 && m <= 90; }) || null;
+                out.push({
+                    time: e ? e.time : null, value: e ? e.value : null,
+                    carbEntryTime: new Date(last.created_at).toISOString(),
+                    profileStartDate: profileStartAt ? profileStartAt(last.created_at) : null,   // DEF-251, kept
+                    grams: episode.reduce((a, c) => a + (c.carbs || 0), 0),
+                    entries: episode.length,
+                    minsBeforeEvent: Math.round((ms - lastMs) / 60000),
+                    bolusTime: bolus ? new Date(bolus.created_at).toISOString() : null,
+                    bolusUnits: bolus ? bolus.insulin : null,
+                    bolusAgeMin: bolus ? Math.round((ms - new Date(bolus.created_at).getTime()) / 60000) : null,
+                    governing: !!(govCarb && new Date(govCarb.created_at).getTime() === lastMs)
+                });
+            });
+            return out.sort((a, b) => a.minsBeforeEvent - b.minsBeforeEvent);
+        };
+        const CR_EPISODES_METHOD = 'every episode with a carb entry in [−6 h, 0] of the event, most recent first, CR resolved on the profile in effect at each episode\'s governing entry (DEF-260 + DEF-251); no threshold, nothing dropped';
+        // [CR-EPISODES-END]
         // [OVERRIDE-OBSERVED-START] v4.1.1 (DEF-249, CORRECTED Sep 22). iAPS records a preset
         // activation TWICE, and neither place is where the Sep 18 design looked. A treatment
         // eventType "Exercise" carries the preset name in `notes` and its length in `duration`
@@ -3674,7 +3838,9 @@
                 + '_This build emits what the tool measured. It carries no bundles, priorities, severities, recommended values, '
                 + 'or detector classifications. Read `eventLedger`, `safetyFacts` and `signals.periods` under the measurement-only '
                 + 'clinical instructions; the basal effect lag in `candidateBlocks.basal` is asserted, not measured (`meta.lagProvenance`)._\n\n'
-                + '- Raw capture taken this page load: **' + (m.rawCaptureTaken === true ? 'YES' : 'NO — press ⬇ Raw fetch before pasting; T1/close condition 3 cannot run without it') + '**\n'
+                + '- Raw capture taken this page load: **' + (m.rawCaptureTaken === true ? ('YES (' + (m.rawCaptureSource || 'unknown') + ')')
+                    : m.rawCaptureError ? ('NO — download failed: ' + m.rawCaptureError)
+                    : 'NO — press ⬇ Raw fetch before pasting; T1/close condition 3 cannot run without it') + '**\n'
                 + '- Data fetched at: ' + (m.dataFetchedAt || 'unknown') + '\n'
                 + '- Event census: detected ' + (c.detected ?? '?') + '; emitted ' + (c.emittedRecords ?? '?') + ' → ' + emittedByType + '\n'
                 + '- Dropped: as signal ' + (c.droppedAsSignal ?? '?') + ' → ' + droppedByType
@@ -4699,7 +4865,8 @@
                         basal: parseSched(e.basalSchedule),
                         cr: parseSched(e.crSchedule),
                         isf: parseSched(e.isfSchedule)
-                    }
+                    },
+                    reanchors: parseReanchorTokens(e.decisionLog)   // DEF-253
                 }));
 
             // Percent deltas per consecutive-session pair. Only keys numeric in BOTH
@@ -4707,19 +4874,29 @@
             // structural tally (never NaN/Infinity). Missing whole snapshot = no data.
             const pairDeltas = [];
             const pairStructural = [];
+            const pairReanchored = [];
+            // DEF-253: a re-anchored block is not a touch. The instrument measures how much the
+            // owner moves a block; re-entering the same dose under a different carb count is not
+            // movement, and counting it would have taken cr 09:30 from 7.3 % gross to ~29 %.
+            const reanchoredOn = (i, param, block) => [i, i - 1].some(j => sessions[j] && sessions[j].reanchors.some(r => r.param === param && r.block === block));
             for (let i = 1; i < sessions.length; i++) {
                 const deltas = [];
                 let structural = 0;
+                let reanchored = 0;
                 // v3.6.09: the key walk moved to the shared primitive. unionKeys:true
                 // preserves this walker's add/remove structural tally exactly.
                 OSC_PARAMS.forEach(param => {
                     const d = diffScheduleSnapshot(sessions[i - 1].scheds[param],
                                                    sessions[i].scheds[param], { unionKeys: true });
                     structural += d.structural;
-                    d.changes.forEach(c => deltas.push({ param, block: c.block, delta: c.changePercent }));
+                    d.changes.forEach(c => {
+                        if (reanchoredOn(i, param, c.block)) { reanchored++; return; }
+                        deltas.push({ param, block: c.block, delta: c.changePercent });
+                    });
                 });
                 pairDeltas.push(deltas);
                 pairStructural.push(structural);
+                pairReanchored.push(reanchored);
             }
 
             // Pooled per-block stats over pairs covering sessions[from..to] inclusive,
@@ -4763,7 +4940,8 @@
                 .sort((x, y) => (y.oscillation - x.oscillation) || (y.grossPct - x.grossPct))
                 .slice(0, 10);
             let structuralChanges = 0;
-            for (let p = blockFrom; p < sessions.length - 1; p++) structuralChanges += pairStructural[p] || 0;
+            let reanchoredTouches = 0;
+            for (let p = blockFrom; p < sessions.length - 1; p++) { structuralChanges += pairStructural[p] || 0; reanchoredTouches += pairReanchored[p] || 0; }
 
             // Per-session series: per-parameter sub-aggregates + pooled overall.
             // overall is the gross-weighted pooled figure across ALL blocks — it is
@@ -4798,6 +4976,7 @@
                 basis: 'percent',
                 perBlock,
                 structuralChanges,
+                reanchoredTouches,   // DEF-253: excluded from every figure above, counted here
                 perSession: perSession.slice(-OSC_BLOCK_WINDOW)
             };
         };
@@ -4867,6 +5046,26 @@
             });
             return out;
         };
+        // DEF-253 (v4.1.2): a dose-neutral re-anchor is not a change to grade. Sep 21 took
+        // cr@09:30 14.6 → 11.4 as a CARB-COUNT correction — the standard lunch is now entered at
+        // 58 g instead of 74, and 58/11.4 ≡ 74/14.6 to within 0.02 U. No insulin moved. Left alone
+        // the ledger would grade a −21.9 % strengthen, re-grade the Sep 18 weaken as REVERTED
+        // (REVERTED tests direction on the same block inside the horizon), and the oscillation
+        // instrument would take cr 09:30's gross from 7.3 % to ~29 %. The session's answer was
+        // "void that grade by hand in every later session" — an unbounded manual gate, DEF-235's
+        // class. Same grammar and the same read path as the VOIDS: token, which is the template.
+        const parseReanchorTokens = (text) => {
+            const out = [];
+            String(text || '').split(/\n/).forEach(line => {
+                const m = line.match(/^\s*REANCHOR:\s*(.+)$/i);
+                if (!m) return;
+                m[1].split(',').forEach(tok => {
+                    const t = tok.trim().match(/^(basal|cr|isf)@(\d{1,2}:\d{2})$/i);
+                    if (t) out.push({ param: t[1].toLowerCase(), block: t[2].padStart(5, '0') });
+                });
+            });
+            return out;
+        };
         const computeChangeEffectiveness = (history) => {
             const parseSched = (v) => {
                 if (!v) return null;
@@ -4892,7 +5091,8 @@
                     low: (period) => num(e[LEDGER_PERIOD_KEYS[period]?.low]),
                     isOverride: !!e.isOverride,
                     basis: ledgerBasisOf(e.toolVersion),
-                    voids: parseVoidsTokens(e.decisionLog)
+                    voids: parseVoidsTokens(e.decisionLog),
+                    reanchors: parseReanchorTokens(e.decisionLog)   // DEF-253
                 }));
 
             // Change extraction: consecutive-snapshot diffs, keys numeric in both.
@@ -4937,6 +5137,26 @@
                 });
             }
 
+            // DEF-253: a change is re-anchored when the snapshot row that first shows it, or the
+            // row immediately before it, carries a REANCHOR: token for the same block — the log is
+            // written the night the change is applied and the snapshot that shows it is the next
+            // morning's. Re-anchored changes come OUT of `changes` before REVERTED, CONFOUNDED and
+            // the direction ladder run: a re-anchor is neither a reversal of a prior touch nor a
+            // confounder of a sibling. They are emitted as rows of their own.
+            const isReanchored = (param, block, i) => [i, i - 1].some(j => sessions[j] && sessions[j].reanchors.some(r => r.param === param && r.block === block));
+            const reanchoredChanges = [];
+            for (let n = changes.length - 1; n >= 0; n--) {
+                const ch = changes[n];
+                if (isReanchored(ch.param, ch.block, ch.sessionIndex)) reanchoredChanges.unshift(...changes.splice(n, 1));
+            }
+            // A token with no diff on that block in its own row or the next is DECLARED, not
+            // dropped: on Friday the weekend layout swaps 11:00 back in as a structural add rather
+            // than a change, and that token will land here — correct, and it should be visible.
+            const unmatchedReanchorTokens = [];
+            sessions.forEach((sn, i) => sn.reanchors.forEach(r => {
+                const matched = reanchoredChanges.some(ch => ch.param === r.param && ch.block === r.block && (ch.sessionIndex === i || ch.sessionIndex === i + 1));
+                if (!matched) unmatchedReanchorTokens.push({ date: sn.date, param: r.param, block: r.block });
+            }));
             const meanOf = (vals) => {
                 const v = vals.filter(x => x !== null);
                 return v.length ? v.reduce((s, x) => s + x, 0) / v.length : null;
@@ -5117,6 +5337,31 @@
                         confounder: v.confounder || null
                     };
                 })
+                .concat(reanchoredChanges.filter(ch => ch.sessionIndex >= windowStart).map(ch => {
+                    // DEF-253: the row is emitted with everything measured intact — the percentage
+                    // and the direction are facts about the pump — and DEF-239's low fields are
+                    // computed as on every other row. What it does not get is a grade, because
+                    // nothing moved to grade.
+                    const v = verdictOf(ch);
+                    const tokenRow = [ch.sessionIndex, ch.sessionIndex - 1].map(j => sessions[j])
+                        .find(sn => sn && sn.reanchors.some(r => r.param === ch.param && r.block === ch.block));
+                    return {
+                        date: ch.date, param: ch.param, block: ch.block,
+                        oldValue: ch.oldValue, newValue: ch.newValue,
+                        changePercent: Math.round(ch.changePercent * 10) / 10,
+                        changePercentExact: ch.changePercent,
+                        direction: ch.direction,
+                        schedulePeriod: ch.schedulePeriod || ch.period || null,
+                        effectPeriods: (ch.effectPeriods && ch.effectPeriods.length) ? ch.effectPeriods : (ch.period ? [ch.period] : []),
+                        period: (ch.effectPeriods && ch.effectPeriods.length) ? ch.effectPeriods.join(' + ') : (ch.period || null),
+                        verdict: 'RE_ANCHOR',
+                        preDeviation: v.preDeviation ?? null, postDeviation: v.postDeviation ?? null,
+                        preLowPct: v.preLowPct ?? null, postLowPct: v.postLowPct ?? null,
+                        lowFieldsBasis: v.lowFieldsBasis ?? null, lowFieldsOmittedReason: v.lowFieldsOmittedReason ?? null,
+                        confounder: null,
+                        reanchorBasis: 'REANCHOR: token on the log row of ' + (tokenRow ? tokenRow.date : '?')
+                    };
+                }))
                 .sort((a, b) => new Date(b.date) - new Date(a.date));
             // [ENUM-DISPATCH-START] v3.6.03 Part B.
             //
@@ -5134,8 +5379,8 @@
             // getIOBAtTime, and slice(indexOf(...)). Swallowing the row instead would be
             // the same defect wearing a different coat, so the row is counted under
             // `unknown` AND announced.
-            const summary = { improved: 0, worsened: 0, neutral: 0, causedLow: 0, reverted: 0, voided: 0, confounded: 0, pending: 0, indeterminateWindow: 0 };
-            const summaryKey = { IMPROVED: 'improved', WORSENED: 'worsened', NEUTRAL: 'neutral', CAUSED_LOW: 'causedLow', REVERTED: 'reverted', VOIDED: 'voided', CONFOUNDED: 'confounded', PENDING: 'pending', INDETERMINATE_WINDOW: 'indeterminateWindow' };
+            const summary = { improved: 0, worsened: 0, neutral: 0, causedLow: 0, reverted: 0, voided: 0, confounded: 0, pending: 0, indeterminateWindow: 0, reAnchor: 0 };
+            const summaryKey = { IMPROVED: 'improved', WORSENED: 'worsened', NEUTRAL: 'neutral', CAUSED_LOW: 'causedLow', REVERTED: 'reverted', VOIDED: 'voided', CONFOUNDED: 'confounded', PENDING: 'pending', INDETERMINATE_WINDOW: 'indeterminateWindow', RE_ANCHOR: 'reAnchor' };
             ledger.forEach(l => {
                 const key = summaryKey[l.verdict];
                 if (key === undefined) {
@@ -5152,7 +5397,8 @@
 
             return {
                 preSessions: LEDGER_PRE, postSessions: LEDGER_POST, horizon: LEDGER_HORIZON,
-                ledger, summary
+                ledger, summary, unmatchedReanchorTokens,
+                reanchorBasis: 'a REANCHOR: token on the change\'s own log row or the one before it takes the change out of the grading, the reversal test and the oscillation touch count (DEF-253); the value on the pump still moved, so ChangeRecord and slotAge are untouched'
             };
         };
         // [INSTR6-LEDGER-END]
@@ -5192,7 +5438,7 @@
         const COB_SAMPLE_OFFSETS_MIN = [15, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360];
         const COB_SAMPLE_TOLERANCE_MS = 7.5 * 60 * 1000;
         const COB_MEAL_MIN_CARBS_G = 10;
-        const computeCobDecay = (nightscoutData, now = new Date()) => {
+        const computeCobDecay = (nightscoutData, now = new Date(), profileCarbsHr = null) => {
             const treatments = Array.isArray(nightscoutData?.treatments) ? nightscoutData.treatments : [];
             const rawStatuses = Array.isArray(nightscoutData?.deviceStatus) ? nightscoutData.deviceStatus : [];
             const pathCensus = cobPathCensus(rawStatuses);
@@ -5222,6 +5468,13 @@
                         if (at > now.getTime()) return { offsetMin: off, cob: null, reason: 'after the fetch' };
                         if (nextMealT !== null && at >= nextMealT) return { offsetMin: off, cob: null, reason: 'after the next carb entry (+' + Math.round((nextMealT - m.t) / 60000) + ' min)' };
                         const x = nearest(at);
+                        // DEF-257 (v4.1.2): the NOMINAL offset can precede the next carb entry while
+                        // the nearest RECORD falls after it — Sep 21 21:16:48Z 98 g, offset 45, record
+                        // at 22:04:07Z, 44 s after the 35 g entry: the sample read the merged COB of
+                        // 153 under this meal's name. DEF-174 nulls the slope so no number was wrong,
+                        // but the sample was mislabelled, and a mislabelled sample is the thing this
+                        // register keeps filing.
+                        if (nextMealT !== null && x && x.t >= nextMealT) return { offsetMin: off, cob: null, reason: 'nearest record falls after the next carb entry (+' + Math.round((nextMealT - m.t) / 60000) + ' min)' };
                         return x ? { offsetMin: off, cob: parseFloat(x.cob.toFixed(1)), at: new Date(x.t).toISOString(), cobSource: x.cobSource }
                                  : { offsetMin: off, cob: null, reason: pathCensus.withCOB === 0 && pathCensus.deviceStatusRecords > 0
                                         ? 'devicestatus present but no record carries COB at any known path'
@@ -5266,7 +5519,8 @@
                         observedDecayNote: slopeNotDecay ? `fitted slope ${fittedSlope} g/hr is not a decay — COB rose inside the series; nulled (DEF-174)`
                             : slope === null ? 'fewer than two COB samples with a value — no slope' : 'least-squares over samples from the first to the last non-zero COB',
                         cobRose, rises,
-                        configuredDecay: { gPerHr: null, reason: 'not present in the Nightscout fetch — iAPS min_5m_carbimpact is a device preference and is not uploaded' }
+                        configuredDecay: { gPerHr: null, profileCarbsHr: profileCarbsHr ?? null,
+                            reason: 'iAPS min_5m_carbimpact is a device preference and is not uploaded; profile.carbs_hr is declared beside it and is not known to be the same setting (DEF-257)' }
                     };
                 });
             return {
@@ -5891,6 +6145,9 @@
             });
             return {
                 value: r.value,
+                bolusIob: extractBolusIOB(rec),
+                basalIob: extractBasalIOB(rec),
+                basis: 'value = bolusIob + basalIob (openaps net); basalIob is negative under a zero or low temp (DEF-252)',
                 iobSource: classifyIOBSource(rec),
                 recordTime: r.sourceTime,
                 ageMin: r.ageMinutes,
@@ -11693,7 +11950,7 @@
                 // [COB-DECAY-RENDER-START] v3.6.29 (DEF-158). The other surface; renders on
                 // zero meals too, with the reason.
                 {
-                    const cd = computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults));
+                    const cd = computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults), analysisResults?.profileFacts?.carbsHr ?? null);
                     output += `## COB Decay (declared only, DEF-158 instrument)\n\n_${cd.statement}_\n\n`;
                     if (cd.meals.length) {
                         output += `| Meal | g | Bolus | COB at +${cd.sampleOffsetsMin.join('/+')} min | Observed g/hr |\n|------|---|-------|-----|---------------|\n`;
@@ -12004,15 +12261,18 @@
                     nightscoutData: analysisResults?.nightscoutData,
                     schedules, agp7day,
                     profileHistory: analysisResults?.profileHistory || [],
+                    profileFacts: analysisResults?.profileFacts || null,
                     periods: analysisResults?.signalAnalysis?.periods || [],
                     analysisWindowDays: config.basalSignalWindow || 7,
-                    rawCaptureTaken: runContext?.rawCaptureTaken === true
+                    rawCaptureTaken: runContext?.rawCaptureTaken === true,
+                    rawCaptureSource: runContext?.rawCaptureSource ?? null,
+                    rawCaptureError: runContext?.rawCaptureError ?? null
                 });
                 const atExportBoundary = (exp) => CONFIG.measurementOnly === true ? toMeasurementOnlyExport(exp, measurementCtx()) : exp;
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.1.1',
+                            version: '4.1.2',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -12063,7 +12323,7 @@
                         // DEF-157: declares the schedule's shape. Both emitters.
                         scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
                         // DEF-158 instrument. Both emitters.
-                        cobDecay: computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults)),
+                        cobDecay: computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults), analysisResults?.profileFacts?.carbsHr ?? null),
                         // DEF-172: the fast path carries no signals.periods, so the gate's cost
                         // and pre-switch comparison ride here by period — a quiet night must
                         // not hide what the switch removed.
@@ -12529,7 +12789,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.1.1',
+                        version: '4.1.2',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12650,7 +12910,7 @@
                     // DEF-157: declares the schedule's shape. Both emitters.
                     scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
                     // DEF-158 instrument. Both emitters.
-                    cobDecay: computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults)),
+                    cobDecay: computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults), analysisResults?.profileFacts?.carbsHr ?? null),
                     // DEF-112 Build 6: a behavioural gate whose position is not in the output is a gate the reviewer cannot account for.
                     directionWiring: { enabled: CONFIG.directionWiringEnabled === true,
                         configValue: CONFIG.directionWiringEnabled === undefined ? 'unset' : CONFIG.directionWiringEnabled,
@@ -12837,6 +13097,11 @@
                                 };
                                 if (t.carbs > 0) obj.carbs = t.carbs;
                                 if (t.insulin > 0) obj.insulin = Math.round(t.insulin * 100) / 100;
+                                // DEF-255 (v4.1.2): Turn 1 asked the owner "were the 7:34–7:55 PM
+                                // doses yours or the loop's?" The record says so and the map dropped
+                                // it. Same SMB predicate ledgerPairMealBoluses uses.
+                                obj.eventType = t.eventType ?? null;
+                                obj.smb = !!(t.eventType && String(t.eventType).includes('SMB'));
                                 return obj;
                             })
                             .sort((a, b) => a.time - b.time);
@@ -14642,6 +14907,18 @@
             // v4.0.0 (§12d): whether ⬇ Raw fetch was pressed in this page load. Emitted as
             // meta.rawCaptureTaken under the flag — false is a value, not an absence.
             const [rawCaptureTaken, setRawCaptureTaken] = useState(false);
+            // DEF-256 (v4.1.2): five consecutive sessions read rawCaptureTaken false. The header
+            // line telling the owner to press the button was the only mechanism and it has never
+            // worked — every one of those nights is unreplayable. Copy takes the capture itself.
+            const [rawCaptureSource, setRawCaptureSource] = useState(null);
+            const [rawCaptureError, setRawCaptureError] = useState(null);
+            // The state drives the screen; this ref drives THIS invocation. copyForClaudeReview
+            // triggers the download and then builds the export in the same call, and a setState
+            // inside that call is not visible to the closure that reads it — the export would have
+            // carried the pre-click `false` on the very run the capture succeeded. Same defect
+            // class as reading a stale schedule off React state (v3.6.x, "use activeSchedules
+            // (fresh from Nightscout) not React state (stale)").
+            const rawCaptureRef = useRef({ taken: false, source: null, error: null });
             
             // Google Sheets Logging State
             const [sheetsWebAppUrl, setSheetsWebAppUrl] = useState(() => {
@@ -14969,7 +15246,13 @@
                     basal: basalSchedule.length > 0 ? basalSchedule : null,
                     targetBG: targetBGSchedule.length > 0 ? targetBGSchedule : null,
                     targetLow: store.target_low?.[0]?.value,
-                    targetHigh: store.target_high?.[0]?.value
+                    targetHigh: store.target_high?.[0]?.value,
+                    // DEF-257 (v4.1.2): both are in every filed raw and both were dropped. dia is
+                    // iAPS's ultra-rapid curve (10); carbs_hr (39) is a rate the export was saying
+                    // was "not present in the Nightscout fetch". Declared, not equated: whether
+                    // iAPS's carbs_hr is its min_5m_carbimpact is not known here.
+                    dia: store.dia ?? null,
+                    carbsHr: store.carbs_hr ?? null
                 };
             };
             
@@ -15776,10 +16059,12 @@
 
                     // Parse and apply profile data (BUG-001 fix)
                     let activeSchedules = { cr: crSchedule, isf: isfSchedule, basal: basalSchedule };
+                    let parsedProfileFacts = { dia: null, carbsHr: null };   // DEF-257
                     let basalRatioInfo = null;
                     
                     if (nightscoutData.profile) {
                         const parsedProfile = parseProfile(nightscoutData.profile);
+                        parsedProfileFacts = parsedProfile || parsedProfileFacts;
                         if (parsedProfile) {
                             // Update schedules from Nightscout profile
                             if (parsedProfile.cr && parsedProfile.cr.length > 0) {
@@ -15804,6 +16089,14 @@
                     } else {
                         console.warn('No profile found in Nightscout, using default schedules');
                     }
+                    // DEF-257 (v4.1.2): the two profile facts the parser used to drop, carried to
+                    // the export beside the schedules they came from.
+                    const profileFacts = {
+                        dia: parsedProfileFacts.dia ?? null,
+                        carbsHr: parsedProfileFacts.carbsHr ?? null,
+                        startDate: nightscoutData.profile?.startDate ?? null,
+                        defaultProfile: nightscoutData.profile?.defaultProfile ?? null
+                    };
                     // DEF-251: the history the fetch kept, parsed once. [] when the server returned
                     // one document or none — every filed raw before v4.1.1 is that case.
                     const profileHistory = parseProfileHistory(nightscoutData.profiles || (nightscoutData.profile ? [nightscoutData.profile] : []));
@@ -16864,6 +17157,7 @@
                         basalRatioInfo,
                         activeSchedules,
                         profileHistory,          // DEF-251 (v4.1.1): resolved per event, never live-only
+                        profileFacts,            // DEF-257 (v4.1.2): dia, carbs_hr, startDate, defaultProfile
                         effectiveBasalTarget,
                         effectiveTargetSource,
                         finalPercent,
@@ -17078,7 +17372,9 @@
             // pointed at, so any two builds can be diffed key-by-key on the same fetch.
             // Nothing is transformed; the token is not included. Download only — no
             // clipboard, no network.
-            const downloadRawFetch = () => {
+            // DEF-256 (v4.1.2): `source` is how the capture was triggered — the button, or the
+            // Copy that now takes it automatically.
+            const downloadRawFetch = (source = 'button') => {
                 try {
                     const nd = analysisResults?.nightscoutData || {};
                     const payload = {
@@ -17097,12 +17393,44 @@
                     a.href = url; a.download = `raw_fetch_${(payload.meta.toolVersion || 'v')}_${payload.meta.capturedAt.replace(/[:.]/g, '-')}.json`;
                     document.body.appendChild(a); a.click(); document.body.removeChild(a);
                     setTimeout(() => URL.revokeObjectURL(url), 1000);
+                    rawCaptureRef.current = { taken: true, source, error: null };
                     setRawCaptureTaken(true);
-                } catch (e) { console.error('downloadRawFetch failed:', e); }
+                    setRawCaptureSource(source);
+                    setRawCaptureError(null);
+                    return true;
+                } catch (e) {
+                    console.error('downloadRawFetch failed:', e);
+                    const msg = (e && e.message) || 'unknown error';
+                    rawCaptureRef.current = { ...rawCaptureRef.current, error: msg };
+                    setRawCaptureError(msg);
+                    return false;
+                }
             };
             // [RAW-FETCH-DOWNLOAD-END]
             const copyForClaudeReview = async () => {
                 console.log('=== copyForClaudeReview called ===');
+
+                // [COPY-CAPTURES-RAW-START] v4.1.2 (DEF-256). BEFORE the clipboard registration and
+                // before the first await, for exactly the reason DEF-149 put the ClipboardItem
+                // there: the download is a synchronous anchor click and it needs the same live
+                // transient user activation. Guarded so a Copy after the button does not download
+                // twice in one page load, and wrapped so a failed download never costs the Copy —
+                // the paste is the deliverable, the raw is the evidence, and losing the second must
+                // not lose the first.
+                // A stopped run (DEF-237) has no analysisResults: there is nothing to capture, the
+                // payload would be an empty shell, and setting rawCaptureTaken on a run that
+                // produced no export would make the flag lie. The Copy aborts a few lines below
+                // for the same reason.
+                if (!rawCaptureRef.current.taken && analysisResults) {
+                    try { downloadRawFetch('copy'); }
+                    catch (e) {
+                        console.error('DEF-256: raw capture on Copy failed:', e);
+                        const msg = (e && e.message) || 'unknown error';
+                        rawCaptureRef.current = { ...rawCaptureRef.current, error: msg };
+                        setRawCaptureError(msg);
+                    }
+                }
+                // [COPY-CAPTURES-RAW-END]
 
                 // [CLIPBOARD-GESTURE-START] v3.6.26 (DEF-149). REGISTERED HERE, BEFORE THE
                 // FIRST AWAIT, and that placement is the whole fix.
@@ -17416,7 +17744,9 @@
                             // its own lateness and discarded it at end of scope.
                             { attempts: jsonpRecordsForRun(jsonpAttemptLog), lateArrivals: jsonpRecordsForRun(jsonpLateArrivals),
                               budgetsMs: JSONP_ATTEMPT_BUDGETS_MS },
-                            { rawCaptureTaken }
+                            { rawCaptureTaken: rawCaptureRef.current.taken === true,
+                              rawCaptureSource: rawCaptureRef.current.source,
+                              rawCaptureError: rawCaptureRef.current.error }
                         );
                         structuredForPaste = structured;
                         structuredJSON = '# STRUCTURED DATA (for Claude analysis)\n\n```json\n' + 
@@ -17934,7 +18264,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.1.1 — measurement-only export · one clock, one profile, one window · DEF-247 every window pinned to the fetch · DEF-245 one per-hour population · DEF-249 the override read from where iAPS records it · DEF-251 each event resolved against the profile that governed it · DEF-258 lowEvents on the analysis window · v4.1.0 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.1.2 — measurement-only export · grading and capture · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the screen, the Copy and the sheet row carry no bundles, priorities or recommended values. Press ⬇ Raw fetch before copying.
