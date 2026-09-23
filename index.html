@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.1.2</title>
+    <title>Daily Insulin Settings Review v4.1.3</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -77,13 +77,21 @@
         // Strict `<` on the LOCAL day, taking the form from the persistence-escalation
         // precedent. The yesterdayEntry precedent uses `!==`, which also returns a
         // future-dated or out-of-order row; `<` cannot.
-        const isBeforeToday = (d) => {
+        // DEF-262 (v4.1.3, PM ruling Sep 22): asOf pins "today" for the readers that DECLARE a
+        // number in the export. appliedBasalDelta is the figure the reviewer states in the decision
+        // log, and a Copy pressed after local midnight promoted tonight's own session row into
+        // priorTotal — the delta then read against itself. Default behaviour is unchanged, so
+        // monthlyOutcomes (declared under DEV-p, left on the render date) and every engine caller
+        // keep the render day; only the callers that pass asOf move.
+        const isBeforeToday = (d, asOf = null) => {
             const k = gapLocalDateKey(d);
-            return !!k && k < getLocalDateString();
+            const asOfMs = asOf == null ? NaN : new Date(asOf).getTime();
+            const today = getLocalDateString(Number.isFinite(asOfMs) ? new Date(asOfMs) : new Date());
+            return !!k && k < today;
         };
-        const lastRowBefore = (rows, dateOf = (r) => r && (r.date || r.timestamp)) => {
+        const lastRowBefore = (rows, dateOf = (r) => r && (r.date || r.timestamp), asOf = null) => {
             const a = Array.isArray(rows) ? rows : [];
-            for (let i = a.length - 1; i >= 0; i--) if (isBeforeToday(dateOf(a[i]))) return a[i];
+            for (let i = a.length - 1; i >= 0; i--) if (isBeforeToday(dateOf(a[i]), asOf)) return a[i];
             return null;
         };
         const excludeToday = (rows, dateOf = (r) => r && (r.date || r.timestamp)) =>
@@ -176,8 +184,8 @@
         const scheduleMapToArray = (map) => Object.keys(map || {})
             .sort()
             .map(t => ({ time: t, value: map[t] }));
-        const computeAppliedBasalDelta = (historyRows, liveBasalSchedule) => {
-            const priorRow = lastRowBefore(historyRows);
+        const computeAppliedBasalDelta = (historyRows, liveBasalSchedule, asOf = null) => {
+            const priorRow = lastRowBefore(historyRows, undefined, asOf);
             const priorMap = priorRow ? parseSnapshot(priorRow.basalSchedule) : null;
             const liveMap = scheduleArrayToMap(liveBasalSchedule);
             if (!priorMap || !liveMap) {
@@ -193,7 +201,9 @@
             return { available: true, reason: null,
                 deltaUPerDay: r3(delta),
                 deltaPercent: priorTotal > 0 ? r3(delta / priorTotal * 100) : null,
-                priorTotal: r3(priorTotal), newTotal: r3(newTotal) };
+                priorTotal: r3(priorTotal), newTotal: r3(newTotal),
+                priorRowDate: priorRow.date ?? priorRow.timestamp ?? null,
+                asOfBasis: asOf ? 'dataFetchedAt (DEF-262)' : 'render date' };
         };
         // [BASAL-DELTA-END]
 
@@ -3522,7 +3532,8 @@
             meta.clockProvenance = {
                 pinnedToFetch: ['agp (7-day and 48-hour)', 'hourlyLowMass and its near-low tier', 'lowEvents and lowEventsWindow',
                                 'glucoseTrace24h', 'cobDecay series truncation', 'recentChanges.autoDetected[].detectedDate',
-                                'eventLedger[].context.daysSinceBlockChanged', 'safetyFacts.slotAge[].daysSince'],
+                                'eventLedger[].context.daysSinceBlockChanged', 'safetyFacts.slotAge[].daysSince',
+                                'appliedBasalDelta (priorTotal, newTotal, deltaUPerDay, deltaPercent) — DEF-262'],
                 readsTheRenderClock: [
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
                     { field: 'meta.pageAgeHours', why: 'the gap between the fetch and the Copy (DEF-242); it exists to be non-zero' },
@@ -3536,7 +3547,6 @@
                     // move. appliedBasalDelta.priorTotal is the one that matters — it is the "what did
                     // we actually change" figure, and it should not depend on when Copy is pressed.
                     { field: 'monthlyOutcomes[] (sessions, daysCovered, meanTIR7d, meanTBRunder70)', why: 'DEV-p: buckets by month over excludeToday(rows); a post-midnight Copy counts the current session' },
-                    { field: 'appliedBasalDelta (deltaUPerDay, deltaPercent, priorTotal)', why: 'DEV-p: prior snapshot is lastRowBefore(today); a post-midnight Copy picks a different prior row' }
                 ],
                 basis: 'DEF-247 pinned every derived quantity in this export to dataFetchedAt; the four fields above read the render clock because that is what they measure (DEF-261)'
             };
@@ -3774,6 +3784,36 @@
             return { active: true, percent: pick.parsed.percent ?? (ep ? ep.percent : null), preset: ep ? ep.preset : null };
         };
         // [OVERRIDE-OBSERVED-END]
+        // [SAFE-STRINGIFY-START] v4.1.3 (DEF-263). A single cyclic reference anywhere in the export
+        // threw JSON.stringify and cost the owner the ENTIRE paste — the one channel this project
+        // has. Sep 23, 00:55 Z: "Structured JSON generation failed … TypeError: cyclic object value",
+        // then "measurement-only export failed to generate", and the session could not run. The
+        // export is the deliverable; a bad reference in one field must cost that field, not the
+        // document. So: replace the cycle with a marker that NAMES ITS PATH, keep everything else,
+        // and declare what happened at the top of the paste and in meta — never silently.
+        // This is a guard, not a fix: a cycle in the export is a defect, and the marker is how the
+        // next session hands us its location instead of its absence.
+        const safeStringify = (value, space = 2) => {
+            const findings = [];
+            const seen = new WeakSet();          // ancestors on the CURRENT path, not every visited object
+            const walk = (key, val, path) => {
+                if (val === null || typeof val !== 'object') return val;
+                if (seen.has(val)) { findings.push(path || '(root)'); return '[CYCLIC REFERENCE → ' + (path || '(root)') + ']'; }
+                // JSON.stringify calls toJSON BEFORE looking at own keys — a Date is an ISO string,
+                // not an empty object. The guard must serialise exactly what JSON.stringify would.
+                if (typeof val.toJSON === 'function') { const j = val.toJSON(key); if (j === null || typeof j !== 'object') return j; val = j; if (seen.has(val)) { findings.push(path || '(root)'); return '[CYCLIC REFERENCE → ' + (path || '(root)') + ']'; } }
+                seen.add(val);
+                let out;
+                if (Array.isArray(val)) out = val.map((v, i) => walk(i, v, path + '[' + i + ']'));
+                else { out = {}; Object.keys(val).forEach(k => { out[k] = walk(k, val[k], path ? path + '.' + k : k); }); }
+                seen.delete(val);                 // siblings may legitimately share a reference (a DAG is not a cycle)
+                return out;
+            };
+            const safe = walk(null, value, '');
+            return { text: JSON.stringify(safe, null, space), findings };
+        };
+        const SAFE_STRINGIFY_NOTE = 'a cyclic reference was found while serialising the export and replaced with a marker naming its path; every other field is intact (DEF-263)';
+        // [SAFE-STRINGIFY-END]
         // [AGP-PIN-START] v4.1.1 (DEF-247). One run, one population. Every AGP object in a run is
         // computed from the run's own fetch timestamp and memoised on the glucose array it was built
         // from, so the fifteen call sites that used to recompute on the wall clock now read one
@@ -12272,7 +12312,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.1.2',
+                            version: '4.1.3',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -12366,7 +12406,7 @@
                         // v3.6.16: both surfaces. The markdown renders these in the trend
                         // section; an unavailable history DECLARES rather than emitting [].
                         monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
-                        appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal) : UNAVAILABLE('appliedBasalDelta'),
+                        appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal, analysisResults?.nightscoutData?.fetchedAt ?? null) : UNAVAILABLE('appliedBasalDelta'),
                         currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date())
                     });
                 }
@@ -12789,7 +12829,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.1.2',
+                        version: '4.1.3',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -12951,7 +12991,7 @@
                     // v3.6.16 Part A: monthly aggregates, no trend claim. Part B: NET
                     // APPLIED basal change, the calibration input v5.55's gate lacks.
                     monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
-                    appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal) : UNAVAILABLE('appliedBasalDelta'),
+                    appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal, analysisResults?.nightscoutData?.fetchedAt ?? null) : UNAVAILABLE('appliedBasalDelta'),
                     // v3.5.91: run-time IOB vs the pill — verification aid, no consumer
                     currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date()),
                     informationalFindings: (analysisResults.findings || [])
@@ -17387,7 +17427,10 @@
                         history: Array.isArray(cachedSheetsEntries) ? cachedSheetsEntries : null,
                         config: { basalSignalWindow: basalSignalWindow ?? null, targetBG: CONFIG.targetBG ?? null, pumpIncrement: CONFIG.pumpIncrement ?? null }
                     };
-                    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+                    // DEF-263: the raw is the evidence; a cycle in it must not cost the file either.
+                    const rawSer = safeStringify(payload, 0);
+                    if (rawSer.findings.length) { payload.meta.serializationFindings = rawSer.findings; console.error('DEF-263: cyclic reference(s) in the raw payload replaced at:', rawSer.findings); }
+                    const blob = new Blob([rawSer.findings.length ? safeStringify(payload, 0).text : rawSer.text], { type: 'application/json' });
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url; a.download = `raw_fetch_${(payload.meta.toolVersion || 'v')}_${payload.meta.capturedAt.replace(/[:.]/g, '-')}.json`;
@@ -17409,6 +17452,7 @@
             // [RAW-FETCH-DOWNLOAD-END]
             const copyForClaudeReview = async () => {
                 console.log('=== copyForClaudeReview called ===');
+                let serializationFindings = [];   // DEF-263
 
                 // [COPY-CAPTURES-RAW-START] v4.1.2 (DEF-256). BEFORE the clipboard registration and
                 // before the first await, for exactly the reason DEF-149 put the ClipboardItem
@@ -17749,8 +17793,12 @@
                               rawCaptureError: rawCaptureRef.current.error }
                         );
                         structuredForPaste = structured;
+                        // DEF-263 (v4.1.3): cycle-safe, and it says so if it had to be.
+                        const ser = safeStringify(structured, 2);
+                        serializationFindings = ser.findings;
+                        if (ser.findings.length) console.error('DEF-263: cyclic reference(s) replaced at:', ser.findings);
                         structuredJSON = '# STRUCTURED DATA (for Claude analysis)\n\n```json\n' + 
-                            JSON.stringify(structured, null, 2) + '\n```\n\n---\n\n';
+                            ser.text + '\n```\n\n---\n\n';
                         console.log('Structured JSON generated, keys:', Object.keys(structured));
                     } catch (jsonErr) {
                         console.error('Structured JSON generation failed (continuing with markdown only):', jsonErr);
@@ -17844,10 +17892,15 @@
                         );
                     }
                     
+                    // DEF-263: the paste declares a replaced cycle in its first line — the reviewer
+                    // must never read a marker without being told one is there.
+                    const serialLine = serializationFindings.length
+                        ? 'SERIALIZATION: ' + serializationFindings.length + ' cyclic reference(s) replaced — ' + serializationFindings.slice(0, 3).join(', ') + (serializationFindings.length > 3 ? ', …' : '')
+                        : null;
                     const cachedFirstLine = historyCachedFirstLine(structuredForPaste?.historySource, structuredForPaste?.historyAgeHours);
-                    const combinedOutput = measurementOnlyPaste
+                    const combinedOutput = (serialLine ? serialLine + '\n\n' : '') + (measurementOnlyPaste
                         ? formatMeasurementOnlyHeader(structuredForPaste) + structuredJSON
-                        : (cachedFirstLine ? cachedFirstLine + '\n\n' : '') + structuredJSON + trendSection + enrichedOutput;
+                        : (cachedFirstLine ? cachedFirstLine + '\n\n' : '') + structuredJSON + trendSection + enrichedOutput);
                     
                     if (measurementOnlyPaste && !structuredJSON) {
                         console.error('copyForClaudeReview: measurement-only export failed to generate');
@@ -18264,7 +18317,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.1.2 — measurement-only export · grading and capture · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.1.3 — measurement-only export · DEF-263 a cyclic reference costs its own field, not the paste · DEF-262 appliedBasalDelta pinned to the fetch · grading and capture · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the screen, the Copy and the sheet row carry no bundles, priorities or recommended values. Press ⬇ Raw fetch before copying.
