@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.1.3</title>
+    <title>Daily Insulin Settings Review v4.1.4</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2896,10 +2896,25 @@
         // attribution; it stays in the instrument for census and leaves the ledger.
         // DEF-251 (v4.1.1): crAtTime resolves each entry's own profile; the default keeps the
         // single-schedule behaviour for every caller that has no history.
-        const ledgerEpisodePlan = (episode, pairs, treatments, crSchedule, crAtTime = null) => {
+        // DEF-267 (v4.1.4): the plan declares what the calculator saw. budgetRatioUpper 0.514 on a
+        // calculator-dosed snack was read as under-delivery; the bolus calculator had subtracted
+        // 1.5 U of IOB and scaled by an 85 % preset. The gross plan stays the gross plan — the
+        // reader gets the two numbers that explain a bound under 0.70. deviceStatus and
+        // overrideObserved are new optional trailing arguments; absent → nulls, no throw.
+        const ledgerEpisodePlan = (episode, pairs, treatments, crSchedule, crAtTime = null, deviceStatus = null, overrideObserved = null) => {
             const empty = { expectedUnits: null, upfrontShare: null, deliveredUnits: null, deliveredShareOfPlan: null, budgetDeterminate: null, budgetRatioLower: null, budgetRatioUpper: null,
-                            mealBolusUnits: null, smbUnitsInHorizon: null, unpairedBolusUnits: null, unpairedBolusCount: null, horizon: null, note: 'no governing carb entry — no plan' };
+                            mealBolusUnits: null, smbUnitsInHorizon: null, unpairedBolusUnits: null, unpairedBolusCount: null, horizon: null, note: 'no governing carb entry — no plan',
+                            iobAtFirstEntry: null, presetAtFirstEntry: { active: null, percent: null, preset: null, crScaled: null } };
             if (!episode || !episode.length) return empty;
+            const firstAt = new Date(episode[0].created_at);
+            const iobAtFirstEntry = (() => {
+                if (!Array.isArray(deviceStatus) || !deviceStatus.length) return null;
+                const rec = findDeviceStatusAt(deviceStatus, firstAt, { direction: 'before' });
+                if (!rec) return null;
+                const net = extractIOB(rec); if (net == null) return null;
+                const look = lookupIOB(deviceStatus, firstAt, { direction: 'before' });
+                return { net, bolus: extractBolusIOB(rec), basal: extractBasalIOB(rec), recordTime: look.sourceTime ?? null, ageMin: look.ageMinutes ?? null };
+            })();
             const perEntry = episode.map(c => { const e = ledgerEntryAt(crAtTime ? crAtTime(c.created_at) : crSchedule, new Date(c.created_at)); return (e && e.value > 0) ? c.carbs / e.value : null; });
             const expected = perEntry.every(x => Number.isFinite(x)) ? perEntry.reduce((a, x) => a + x, 0) : null;
             const fromMs = new Date(episode[0].created_at).getTime() - 2 * 60000;
@@ -2917,8 +2932,12 @@
             const r3 = (x) => x === null ? null : parseFloat(x.toFixed(3));
             const upper = (expected !== null && expected > 0) ? delivered / expected : null;
             const lower = (expected !== null && expected > 0) ? (determinate ? upper : pairedUnits / expected) : null;
+            const presetAt = overrideObserved ? overrideAtTime(overrideObserved, firstAt) : { active: null, percent: null, preset: null };
+            const presetAtFirstEntry = { ...presetAt,
+                crScaled: (presetAt.active === true && Number.isFinite(presetAt.percent) && expected !== null) ? r3(expected * presetAt.percent / 100) : null };
             return {
                 expectedUnits: expected, upfrontShare: CONFIG.IAPS_UPFRONT_BOLUS_FRACTION ?? null,
+                iobAtFirstEntry, presetAtFirstEntry,
                 deliveredUnits: r3(delivered), deliveredShareOfPlan: determinate ? upper : null,
                 budgetDeterminate: determinate, budgetRatioLower: lower, budgetRatioUpper: upper,
                 mealBolusUnits: r3(pairedUnits), smbUnitsInHorizon: r3(smbUnits), unpairedBolusUnits: r3(unpairedUnits), unpairedBolusCount: unpaired.length,
@@ -2933,7 +2952,6 @@
             // DEF-247 (v4.1.1): every as-of in this builder is the FETCH's, not the render's.
             const ledgerAsOf = nightscoutData?.fetchedAt ?? null;
             // DEF-249 (v4.1.1): what the loop was actually running under when the event happened.
-            const ledgerOverride = buildOverrideObserved(nightscoutData);
             const glucose = (nightscoutData?.glucose || []).slice().sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
             const treatments = nightscoutData?.treatments || [];
             const deviceStatus = nightscoutData?.deviceStatus || [];
@@ -2944,6 +2962,7 @@
             // an upload, and plan.basis has always said Σ gᵢ / CR(tᵢ)).
             const profileTally = newProfileLookupTally();
             const schedAt = (dateLike) => { const r = schedulesAt(profileHistory, schedules, dateLike); tallyProfileLookup(profileTally, r.source); return r; };
+            const ledgerOverride = buildOverrideObserved(nightscoutData, profileBaseFromSchedules(schedAt));
             const census = { emittedByType: {}, droppedAsSignalByType: {}, droppedAsSignal: 0, droppedAsStructural: 0, dedupedDuplicates: 0, emittedRecords: 0, unclassified: 0,
                              fromSuppressedGate: 0,
                              // DEF-228 (v4.0.3): which list this ledger was built from. aggregateFindings keeps
@@ -3070,7 +3089,7 @@
                 const evSched = schedAt(evDate);
                 const evBasalS = evSched.schedules?.basal || basalS, evCrS = evSched.schedules?.cr || crS, evIsfS = evSched.schedules?.isf || isfS;
                 const crAtEntry = (at) => (schedAt(at).schedules?.cr || crS);
-                const plan = ledgerEpisodePlan(episode, pairs, treatments, crS, crAtEntry);
+                const plan = ledgerEpisodePlan(episode, pairs, treatments, crS, crAtEntry, deviceStatus, ledgerOverride);   // DEF-267
                 // DEF-218 (v4.0.1): the authority's ISF is the record's OWN per-correction lookup
                 // (candidateBlocks.isf), volume-weighted — one field pointing at another in the
                 // same record, so the two cannot disagree about which ISF governed the insulin.
@@ -3209,10 +3228,10 @@
         const buildSafetyFacts = ({ eventLedger, nightscoutData, schedules, agp7day, periods, analysisWindowDays, profileHistory = [] }) => {
             // DEF-247 (v4.1.1): the fetch is this builder's clock too.
             const safetyAsOf = nightscoutData?.fetchedAt ?? null;
-            const safetyOverride = buildOverrideObserved(nightscoutData);   // DEF-249
             // DEF-251: this builder resolves the same way the ledger does, and tallies the same way.
             const safetyProfileTally = newProfileLookupTally();
             const sfSchedAt = (dateLike) => { const r = schedulesAt(profileHistory, schedules, dateLike); tallyProfileLookup(safetyProfileTally, r.source); return r; };
+            const safetyOverride = buildOverrideObserved(nightscoutData, profileBaseFromSchedules(sfSchedAt));   // DEF-249
             const safetyWindow = pinnedAnalysisWindow(safetyAsOf, analysisWindowDays,
                 (nightscoutData?.glucose || []).reduce((m, r) => (r && r.dateString ? Math.max(m, new Date(r.dateString).getTime()) : m), -Infinity));
             const hs = agp7day?.hourlyStats || {};
@@ -3307,7 +3326,9 @@
                     unsplitWindows: p.unsplit?.windows ?? p.unsplitWindowCount ?? (applied ? null : (p.effectiveWindowCount ?? null)),
                     unsplitDays: p.contributingDayCount ?? null,
                     coverage: p.concentration?.ceilingUtilization ?? p.ceilingUtilization ?? null,
-                    fastedShare: p.fastedPopulation?.shareOfClean ?? null };
+                    fastedShare: p.fastedPopulation?.shareOfClean ?? null,
+                    fastedNoSmbMedian: p.fastedPopulation?.noSmb?.medianDeviation ?? null,   // DEF-264
+                    smbAssistedShare: p.fastedPopulation?.smbAssistedShare ?? null };
             });
             // lowEvents: every episode of readings below the low threshold in the window, nadir + IOB
             // at nadir, no label.
@@ -3476,7 +3497,8 @@
                                                    periods: ctx.periods, analysisWindowDays: ctx.analysisWindowDays, profileHistory: ctx.profileHistory || [] });
             // DEF-249 (v4.1.1): the override record itself, beside the two builders that read it
             // per event. The walk's working arrays (_rows, _episodes) are internal and never ship.
-            const { _rows, _episodes, ...overrideObserved } = buildOverrideObserved(ctx.nightscoutData);
+            const { _rows, _episodes, ...overrideObserved } = buildOverrideObserved(ctx.nightscoutData,
+                profileBaseFromSchedules((d) => schedulesAt(ctx.profileHistory || [], ctx.schedules, d)));
             // profileLookups is the builder's own tally; it is reported once, in meta.profileHistory.
             const { profileLookups: _sfLookups, ...safetyFactsOut } = safetyFacts;
             const meta = { ...(structured.meta || {}) };
@@ -3705,18 +3727,62 @@
         // `Override: 85` ran). The withdrawn design would have declared an override on nine of nine
         // nights when none ran. Declared only: which preset it was, and whether it should have run,
         // is the reviewer's.
-        const OVERRIDE_OBSERVED_BASIS = 'treatments eventType "Exercise" (notes = preset, duration = minutes) joined to the Override On/Off, Override: N, SMBs off, Target N and ISF/Basal/CR was/now tokens in deviceStatus openaps.suggested.reason; target_bg and sensitivityRatio are NOT override signals (DEF-249, corrected Sep 22)';
+        const OVERRIDE_OBSERVED_BASIS = 'treatments eventType "Exercise" (notes = preset, duration = minutes) joined to the Override On/Off, Override: N, SMBs off, Target N and ISF/Basal/CR was/now tokens in deviceStatus openaps.suggested.reason; target_bg and sensitivityRatio are NOT override signals (DEF-249, corrected Sep 22); effective ISF/CR read against the Carb-floor base — was/now when it differs from the base, base ÷ percent when it equals it (DEF-266)';
+        // [OVERRIDE-EFFECTIVE-START] v4.1.5 (DEF-266, PM ruling Oct 2). The `ISF was/now` and
+        // `CR was/now` tokens carried the override-SCALED values through 2026-09-28 23:02 Z and the
+        // UNSCALED profile values from 2026-09-29 18:02 Z (the first episode after the owner's Sep 28
+        // update). `Basal was/now` is scaled in both forms. The token did not stop matching; what it
+        // matches changed meaning. So each of ISF and CR is read against a BASE — the reason string's
+        // own `Carb floor … (impact x ISF a CR b)`, which is what the loop was using at that record,
+        // autoISF excluded; `schedulesAt` only when that token is absent. If was/now differs from the
+        // base it IS the scaled value (reason_was_now); if it equals the base the scaled value is
+        // base ÷ (percent/100) (computed_from_percent); with no percent, or no base to tell the forms
+        // apart, the field is unavailable. The `ISF: a → b` arrow is override × autoISF and is never
+        // a source. Declared per field in effective.basis, with the base and its source beside it.
+        const OVERRIDE_BASE_TOLERANCE = { isf: 0.5, cr: 0.05 };
+        const OVERRIDE_EFFECTIVE_ROUND = { isf: (v) => Math.round(v), cr: (v) => Math.round(v * 100) / 100, basal: (v) => Math.round(v * 10000) / 10000 };
+        const effectiveFromTokens = (wasNow, percent, base, baseSource) => {
+            const hasBase = !!base && (base.isf != null || base.cr != null);
+            const out = { isf: null, basal: null, cr: null,
+                          basis: { isf: 'unavailable', basal: 'unavailable', cr: 'unavailable' },
+                          base: { isf: hasBase ? (base.isf ?? null) : null, cr: hasBase ? (base.cr ?? null) : null },
+                          baseSource: hasBase ? baseSource : null };
+            if (wasNow && wasNow.basal != null) { out.basal = OVERRIDE_EFFECTIVE_ROUND.basal(wasNow.basal); out.basis.basal = 'reason_was_now'; }
+            ['isf', 'cr'].forEach(k => {
+                const wn = wasNow ? wasNow[k] : null, b = hasBase ? (base[k] ?? null) : null;
+                if (wn != null && b != null && Math.abs(wn - b) > OVERRIDE_BASE_TOLERANCE[k]) { out[k] = OVERRIDE_EFFECTIVE_ROUND[k](wn); out.basis[k] = 'reason_was_now'; }
+                else if (b != null && percent != null && percent > 0) { out[k] = OVERRIDE_EFFECTIVE_ROUND[k](b / (percent / 100)); out.basis[k] = 'computed_from_percent'; }
+            });
+            return out;
+        };
         const parseOverrideReason = (reason) => {
-            const empty = { active: null, percent: null, smbsOff: null, target: null, effective: { isf: null, basal: null, cr: null } };
+            const empty = { active: null, percent: null, smbsOff: null, target: null, wasNow: null, base: null,
+                            effective: effectiveFromTokens(null, null, null, null) };
             if (typeof reason !== 'string' || !reason) return empty;
             const onOff = reason.match(/Override (On|Off)/);
             if (!onOff) return empty;
             const num = (re) => { const m = reason.match(re); const v = m ? parseFloat(m[1]) : NaN; return Number.isFinite(v) ? v : null; };
             const nowOf = (name) => num(new RegExp(name + ' was\\/now [\\d.]+\\/([\\d.]+)'));
-            return { active: onOff[1] === 'On', percent: num(/Override: (\d+)/), smbsOff: /SMBs off/.test(reason),
-                     target: num(/Target:? (\d+)/), effective: { isf: nowOf('ISF'), basal: nowOf('Basal'), cr: nowOf('CR') } };
+            const percent = num(/Override: (\d+)/);
+            const wasNow = { isf: nowOf('ISF'), basal: nowOf('Basal'), cr: nowOf('CR') };
+            const cf = reason.match(/Carb floor [\d.]+ g\/hr \(impact [\d.]+ ISF ([\d.]+) CR ([\d.]+)\)/);
+            const base = cf ? { isf: parseFloat(cf[1]), cr: parseFloat(cf[2]) } : null;
+            return { active: onOff[1] === 'On', percent, smbsOff: /SMBs off/.test(reason),
+                     target: num(/Target:? (\d+)/), wasNow, base,
+                     effective: effectiveFromTokens(wasNow, percent, base, base ? 'reason_carb_floor' : null) };
         };
-        const buildOverrideObserved = (nightscoutData) => {
+        // The fallback base from a schedule resolver: (dateLike) => { schedules } → (ms) => { isf, cr }.
+        const profileBaseFromSchedules = (schedAtFn) => (ms) => {
+            const sc = typeof schedAtFn === 'function' ? schedAtFn(ms)?.schedules : null;
+            const i = Array.isArray(sc?.isf) && sc.isf.length ? getISFForTime(new Date(ms), sc.isf) : null;
+            const c = Array.isArray(sc?.cr) && sc.cr.length ? getCRForTime(new Date(ms), sc.cr) : null;
+            return { isf: i && Number.isFinite(i.value) ? i.value : null, cr: c && Number.isFinite(c.value) ? c.value : null };
+        };
+        // [OVERRIDE-EFFECTIVE-END]
+        // profileBaseAt (v4.1.5, DEF-266): optional (ms) => { isf, cr } from the schedule in effect — the
+        // fallback base when a record carries no Carb-floor token. Resolved only at episode creation,
+        // so a raw whose records all carry the token costs no profile lookups.
+        const buildOverrideObserved = (nightscoutData, profileBaseAt = null) => {
             const iso = (ms) => Number.isFinite(ms) ? new Date(ms).toISOString() : null;
             const rows = (nightscoutData?.deviceStatus || [])
                 .map(d => ({ t: new Date(d?.created_at || d?.timestamp || 0).getTime(),
@@ -3737,7 +3803,10 @@
                 if (x.parsed.active === true) {
                     if (!cur) cur = { startMs: x.t, endMs: null, endBasis: null, preset: null, durationMin: null,
                                       percent: x.parsed.percent, smbsOff: x.parsed.smbsOff, targets: [],
-                                      effective: x.parsed.effective, sources: ['devicestatus.reason'] };
+                                      effective: (x.parsed.base === null && typeof profileBaseAt === 'function')
+                                          ? effectiveFromTokens(x.parsed.wasNow, x.parsed.percent, profileBaseAt(x.t), 'schedulesAt')
+                                          : x.parsed.effective,
+                                      sources: ['devicestatus.reason'] };
                     if (x.parsed.target != null && !cur.targets.includes(x.parsed.target)) cur.targets.push(x.parsed.target);
                 } else if (x.parsed.active === false && cur) {
                     cur.endMs = x.t; cur.endBasis = 'reason_off'; episodes.push(cur); cur = null;
@@ -3754,7 +3823,7 @@
                 startMs: e.t, endMs: Number.isFinite(e.durationMin) ? e.t + e.durationMin * 60000 : null,
                 endBasis: Number.isFinite(e.durationMin) ? 'duration' : 'open_at_fetch',
                 preset: e.preset, durationMin: e.durationMin, percent: null, smbsOff: null, targets: [],
-                effective: { isf: null, basal: null, cr: null }, sources: ['treatments'] }));
+                effective: effectiveFromTokens(null, null, null, null), sources: ['treatments'] }));
             episodes.sort((a, b) => a.startMs - b.startMs);
             const out = episodes.map(ep => ({ start: iso(ep.startMs), end: iso(ep.endMs), endBasis: ep.endBasis,
                 preset: ep.preset, durationMin: ep.durationMin, percent: ep.percent, smbsOff: ep.smbsOff,
@@ -5773,6 +5842,29 @@
 
             const latest = series.length ? series[series.length - 1] : null;
             const reqVals = series.map(s => s.requirementU);
+            // [GAP-RUN-START] DEF-265 (v4.1.4): the run counts itself. The reviewer counted six rows above the
+            // endpoint by hand, and on two nights did not. Walk back from the latest row while
+            // smbU >= the target — `>=`, so a row exactly at 0.30 extends the run, while
+            // endpointMet keeps its strict `<`. A measurement of the series, not a finding.
+            const r3 = (v) => Math.round(v * 1000) / 1000, r1 = (v) => Math.round(v * 10) / 10;
+            const meanOrNull = (vals, round) => { const v = vals.filter(x => typeof x === 'number' && isFinite(x)); return v.length ? round(v.reduce((a, x) => a + x, 0) / v.length) : null; };
+            const run = [];
+            for (let i = series.length - 1; i >= 0; i--) { if (typeof series[i].smbU === 'number' && series[i].smbU >= GAP_ENDPOINT_TARGET_U) run.unshift(series[i]); else break; }
+            const runAboveEndpoint = {
+                count: run.length,
+                since: run.length ? run[0].date : null,
+                meanSmbU: run.length ? meanOrNull(run.map(s => s.smbU), r3) : null,
+                meanBgDelta: run.length ? meanOrNull(run.map(s => s.bgDelta), r1) : null,
+                meanClosurePct: run.length ? meanOrNull(run.map(s => s.closurePct), r3) : null
+            };
+            const tail = series.slice(-7);
+            const trend = tail.length >= 2 ? {
+                rows: tail.length,
+                firstRequirementU: tail[0].requirementU, lastRequirementU: tail[tail.length - 1].requirementU,
+                deltaU: r3(tail[tail.length - 1].requirementU - tail[0].requirementU),
+                deltaPct: tail[0].requirementU > 1e-9 ? r1((tail[tail.length - 1].requirementU - tail[0].requirementU) / tail[0].requirementU * 100) : null
+            } : null;
+            // [GAP-RUN-END]
             return {
                 window: 'dawn',
                 windowHours: GAP_WINDOW_HOURS.slice(),
@@ -5785,7 +5877,10 @@
                     requirementStability: reqVals.length
                         ? { min: Math.min(...reqVals), max: Math.max(...reqVals), n: reqVals.length }
                         : null,
-                    skippedRows
+                    skippedRows,
+                    runAboveEndpoint,
+                    trend,
+                    basis: 'consecutive latest rows with smbU ≥ endpointTargetU; a measurement of the series, not a finding (DEF-265)'
                 }
             };
         };
@@ -9966,6 +10061,12 @@
         // SMB would exclude the measurement. This is a one-flag ruling for the PM, the
         // flag is emitted in the output, and T5/T9 test both settings.
         const FASTED_EXCLUDES_SMB = false;
+        // DEF-264 (v4.1.4). The ruling above stands — SMBs stay IN the fasted population. What
+        // was missing is the second number beside it: how much of that median the SMBs are
+        // holding. For three sessions the Dawn fasted median read as basal adequacy while
+        // 0.5–0.95 U of SMBs a morning held it flat. ASSUMPTION, stated: an SMB's glucose effect
+        // is inside the window for about 60 minutes — asserted, like the basal lag, not measured.
+        const FASTED_SMB_LOOKBACK_MIN = 60;
         // [FASTED-CONST-END]
         const SignalAnalysis = {
             analyzeCleanWindows(nightscoutData, basalWindow, targetBG = 110, basalSchedule = null, isfSchedule = null, tdd = null) {
@@ -10370,6 +10471,30 @@
                     const fastedCapability = windowsInPeriod.length === 0 ? 'no_candidates'
                         : (fastedWindows.length === 0 ? 'excluded_by_rule' : 'capable');
                     // [FASTED-CAPABILITY-END]
+                    // [FASTED-NO-SMB-START] DEF-264 (v4.1.4): one helper, two populations (fasted and fasted-on-split).
+                    // Partition a window set by whether an SMB landed in (at − 60 min, at] — half-
+                    // open on the left, so an SMB exactly 60 min before the window does NOT clear.
+                    const smbRecords = (nightscoutData.treatments || [])
+                        .filter(t => t && t.created_at && t.eventType && String(t.eventType).includes('SMB') && typeof t.insulin === 'number' && t.insulin > 0)
+                        .map(t => ({ ms: new Date(t.created_at).getTime(), units: t.insulin })).filter(r => !Number.isNaN(r.ms));
+                    const FASTED_SMB_LOOKBACK_MS = FASTED_SMB_LOOKBACK_MIN * 60000;
+                    const noSmbPartition = (windows) => {
+                        const r4 = (x) => parseFloat(x.toFixed(4));
+                        const noSmb = windows.filter(w => { const at = w.time.getTime(); return !smbRecords.some(r => r.ms > at - FASTED_SMB_LOOKBACK_MS && r.ms <= at); });
+                        const byDate = {}; noSmb.forEach(w => { if (w.date) byDate[w.date] = (byDate[w.date] || 0) + 1; });
+                        const devs = noSmb.map(w => w.deviation).sort((a, b) => a - b);
+                        // Every SMB record that falls inside ANY window's lookback, counted once.
+                        const inWindows = smbRecords.filter(r => windows.some(w => { const at = w.time.getTime(); return r.ms > at - FASTED_SMB_LOOKBACK_MS && r.ms <= at; }));
+                        const share = windows.length > 0 ? r4(noSmb.length / windows.length) : null;
+                        return {
+                            noSmb: { lookbackMin: FASTED_SMB_LOOKBACK_MIN, windowCount: noSmb.length, dayCount: Object.keys(byDate).length, windowsByDate: byDate,
+                                     medianDeviation: devs.length ? medianOf(devs) : null, shareOfFasted: share },
+                            smbAssistedShare: share === null ? null : r4(1 - share),
+                            smbUnitsInPeriodWindows: parseFloat(inWindows.reduce((a, r) => a + r.units, 0).toFixed(3)),
+                            basis: 'fasted windows with no SMB record in the prior ' + FASTED_SMB_LOOKBACK_MIN + ' min (asserted); the standing fasted population is unchanged (FASTED_EXCLUDES_SMB false, since the fasted population was introduced) — this is the second number beside it, declared only'
+                        };
+                    };
+                    // [FASTED-NO-SMB-END]
                     const fastedPopulation = {
                         lookbackHours: FASTED_LOOKBACK_HOURS,
                         excludesSMB: FASTED_EXCLUDES_SMB,
@@ -10392,7 +10517,8 @@
                             ? parseFloat((fastedWindows.length / windowsInPeriod.length).toFixed(4)) : null,
                         expected: 'shareOfClean near 1.0 in Deep Sleep and Dawn, far below in meal-covered periods; '
                             + 'a looser gate raises the meal-covered share. ceilingUtilization is over the period ceiling and is ≤ the period\'s own coverage. '
-                            + 'Declared only — nothing reads this.'
+                            + 'Declared only — nothing reads this.',
+                        ...noSmbPartition(fastedWindows)   // DEF-264
                     };
                     // [FASTED-POP-END]
                     // [FASTED-ON-SPLIT-START] v4.0.2 (DEF-224). The same fasted rule over the
@@ -10417,7 +10543,8 @@
                         windowsByDate: effectiveFastedByDate,
                         medianDeviation: effectiveFastedDeviations.length ? medianOf(effectiveFastedDeviations) : null,
                         shareOfSplit: effectiveWindows.length > 0 ? parseFloat((effectiveFastedWindows.length / effectiveWindows.length).toFixed(4)) : null,
-                        note: 'the fasted rule over the split (effective) population; a split median whose fasted windowCount is 0 is not a fasting signal'
+                        note: 'the fasted rule over the split (effective) population; a split median whose fasted windowCount is 0 is not a fasting signal',
+                        ...noSmbPartition(effectiveFastedWindows)   // DEF-264
                     };
                     // [FASTED-ON-SPLIT-END]
                     // [COB-GATE-REPORT-START] v3.6.31 (DEF-172 switch; PM condition 2). The
@@ -11830,7 +11957,12 @@
                             const med = (f.medianDeviation === null || f.medianDeviation === undefined) ? 'n/a' : `${Number(f.medianDeviation) >= 0 ? '+' : ''}${Number(f.medianDeviation).toFixed(1)}`;
                             const cap = f.capability === 'excluded_by_rule' ? ` [EXCLUDED BY RULE: ${f.candidateWindows} clean windows all within ${f.lookbackHours}h of a meal/bolus]`
                                 : f.capability === 'no_candidates' ? ' [no clean windows]' : '';
-                            return `${p.name} ${f.windowCount}w/${f.dayCount}d · med ${med} · share ${f.shareOfClean === null ? 'n/a' : f.shareOfClean.toFixed(2)} · cov ${f.ceilingUtilization === null ? 'n/a' : f.ceilingUtilization.toFixed(3)}${cap}`;
+                            // DEF-264 (v4.1.4): the second number beside the median — how much of it the SMBs hold.
+                            const ns = f.noSmb;
+                            const noSmb = ns && ns.windowCount != null
+                                ? ` · no-SMB med ${ns.medianDeviation === null || ns.medianDeviation === undefined ? 'n/a' : `${Number(ns.medianDeviation) >= 0 ? '+' : ''}${Number(ns.medianDeviation).toFixed(1)}`} on ${ns.windowCount} (share ${ns.shareOfFasted === null ? 'n/a' : ns.shareOfFasted.toFixed(2)})`
+                                : '';
+                            return `${p.name} ${f.windowCount}w/${f.dayCount}d · med ${med} · share ${f.shareOfClean === null ? 'n/a' : f.shareOfClean.toFixed(2)} · cov ${f.ceilingUtilization === null ? 'n/a' : f.ceilingUtilization.toFixed(3)}${cap}${noSmb}`;
                         });
                         const any = analysisResults.signalAnalysis.periods.find(p => p.fastedPopulation && !p.fastedPopulation.unavailable)?.fastedPopulation;
                         output += `\n_Fasted population (declared only; ${any ? any.lookbackHours + 'h lookback, ' + (any.excludesSMB ? 'SMBs excluded' : 'SMBs exempt') : 'gate not computed'}): ${fp.join(' · ')}. Expected: share near 1.0 in Deep Sleep and Dawn, far below in meal-covered periods; a looser gate raises the meal-covered share. STANDING READ RESTRICTION (Sep 7): the fasted median is readable only where share is 1.00._\n`;
@@ -12239,7 +12371,8 @@
                 const agp48h = agpForRun(analysisResults, 2);
                 // DEF-249 (v4.1.1): one read of the override record per export — the state fields and
                 // the declared block below both come from it, so they cannot disagree.
-                const overrideObservedForExport = buildOverrideObserved(analysisResults?.nightscoutData);
+                const overrideObservedForExport = buildOverrideObserved(analysisResults?.nightscoutData,
+                    profileBaseFromSchedules((d) => schedulesAt(analysisResults?.profileHistory || [], schedules, d)));
                 // [COVERAGE-PCT-START] v3.6.28 (DEF-119). One computation, both emitters.
                 // The quiet-night (fast-path) object emitted a SUM OF WINDOW COUNTS under the
                 // name coveragePercent — a count wearing a percent's name. The path is
@@ -12312,7 +12445,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.1.3',
+                            version: '4.1.4',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -12829,7 +12962,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.1.3',
+                        version: '4.1.4',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -18317,7 +18450,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.1.3 — measurement-only export · DEF-263 a cyclic reference costs its own field, not the paste · DEF-262 appliedBasalDelta pinned to the fetch · grading and capture · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.1.4 — measurement-only export · DEF-264 the fasted median names its SMBs · DEF-265 the dawn run counts itself · DEF-267 the plan declares what the calculator saw · DEF-266 diagnosed, parse unchanged pending ruling · v4.1.3 underneath · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the screen, the Copy and the sheet row carry no bundles, priorities or recommended values. Press ⬇ Raw fetch before copying.
@@ -19306,6 +19439,11 @@
                                                         {period.splitApplied && period.unsplitMedianDeviation != null
                                                             ? ` since ${String(period.splitChangeDate || '').slice(0, 10)}`
                                                             + ` \u00b7 ${period.unsplitMedianDeviation >= 0 ? '+' : ''}${period.unsplitMedianDeviation.toFixed(1)} across ${period.unsplitWindowCount} overall`
+                                                            : ''}
+                                                        {/* DEF-264 (v4.1.4): the fasted median beside the no-SMB median — a measurement, not a read. */}
+                                                        {period.fastedPopulation && period.fastedPopulation.noSmb && period.fastedPopulation.windowCount > 0
+                                                            ? ` \u00b7 fasted ${period.fastedPopulation.medianDeviation >= 0 ? '+' : ''}${Number(period.fastedPopulation.medianDeviation).toFixed(1)} on ${period.fastedPopulation.windowCount}`
+                                                            + ` \u00b7 no-SMB ${period.fastedPopulation.noSmb.medianDeviation === null ? 'n/a' : (period.fastedPopulation.noSmb.medianDeviation >= 0 ? '+' : '') + Number(period.fastedPopulation.noSmb.medianDeviation).toFixed(1)} on ${period.fastedPopulation.noSmb.windowCount} (share ${period.fastedPopulation.noSmb.shareOfFasted === null ? 'n/a' : period.fastedPopulation.noSmb.shareOfFasted.toFixed(2)})`
                                                             : ''}
                                                     </div>
                                                     {period.signal === 'INSUFFICIENT' && (
