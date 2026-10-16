@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.1.6</title>
+    <title>Daily Insulin Settings Review v4.2.0</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -394,6 +394,28 @@
             // in this tool is mealPeakTiming, which is bolus timing. basalEffectWindow, the
             // CAE causal-block lookup and eventLedger.candidateBlocks.basal all read this.
             basalEffectLagH: [1.0, 1.5],
+            // v4.2.0 (DEF-271). The measured basal requirement's rules, stated once. Every value
+            // is a declared default the owner may move; none of them gates anything.
+            basalRequirement: {
+                postCarbHours: 4,            // no carb entry in the prior 4 h (exactly 4 h passes)
+                reboundExclusionMin: 120,    // not within 120 min after a reading below reboundBelow
+                reboundBelow: 80,            // R6: the school protocol treats at 80
+                artifactMaxMgdlPerMin: 4.0,  // Gate B's rule
+                slopeWindowMin: 30,          // [t − 15, t + 15] min, ≥ 5 readings, no gap > 10 min
+                slopeMinReadings: 5,
+                slopeMaxGapMin: 10,
+                minReadingsPerDayHour: 3,    // a (date, delivery hour) is one day observation only with ≥ 3 readings
+                nightHours: [0, 5],          // R13: delivery hours 00:00–05:59 — the fasted core — feed the prior's scale
+                nightHoursWide: [22, 5],     // R13: 22:00–05:59 is DECLARED beside it (nightScaleWide), never used for the prior
+                minNightDays: 4,
+                basalDominatedShareMax: 0.50, // R14: an hour's observed gap counts toward observedGapUBasal only when correctionDominatedShare ≤ this
+                shrinkageK: 3,
+                poolDays: 28,
+                uamSlope5: 3,                // slope5 > +3 at COB 0 → counted as a UAM suspect, never excluded
+                activityPresets: ['Exercise Mode', 'Practice'],   // R7: only these leave an activityTail
+                activityTailH: [12, 24]      // readings 12–24 h after an activity-class override ends are tagged
+            },
+            basalShareBand: { low: 40, high: 50 },   // A9: a static guardrail band of TDD; flags, never steers
             // v4.0.0. Measurement-only export: the tool emits what it measured and the facts
             // the gates consumed; bundles, priorities, severities, recommended values and the
             // detectors' classifications are not exported. The judgement engine still RUNS
@@ -444,15 +466,20 @@
         // BUG-A FIX: Duration-weighted basal daily total helper.
         // The naïve reduce((sum, e) => sum + e.value) sums U/hr rates, not U/day.
         // This function multiplies each rate by its active hours before summing.
+        // [BASAL-TOTAL-START] v4.2.0 (DEF-271 Part D). Minute-aware: HH:MM parsed to minutes, duration-
+        // weighted, wrapping midnight — the scheduledDawnU discipline. The hour-only parse before it gave a
+        // half-hour entry zero or double duration. Identical on an hourly schedule (test 9).
         const computeBasalDailyTotal = (schedule) => {
             if (!schedule || !Array.isArray(schedule) || schedule.length === 0) return 0;
-            return schedule.reduce((sum, entry, idx, arr) => {
-                const nextIdx = (idx + 1) % arr.length;
-                const curHour = parseInt(entry.time.split(':')[0]);
-                const nextHour = nextIdx === 0 ? 24 : parseInt(arr[nextIdx].time.split(':')[0]);
-                return sum + entry.value * (nextHour - curHour);
+            const toMin = (t) => { const p = String(t).split(':').map(Number); return Number.isFinite(p[0]) ? p[0] * 60 + (Number.isFinite(p[1]) ? p[1] : 0) : NaN; };
+            const entries = schedule.map(e => ({ min: toMin(e && e.time), value: e && e.value })).filter(e => Number.isFinite(e.min) && typeof e.value === 'number' && Number.isFinite(e.value)).sort((a, b) => a.min - b.min);
+            if (!entries.length) return 0;
+            return entries.reduce((sum, e, i, arr) => {
+                const end = i + 1 < arr.length ? arr[i + 1].min : 24 * 60 + arr[0].min;   // the last entry runs to the first entry's time next day
+                return sum + e.value * (end - e.min) / 60;
             }, 0);
         };
+        // [BASAL-TOTAL-END]
 
         // DQ-B FIX: Shared TDD extraction helper replaces 3 independent duplicate implementations.
         // iAPS reason string format: "...2week TDD 18.5 ... Insulin 24h: 14.2..."
@@ -3565,7 +3592,8 @@
                                 'glucoseTrace24h', 'cobDecay series truncation', 'recentChanges.autoDetected[].detectedDate',
                                 'eventLedger[].context.daysSinceBlockChanged', 'safetyFacts.slotAge[].daysSince',
                                 'appliedBasalDelta (priorTotal, newTotal, deltaUPerDay, deltaPercent) — DEF-262',
-                                'safetyFacts.autoISFExposure and autoISFAtEvent (ledger and lowEvents) — DEF-269'],
+                                'safetyFacts.autoISFExposure and autoISFAtEvent (ledger and lowEvents) — DEF-269',
+                                'signals.basalRequirement (window, day keys, logSlots date) — DEF-271'],
                 readsTheRenderClock: [
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
                     { field: 'meta.pageAgeHours', why: 'the gap between the fetch and the Copy (DEF-242); it exists to be non-zero' },
@@ -3863,6 +3891,27 @@
             return { active: true, percent: pick.parsed.percent ?? (ep ? ep.percent : null), preset: ep ? ep.preset : null };
         };
         // [OVERRIDE-OBSERVED-END]
+        // [CYCLE-DEDUP-START] v4.2.0 (DEF-271; carried from the v4.1.6 ruling). iAPS re-posts a
+        // loop cycle under a later created_at (the Oct 1 raw: 52 of 2,163 records, e.g. the 20:45 Z
+        // cycle again at 21:16:27 Z). One record per cycle, keyed on openaps.iob.time; the EARLIEST
+        // created_at is the original post and wins. Records without iob.time are kept as they are.
+        // Shared by the autoISF exposure, the dose matcher and the basal-requirement reading loop.
+        const deviceStatusCycleKey = (status) => status?.openaps?.iob?.time || null;
+        const dedupDeviceStatus = (deviceStatus) => {
+            const best = new Map(), out = []; let dropped = 0;
+            (deviceStatus || []).forEach(d => {
+                if (!d || !d.created_at) return;
+                const k = deviceStatusCycleKey(d);
+                if (!k) { out.push(d); return; }
+                const c = new Date(d.created_at).getTime();
+                const prev = best.get(k);
+                if (!prev || (Number.isFinite(c) && c < prev.c)) { if (prev) dropped++; best.set(k, { d, c }); } else dropped++;
+            });
+            best.forEach(v => out.push(v.d));
+            out.sort((a, b) => autoIsfRecordMs(a) - autoIsfRecordMs(b));
+            return { records: out, dropped };
+        };
+        // [CYCLE-DEDUP-END]
         // [AUTOISF-CONST-START] v4.1.6 (DEF-269)
         const AUTOISF_SMB_MATCH_MS = 2.5 * 60000;     // an SMB and the devicestatus record that issued it sit within this
         const AUTOISF_SMB_UNITS_TOL = 0.005;          // `Microbolusing xU` vs the treatment's insulin
@@ -3915,6 +3964,10 @@
         const buildAutoIsfObserved = (nightscoutData) => {
             const rows = [], failures = [];
             let recordsParsed = 0, recordsWithRatio = 0, recordsNightDisabled = 0, recordsWithSmbRatio = 0;
+            // v4.2.0 (DEF-271, carried from the v4.1.6 ruling): the counts below are over records AS POSTED;
+            // the rows the exposure and the dose matcher read are one per loop cycle (dedupDeviceStatus).
+            const dd = dedupDeviceStatus(nightscoutData?.deviceStatus);
+            const kept = new Set(dd.records);
             (nightscoutData?.deviceStatus || []).forEach(d => {
                 if (!d || !d.created_at) return;
                 const reason = d.openaps?.suggested?.reason;
@@ -3926,11 +3979,11 @@
                 if (p.ratio !== null) recordsWithRatio++;
                 if (p.nightDisabled === true) recordsNightDisabled++;
                 if (p.smbRatio !== null) recordsWithSmbRatio++;
-                rows.push({ ms, createdAt: d.created_at, parsed: p });
+                if (kept.has(d)) rows.push({ ms, createdAt: d.created_at, parsed: p });
             });
             rows.sort((a, b) => a.ms - b.ms);
             const withRatio = rows.filter(r => r.parsed.ratio !== null);
-            return { rows, meta: { recordsParsed, recordsWithRatio, recordsNightDisabled, recordsWithSmbRatio,
+            return { rows, meta: { recordsParsed, recordsWithRatio, recordsNightDisabled, recordsWithSmbRatio, duplicateCyclesDropped: dd.dropped,
                                    firstParsedAt: withRatio.length ? new Date(withRatio[0].ms).toISOString() : null,
                                    lastParsedAt: withRatio.length ? new Date(withRatio[withRatio.length - 1].ms).toISOString() : null,
                                    parseFailures: failures, basis: AUTOISF_BASIS } };
@@ -4009,6 +4062,310 @@
                 daysContributing: h._days.size }));
         };
         // [AUTOISF-OBSERVED-END]
+        // [BASAL-REQ-START] v4.2.0 (DEF-271). The measured basal requirement: for every post-absorption
+        // CGM reading, the part of the glucose rate the loop's own insulin activity does not explain —
+        // 12 × slope5 ÷ ISF + 60 × activity, in U/h — added to the basal scheduled at the delivery time
+        // the reading is attributed to (t − mean(CONFIG.basalEffectLagH), on the profile then in effect).
+        // Autotune's basal method on this tool's population rules and lag. Aggregated by DAYS, not
+        // readings; thin hours carry the night requirement on the schedule's own shape and say so.
+        // Measurement only: no target, no recommended value, no proposed schedule; nothing reads it.
+        const BASAL_REQ_METHOD = 'post-absorption 12×slope÷profile ISF + 60×net insulin activity, added to the basal scheduled at t − mean(lag) on the profile then in effect; variant at the dosed ISF (DEF-271)';
+        const BASAL_REQ_BASIS = 'a measurement under an asserted lag and the loop\'s ISF; no target, no recommended value; nothing gates, ranks or suppresses on it';
+        const BASAL_REQ_LAG_BASIS = 'ASSERTED — not measured. See meta.lagProvenance.';
+        const extractIOBActivity = (status) => {
+            if (!status) return null;
+            if (status.iob && typeof status.iob === 'object' && typeof status.iob.activity === 'number' && Number.isFinite(status.iob.activity)) return status.iob.activity;
+            const a = status.openaps?.iob?.activity;
+            return (typeof a === 'number' && Number.isFinite(a)) ? a : null;
+        };
+        const extractBolusIOBStrict = (status) => { const b = status?.openaps?.iob?.bolusiob; return (typeof b === 'number' && Number.isFinite(b)) ? b : null; };
+        const minuteOfDay = (d) => d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60;
+        const hhmmToMin = (t) => { const p = String(t).split(':').map(Number); return Number.isFinite(p[0]) ? p[0] * 60 + (Number.isFinite(p[1]) ? p[1] : 0) : NaN; };
+        // The rate a schedule carries at a local time; the last entry at or before it, wrapping to the last entry overnight.
+        const basalRateAtTime = (schedule, date) => {
+            const entries = (Array.isArray(schedule) ? schedule : []).map(e => ({ min: hhmmToMin(e?.time), rate: e?.value })).filter(e => Number.isFinite(e.min) && typeof e.rate === 'number' && Number.isFinite(e.rate)).sort((a, b) => a.min - b.min);
+            if (!entries.length) return null;
+            const m = minuteOfDay(date);
+            let pick = entries[entries.length - 1];
+            for (const e of entries) { if (e.min <= m) pick = e; else break; }
+            return pick.rate;
+        };
+        // Duration-weighted units over a local-minute window [startMin, endMin) of one schedule — the scheduledDawnU discipline.
+        const scheduledUnitsOverWindow = (schedule, startMin, endMin) => {
+            const entries = (Array.isArray(schedule) ? schedule : []).map(e => ({ min: hhmmToMin(e?.time), rate: e?.value })).filter(e => Number.isFinite(e.min) && typeof e.rate === 'number' && Number.isFinite(e.rate)).sort((a, b) => a.min - b.min);
+            if (!entries.length || !(endMin > startMin)) return null;
+            let total = 0;
+            for (let i = 0; i < entries.length; i++) {
+                const start = entries[i].min, end = i + 1 < entries.length ? entries[i + 1].min : 24 * 60;
+                const a = Math.max(start, startMin), b = Math.min(end, endMin);
+                if (b > a) total += entries[i].rate * (b - a) / 60;
+            }
+            if (entries[0].min > startMin) { const b = Math.min(entries[0].min, endMin); if (b > startMin) total += entries[entries.length - 1].rate * (b - startMin) / 60; }
+            return total;
+        };
+        const blockLabelAt = (schedule, hour) => { const entries = (Array.isArray(schedule) ? schedule : []).map(e => ({ min: hhmmToMin(e?.time), time: e?.time })).filter(e => Number.isFinite(e.min)).sort((a, b) => a.min - b.min); if (!entries.length) return null; let pick = entries[entries.length - 1]; for (const e of entries) { if (e.min <= hour * 60) pick = e; else break; } return pick.time; };
+        const medianOfNums = (xs) => { const v = xs.filter(x => typeof x === 'number' && Number.isFinite(x)).sort((a, b) => a - b); if (!v.length) return null; const m = Math.floor(v.length / 2); return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2; };
+        const iqrOfNums = (xs) => { const v = xs.filter(x => typeof x === 'number' && Number.isFinite(x)).sort((a, b) => a - b); if (v.length < 2) return null; const q = (p) => { const i = (v.length - 1) * p, lo = Math.floor(i), hi = Math.ceil(i); return v[lo] + (v[hi] - v[lo]) * (i - lo); }; return q(0.75) - q(0.25); };
+        const r3 = (x) => x === null || x === undefined || !Number.isFinite(x) ? null : parseFloat(x.toFixed(3));
+        const r2 = (x) => x === null || x === undefined || !Number.isFinite(x) ? null : parseFloat(x.toFixed(2));
+        const r1 = (x) => x === null || x === undefined || !Number.isFinite(x) ? null : parseFloat(x.toFixed(1));
+        // Temp Basal treatments (absolute, else rate; duration in minutes), each clipped at the next temp's start.
+        const readTempBasals = (treatments) => (treatments || [])
+            .filter(t => t && t.created_at && /^temp basal$/i.test(String(t.eventType || '').trim()))
+            .map(t => ({ start: new Date(t.created_at).getTime(), rate: typeof t.absolute === 'number' ? t.absolute : (typeof t.rate === 'number' ? t.rate : null), durationMin: typeof t.duration === 'number' ? t.duration : null }))
+            .filter(t => Number.isFinite(t.start) && t.rate !== null && t.durationMin !== null && t.durationMin > 0)
+            .sort((a, b) => a.start - b.start)
+            .map((t, i, arr) => ({ ...t, end: Math.min(t.start + t.durationMin * 60000, i + 1 < arr.length ? arr[i + 1].start : Infinity) }));
+        // Σ (temp − scheduled) × hours over [winStart, winEnd): uncovered time reverts to schedule (contributes 0).
+        const tempDeltaUnits = (temps, scheduleAt, winStartMs, winEndMs) => {
+            let delta = 0;
+            temps.forEach(t => {
+                const a = Math.max(t.start, winStartMs), b = Math.min(t.end, winEndMs);
+                if (!(b > a)) return;
+                // integrate in ≤ 5-min pieces so a schedule boundary inside the temp is honoured
+                for (let ms = a; ms < b; ms += 5 * 60000) {
+                    const piece = Math.min(5 * 60000, b - ms) / 3600000;
+                    const sched = scheduleAt(new Date(ms));
+                    if (typeof sched === 'number') delta += (t.rate - sched) * piece;
+                }
+            });
+            return delta;
+        };
+        const UNAVAILABLE_BASAL_REQ = (reason) => ({ unavailable: true, section: 'basalRequirement', reason });
+        const computeBasalRequirement = (nightscoutData, basalSchedule, opts = {}) => {
+            const cfg = opts.cfg || CONFIG.basalRequirement;
+            const lagH = Array.isArray(opts.lagH) && opts.lagH.length === 2 ? opts.lagH : CONFIG.basalEffectLagH;
+            const assignAtH = (lagH[0] + lagH[1]) / 2;
+            const schedules = opts.schedules || { basal: basalSchedule };
+            const profileHistory = Array.isArray(opts.profileHistory) ? opts.profileHistory : [];
+            const schedAt = (dateLike) => schedulesAt(profileHistory, schedules, dateLike).schedules || schedules;
+            const window = pinnedAnalysisWindow(opts.fetchedAt ?? nightscoutData?.fetchedAt ?? null, opts.windowDays || 7,
+                (nightscoutData?.glucose || []).reduce((m, r) => (r && r.dateString ? Math.max(m, new Date(r.dateString).getTime()) : m), -Infinity));
+            const dd = dedupDeviceStatus(nightscoutData?.deviceStatus);
+            const ds = dd.records;
+            if (!ds.length) return UNAVAILABLE_BASAL_REQ('no device status');
+            if (!ds.some(d => extractIOBActivity(d) !== null)) return UNAVAILABLE_BASAL_REQ('no readable iob.activity on any record');
+            if (!Array.isArray(basalSchedule) || !basalSchedule.length) return UNAVAILABLE_BASAL_REQ('no basal schedule');
+            const glucose = (nightscoutData?.glucose || []).filter(r => r && r.dateString && typeof r.sgv === 'number' && Number.isFinite(r.sgv))
+                .map(r => ({ ms: new Date(r.dateString).getTime(), sgv: r.sgv })).filter(r => Number.isFinite(r.ms)).sort((a, b) => a.ms - b.ms);
+            const candidates = glucose.filter(r => r.ms >= window.startMs && r.ms <= window.endMs);
+            const carbs = (nightscoutData?.treatments || []).filter(t => t && t.created_at && typeof t.carbs === 'number' && t.carbs > 0).map(t => new Date(t.created_at).getTime()).filter(Number.isFinite).sort((a, b) => a - b);
+            const lows = glucose.filter(r => r.sgv < cfg.reboundBelow).map(r => r.ms);
+            const episodes = (opts.overrideObserved?._episodes || []).map(e => ({ start: e.startMs, end: e.endMs === null || e.endMs === undefined ? window.endMs : e.endMs, preset: e.preset }));
+            // exact preset names (case-insensitive): 'Practice Evening Wind Down' and 'Post Practice Eating' contain 'Practice' and must NOT tag (R7)
+            const activityTails = episodes.filter(e => e.preset && cfg.activityPresets.some(p => String(e.preset).trim().toLowerCase() === String(p).trim().toLowerCase()) && e.end !== null)
+                .map(e => ({ start: e.end + cfg.activityTailH[0] * 3600000, end: e.end + cfg.activityTailH[1] * 3600000 }));
+            const inAny = (ms, ranges, incl = true) => ranges.some(r => incl ? (ms >= r.start && ms <= r.end) : (ms > r.start && ms < r.end));
+            const census = { candidateReadings: candidates.length, eligible: 0,
+                             rejectedBy: { carbs: 0, cob: 0, override: 0, rebound: 0, artifact: 0, unreadableActivity: 0, unreadableISF: 0, unreadableSchedule: 0 },
+                             bgiCheck: { compared: 0, withinHalf: 0, share: null }, variantUnavailable: 0,
+                             deviceStatusDuplicatesDropped: dd.dropped };
+            const half = cfg.slopeWindowMin / 2 * 60000;
+            const readings = [];
+            let gi = 0;
+            candidates.forEach(r => {
+                const t = r.ms;
+                if (carbs.some(c => c > t - cfg.postCarbHours * 3600000 && c <= t)) { census.rejectedBy.carbs++; return; }
+                const rec = findDeviceStatusAt(ds, t, { direction: 'before' });
+                if (!rec) { census.rejectedBy.unreadableActivity++; return; }
+                const cob = extractCOB(rec).value;
+                if (cob === null || !(cob === 0)) { census.rejectedBy.cob++; return; }
+                if (inAny(t, episodes)) { census.rejectedBy.override++; return; }
+                if (lows.some(l => l < t && l >= t - cfg.reboundExclusionMin * 60000)) { census.rejectedBy.rebound++; return; }
+                // slope window: [t − 15, t + 15] min, ≥ 5 readings, no gap > 10 min, Gate B's rate rule on every consecutive pair
+                while (gi < glucose.length && glucose[gi].ms < t - half) gi++;
+                const win = []; for (let j = gi; j < glucose.length && glucose[j].ms <= t + half; j++) win.push(glucose[j]);
+                let artifact = win.length < cfg.slopeMinReadings;
+                for (let j = 1; j < win.length && !artifact; j++) { const dt = (win[j].ms - win[j - 1].ms) / 60000; if (dt > cfg.slopeMaxGapMin || (dt > 0 && Math.abs((win[j].sgv - win[j - 1].sgv) / dt) > cfg.artifactMaxMgdlPerMin)) artifact = true; }
+                if (artifact) { census.rejectedBy.artifact++; return; }
+                const activity = extractIOBActivity(rec);
+                if (activity === null) { census.rejectedBy.unreadableActivity++; return; }
+                const isfEntry = (() => { const s = schedAt(t); return Array.isArray(s?.isf) && s.isf.length ? getISFForTime(new Date(t), s.isf) : null; })();
+                const isfProfile = isfEntry && Number.isFinite(isfEntry.value) && isfEntry.value > 0 ? isfEntry.value : null;
+                if (isfProfile === null) { census.rejectedBy.unreadableISF++; return; }
+                // least-squares slope, mg/dL per minute → per 5 min
+                const n = win.length, mx = win.reduce((a, x) => a + x.ms, 0) / n, my = win.reduce((a, x) => a + x.sgv, 0) / n;
+                let sxy = 0, sxx = 0; win.forEach(x => { const dx = (x.ms - mx) / 60000; sxy += dx * (x.sgv - my); sxx += dx * dx; });
+                const slope5 = sxx > 0 ? (sxy / sxx) * 5 : 0;
+                const auto = parseAutoIsfReason(rec.openaps?.suggested?.reason);
+                const isfDosed = auto.isfEffective !== null && auto.isfEffective > 0 ? auto.isfEffective : null;
+                if (isfDosed === null) census.variantUnavailable++;
+                const bgiTok = typeof rec.openaps?.suggested?.reason === 'string' ? rec.openaps.suggested.reason.match(/BGI: (-?[\d.]+)/) : null;
+                if (bgiTok && isfDosed !== null) { census.bgiCheck.compared++; if (Math.abs(-activity * isfDosed * 5 - Number(bgiTok[1])) <= 0.5) census.bgiCheck.withinHalf++; }
+                const shortfallUh = 12 * slope5 / isfProfile + 60 * activity;
+                const shortfallUhDosed = isfDosed === null ? null : 12 * slope5 / isfDosed + 60 * activity;
+                const deliveryMs = t - assignAtH * 3600000, deliveryDate = new Date(deliveryMs);
+                const rate = basalRateAtTime(schedAt(deliveryMs)?.basal || basalSchedule, deliveryDate);
+                if (rate === null) { census.rejectedBy.unreadableSchedule++; return; }
+                const bolusIob = extractBolusIOBStrict(rec);
+                census.eligible++;
+                readings.push({ t, deliveryMs, hour: deliveryDate.getHours(), date: getLocalDateString(deliveryDate), slope5, activity, isfProfile, isfDosed,
+                    requirementUh: rate + shortfallUh, requirementUhDosed: shortfallUhDosed === null ? null : rate + shortfallUhDosed,
+                    activityTail: inAny(t, activityTails), uamSuspect: slope5 > cfg.uamSlope5,
+                    correctionDominated: bolusIob !== null && bolusIob > rate, autoISFRatio: auto.ratio });
+            });
+            census.bgiCheck.share = census.bgiCheck.compared ? r2(census.bgiCheck.withinHalf / census.bgiCheck.compared) : null;
+            // A5: day observations per (date, delivery hour)
+            const byKey = new Map();
+            readings.forEach(x => { const k = x.date + '|' + x.hour; (byKey.get(k) || byKey.set(k, []).get(k)).push(x); });
+            const fetchObs = [];   // { date, h, medianUh, medianUhDosed, readings, correctionDominatedShare }
+            byKey.forEach((xs, k) => { if (xs.length < cfg.minReadingsPerDayHour) return; const [date, h] = k.split('|');
+                fetchObs.push({ date, h: Number(h), medianUh: medianOfNums(xs.map(x => x.requirementUh)), medianUhDosed: xs.every(x => x.requirementUhDosed !== null) ? medianOfNums(xs.map(x => x.requirementUhDosed)) : null,
+                                readings: xs.length, correctionDominatedShare: r2(xs.filter(x => x.correctionDominated).length / xs.length) }); });
+            // Part E pooling: slots for dates outside the fetch window, within poolDays, deduped by (date, h); fill thin hours only (R9),
+            // night hours up to minNightDays so R8's night count can be reached, day hours up to K.
+            const fetchDates = new Set(); for (let ms = window.startMs; ms <= window.endMs + 86400000; ms += 86400000) fetchDates.add(getLocalDateString(new Date(ms)));
+            const poolFloor = getLocalDateString(new Date(window.startMs - cfg.poolDays * 86400000));
+            const seenPool = new Set(); const pool = [];
+            (Array.isArray(opts.historySlots) ? opts.historySlots : []).forEach(s => {
+                if (!s || typeof s.date !== 'string' || !Number.isFinite(Number(s.h)) || typeof s.medianUh !== 'number') return;
+                if (fetchDates.has(s.date) || s.date < poolFloor) return;
+                const k = s.date + '|' + s.h; if (seenPool.has(k)) return; seenPool.add(k);
+                pool.push({ date: s.date, h: Number(s.h), medianUh: s.medianUh, medianUhDosed: typeof s.medianUhAtDosedISF === 'number' ? s.medianUhAtDosedISF : null, readings: s.readings ?? null, correctionDominatedShare: s.correctionDominatedShare ?? null });
+            });
+            pool.sort((a, b) => b.date.localeCompare(a.date));   // newest first
+            const inHourRange = (h, range) => range[0] <= range[1] ? (h >= range[0] && h <= range[1]) : (h >= range[0] || h <= range[1]);
+            // R13: the prior's scale is read over the fasted core (00–05). Hours 22–23 carry the dinner correction tail
+            // (Oct 1: correctionDominatedShare 0.84 / 0.54) and the Part C night balance agrees with 00–05, not 22–05.
+            // The wide range still pools like a night hour and is declared beside the scale for comparison.
+            const isNightHour = (h) => inHourRange(h, cfg.nightHours);
+            const isWideNightHour = (h) => inHourRange(h, cfg.nightHoursWide || cfg.nightHours);
+            const nightHourList = Array.from({ length: 24 }, (_, h) => h).filter(isNightHour);
+            const usedPoolDates = new Set();
+            const scheduledUh = (h) => scheduledUnitsOverWindow(basalSchedule, h * 60, (h + 1) * 60);
+            const perHour = Array.from({ length: 24 }, (_, h) => {
+                const fo = fetchObs.filter(o => o.h === h), hx = readings.filter(x => x.hour === h);
+                const fillTo = isWideNightHour(h) ? Math.max(cfg.shrinkageK, cfg.minNightDays) : cfg.shrinkageK;
+                const pooled = fo.length < fillTo ? pool.filter(o => o.h === h).slice(0, fillTo - fo.length) : [];
+                pooled.forEach(o => usedPoolDates.add(o.date));
+                const obs = fo.concat(pooled);
+                const days = obs.length, w = days / (days + cfg.shrinkageK);
+                const sched = scheduledUh(h);
+                return { h, block: blockLabelAt(basalSchedule, h), scheduledUh: r3(sched),
+                         observedRequirementUh: days ? medianOfNums(obs.map(o => o.medianUh)) : null, iqrUh: days ? iqrOfNums(obs.map(o => o.medianUh)) : null,
+                         observedRequirementUhDosed: days && obs.every(o => o.medianUhDosed !== null) ? medianOfNums(obs.map(o => o.medianUhDosed)) : null,
+                         days, fetchDays: fo.length, readings: hx.length,
+                         activityTailDays: new Set(hx.filter(x => x.activityTail).map(x => x.date)).size, uamSuspect: hx.filter(x => x.uamSuspect).length,
+                         pooledDays: pooled.length, oldestDate: obs.length ? obs.map(o => o.date).sort()[0] : null,
+                         correctionDominatedShare: hx.length ? r2(hx.filter(x => x.correctionDominated).length / hx.length) : null,
+                         autoISFRatioShare: hx.length ? r2(hx.filter(x => x.autoISFRatio !== null && x.autoISFRatio !== 1).length / hx.length) : null,
+                         _w: w, _sched: sched };
+            });
+            // A6: the night scale (R13: over the fasted core; the wide 22–05 figure declared beside it)
+            const scaleOver = (pred, hourCount) => {
+                const q = perHour.filter(p => pred(p.h) && p.days >= cfg.minNightDays && p.observedRequirementUh !== null && typeof p._sched === 'number');
+                if (q.length < hourCount / 2) return { scale: 1.0, basis: 'insufficient_night_evidence', qualifying: q.length };
+                const so = q.reduce((a, p) => a + p.observedRequirementUh, 0), ss = q.reduce((a, p) => a + p._sched, 0);
+                return ss > 0 ? { scale: so / ss, basis: 'measured', qualifying: q.length } : { scale: 1.0, basis: 'insufficient_night_evidence', qualifying: q.length };
+            };
+            const core = scaleOver(isNightHour, nightHourList.length);
+            const wide = scaleOver(isWideNightHour, Array.from({ length: 24 }, (_, h) => h).filter(isWideNightHour).length);
+            const nightScale = core.scale, nightScaleBasis = core.basis, nightQual = { length: core.qualifying };
+            // A7: shrinkage
+            perHour.forEach(p => {
+                const prior = typeof p._sched === 'number' ? p._sched * nightScale : null;
+                const est = prior === null ? null : (p.days ? p._w * p.observedRequirementUh + (1 - p._w) * prior : prior);
+                const estDosed = prior === null ? null : (p.days ? (p.observedRequirementUhDosed === null ? null : p._w * p.observedRequirementUhDosed + (1 - p._w) * prior) : prior);
+                p.priorUh = r3(prior); p.weight = r2(p._w); p.estimateUh = r3(est); p.gapUh = est === null || typeof p._sched !== 'number' ? null : r3(est - p._sched);
+                p.estimateUhAtDosedISF = r3(estDosed); p.isfSensitivityUh = est === null || estDosed === null ? null : r3(est - estDosed);
+                p.source = p.days >= cfg.shrinkageK ? 'observed' : p.days > 0 ? 'blended' : 'prior_only';
+                p._est = est; p._estDosed = estDosed;
+            });
+            perHour.forEach(p => { p.observedRequirementUh = r3(p.observedRequirementUh); p.iqrUh = r3(p.iqrUh); p.observedRequirementUhDosed = r3(p.observedRequirementUhDosed); });
+            // A8: daily roll-up
+            const scheduledU = computeBasalDailyTotal(basalSchedule);
+            const ests = perHour.map(p => p._est).filter(x => x !== null);
+            const requirementU = ests.length === 24 ? ests.reduce((a, x) => a + x, 0) : null;
+            const estsDosed = perHour.map(p => p._estDosed);
+            const requirementUDosed = estsDosed.every(x => x !== null) ? estsDosed.reduce((a, x) => a + x, 0) : null;
+            const withDays = perHour.filter(p => p.days > 0 && p.observedRequirementUh !== null && typeof p._sched === 'number');
+            const observedGapU = withDays.reduce((a, p) => a + p._w * (p.observedRequirementUh - p._sched), 0);
+            const observedGapUDosed = withDays.every(p => p.observedRequirementUhDosed !== null) ? withDays.reduce((a, p) => a + p._w * (p.observedRequirementUhDosed - p._sched), 0) : null;
+            // R14: the measured gap over basal-dominated hours only — an hour whose readings sat under more than an
+            // hour of basal in bolus IOB is a correction tail. Hours with no readings contribute 0; the Under-
+            // Insulinization clause reads this, not observedGapU.
+            const basalDominated = withDays.filter(p => p.correctionDominatedShare !== null && p.correctionDominatedShare <= cfg.basalDominatedShareMax);
+            const observedGapUBasal = basalDominated.reduce((a, p) => a + p._w * (p.observedRequirementUh - p._sched), 0);
+            const daily = { scheduledU: r2(scheduledU), requirementU: r2(requirementU), gapU: requirementU === null ? null : r2(requirementU - scheduledU),
+                            gapPct: requirementU === null || !(scheduledU > 0) ? null : r1((requirementU - scheduledU) / scheduledU * 100),
+                            observedShareOfRequirement: requirementU && requirementU > 0 ? r2(perHour.reduce((a, p) => a + p._w * (p._est ?? 0), 0) / requirementU) : null,
+                            observedGapU: r2(observedGapU), observedGapUBasal: r2(observedGapUBasal), observedGapUBasalHours: basalDominated.map(p => p.h),
+                            observedGapUBasalBasis: 'Σ w(h) × (observed − scheduled) over hours with correctionDominatedShare ≤ ' + cfg.basalDominatedShareMax + ' (R14); hours with no readings contribute 0',
+                            requirementUAtDosedISF: r2(requirementUDosed), observedGapUAtDosedISF: r2(observedGapUDosed) };
+            // A9: share-of-TDD band
+            const tdd = opts.tdd && typeof opts.tdd.value === 'number' && opts.tdd.value > 0 ? opts.tdd : null;
+            const band = CONFIG.basalShareBand;
+            const scheduledPct = tdd ? r1(scheduledU / tdd.value * 100) : null, requirementPct = tdd && requirementU !== null ? r1(requirementU / tdd.value * 100) : null;
+            const shareOfTDD = { scheduledPct, requirementPct, band: { low: band.low, high: band.high, source: 'CONFIG.basalShareBand' },
+                                 denominator: tdd ? { tdd: tdd.value, source: tdd.source || null } : { unavailable: true, section: 'basalRequirement.shareOfTDD.denominator' },
+                                 outsideBand: requirementPct === null ? null : (requirementPct < band.low || requirementPct > band.high) };
+            // A10: shape of the estimate profile
+            const shape = (() => { try { const sh = computeScheduleShape(perHour.map(p => ({ time: String(p.h).padStart(2, '0') + ':00', value: p._est })), { pumpIncrement: opts.pumpIncrement ?? CONFIG.pumpIncrement });
+                return { flaggedSteps: (sh.boundaries || []).filter(b => b.flagged).map(b => ({ from: b.from, to: b.to, rateFrom: b.rateFrom, rateTo: b.rateTo, changePct: b.changePct, incrementsMoved: b.incrementsMoved })) }; } catch (e) { return { flaggedSteps: [], error: String(e && e.message) }; } })();
+            // Part C: night balance — per night with no carbs after 20:00 and no override over [00:00, 06:00)
+            const temps = readTempBasals(nightscoutData?.treatments);
+            const nights = [];
+            for (let dayMs = window.startMs; dayMs <= window.endMs; dayMs += 86400000) {
+                const d0 = new Date(dayMs); d0.setHours(0, 0, 0, 0); const n0 = d0.getTime(), n6 = n0 + 6 * 3600000;
+                if (n0 < window.startMs || n6 > window.endMs) continue;
+                const eve = n0 - 4 * 3600000;
+                if (carbs.some(c => c >= eve && c < n6)) continue;
+                if (episodes.some(e => e.start < n6 && e.end > n0)) continue;
+                const schedThen = (ms) => schedAt(ms)?.basal || basalSchedule;
+                const scheduled = scheduledUnitsOverWindow(schedThen(n0), 0, 360);
+                if (scheduled === null) continue;
+                const tempDeltaU = tempDeltaUnits(temps, (d) => basalRateAtTime(schedThen(d.getTime()), d), n0, n6);
+                const ins = (nightscoutData?.treatments || []).filter(t => t && t.created_at && typeof t.insulin === 'number' && t.insulin > 0).map(t => ({ ms: new Date(t.created_at).getTime(), u: t.insulin, smb: /SMB/i.test(String(t.eventType || '')) })).filter(x => x.ms >= n0 && x.ms < n6);
+                const smbU = ins.filter(x => x.smb).reduce((a, x) => a + x.u, 0), bolusU = ins.filter(x => !x.smb).reduce((a, x) => a + x.u, 0);
+                const r0 = findDeviceStatusAt(ds, n0, { direction: 'before' }), r6 = findDeviceStatusAt(ds, n6, { direction: 'before' });
+                const iobStart = r0 ? extractIOB(r0) : null, iobEnd = r6 ? extractIOB(r6) : null;
+                const bgAt = (ms) => { let pick = null; for (const g of glucose) { if (g.ms <= ms && g.ms >= ms - 15 * 60000) pick = g; if (g.ms > ms) break; } return pick ? pick.sgv : null; };
+                const bgStart = bgAt(n0), bgEnd = bgAt(n6);
+                const isfs = []; for (let h = 0; h < 6; h++) { const s = schedAt(n0 + h * 3600000); const e = Array.isArray(s?.isf) && s.isf.length ? getISFForTime(new Date(n0 + h * 3600000), s.isf) : null; if (e && Number.isFinite(e.value) && e.value > 0) isfs.push(e.value); }
+                const meanIsf = isfs.length ? isfs.reduce((a, x) => a + x, 0) / isfs.length : null;
+                const deliveredU = scheduled + tempDeltaU + smbU + bolusU;
+                const balanceRequirementU = (iobStart !== null && iobEnd !== null && bgStart !== null && bgEnd !== null && meanIsf !== null) ? deliveredU + (iobStart - iobEnd) + (bgEnd - bgStart) / meanIsf : null;
+                const estimateU = perHour.slice(0, 6).every(p => p._est !== null) ? perHour.slice(0, 6).reduce((a, p) => a + p._est, 0) : null;
+                nights.push({ date: getLocalDateString(d0), scheduledU: r2(scheduled), tempDeltaU: r2(tempDeltaU), smbU: r2(smbU), bolusU: r2(bolusU), deliveredU: r2(deliveredU),
+                              iobStart: r3(iobStart), iobEnd: r3(iobEnd), bgStart, bgEnd, meanIsf: r1(meanIsf), balanceRequirementU: r2(balanceRequirementU), estimateU: r2(estimateU),
+                              ratio: balanceRequirementU !== null && estimateU !== null && estimateU > 0 ? r2(balanceRequirementU / estimateU) : null });
+            }
+            const nightBalance = { nights: nights.length, medianRatio: r2(medianOfNums(nights.map(n => n.ratio))), perNight: nights,
+                                   basis: 'nights with no carb entry from 20:00 and no observed override over [00:00, 06:00): delivered (scheduled on the profile then in effect + temp delta + SMB + manual bolus) + (IOB at 00:00 − IOB at 06:00) + (BG at 06:00 − BG at 00:00) ÷ mean profile ISF; against Σ estimateUh over delivery hours 0–5; declared only (DEF-271 Part C, R12)' };
+            // Part E: the slots to log — day observations for the most recent COMPLETE local date (R10)
+            const fetchLocal = new Date(window.endMs); const yday = new Date(fetchLocal.getFullYear(), fetchLocal.getMonth(), fetchLocal.getDate() - 1);
+            const logDate = getLocalDateString(yday);
+            const logSlots = fetchObs.filter(o => o.date === logDate).sort((a, b) => a.h - b.h).map(o => ({ date: o.date, h: o.h, medianUh: r3(o.medianUh), medianUhAtDosedISF: r3(o.medianUhDosed), readings: o.readings, correctionDominatedShare: o.correctionDominatedShare }));
+            perHour.forEach(p => { delete p._w; delete p._sched; delete p._est; delete p._estDosed; });
+            return {
+                method: BASAL_REQ_METHOD, basis: BASAL_REQ_BASIS,
+                lag: { minH: lagH[0], maxH: lagH[1], assignAtH, source: 'CONFIG.basalEffectLagH', basis: BASAL_REQ_LAG_BASIS },
+                eligibility: { postCarbHours: cfg.postCarbHours, reboundExclusionMin: cfg.reboundExclusionMin, reboundBelow: cfg.reboundBelow, minReadingsPerDayHour: cfg.minReadingsPerDayHour, slopeWindowMin: cfg.slopeWindowMin,
+                               artifactMaxMgdlPerMin: cfg.artifactMaxMgdlPerMin, activityPresets: cfg.activityPresets.slice(), activityTailH: cfg.activityTailH.slice(), uamSlope5: cfg.uamSlope5,
+                               deviceStatusDedup: 'one record per loop cycle, keyed on openaps.iob.time, earliest created_at kept' },
+                window: { start: window.start, end: window.end, days: window.days, basis: window.basis },
+                census,
+                pool: { requestedDays: cfg.poolDays, usedDays: usedPoolDates.size, historyAvailable: opts.historyAvailable === true, slotsOffered: pool.length, fillRule: 'thin hours only — day hours to K, night hours to max(K, minNightDays), newest first (R8/R9)' },
+                prior: { basis: 'night_scaled', nightScale: r3(nightScale), nightScaleBasis, nightHours: cfg.nightHours.slice(), nightHoursQualifying: nightQual.length, minNightDays: cfg.minNightDays, shrinkageK: cfg.shrinkageK,
+                         nightScaleWide: r3(wide.scale), nightScaleWideBasis: wide.basis, nightHoursWide: (cfg.nightHoursWide || cfg.nightHours).slice(), nightHoursWideQualifying: wide.qualifying,
+                         nightScaleNote: 'R13: the prior scales on the fasted core (nightHours); nightScaleWide is the same ratio over nightHoursWide, declared for comparison and never used' },
+                perHour, daily, shareOfTDD, shape,
+                corroboration: { nightBalance, requirementGap: 'see requirementGap — history-dependent, UNAVAILABLE on a degraded run' },
+                logSlots: { date: logDate, slots: logSlots }
+            };
+        };
+        // Part E read-back: every row's basalRequirementSlots (array, or the JSON string a blank-parsing
+        // reader left) flattened; malformed rows contribute nothing — safetyLowSlots pattern.
+        const historySlotsFromRows = (rows) => {
+            const out = [];
+            (Array.isArray(rows) ? rows : []).forEach(e => {
+                let v = e && e.basalRequirementSlots;
+                if (typeof v === 'string') { try { v = JSON.parse(v); } catch (err) { v = null; } }
+                if (Array.isArray(v)) v.forEach(x => { if (x && typeof x === 'object') out.push(x); });
+            });
+            return out;
+        };
+        // [BASAL-REQ-END]
         // [SAFE-STRINGIFY-START] v4.1.3 (DEF-263). A single cyclic reference anywhere in the export
         // threw JSON.stringify and cost the owner the ENTIRE paste — the one channel this project
         // has. Sep 23, 00:55 Z: "Structured JSON generation failed … TypeError: cyclic object value",
@@ -5917,33 +6274,34 @@
                 if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { return null; } }
                 return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null;
             };
-            // Duration-weighted scheduled basal over [4:00, 8:00) — never sum rates
-            // (the computeBasalDailyTotal discipline). Pro-rata for straddling blocks;
-            // the pre-first-entry span wraps to the last entry's rate (midnight wrap).
-            const scheduledDawnU = (sched) => {
+            // Duration-weighted scheduled basal over a window — never sum rates (the
+            // computeBasalDailyTotal discipline). Pro-rata for straddling blocks; the
+            // pre-first-entry span wraps to the last entry's rate (midnight wrap).
+            // [GAP-C-START] DEF-271 Part C (v4.2.0): a slot that names its own SMB window has its scheduled
+            // basal summed over THAT window; a legacy slot keeps [04:00, 08:00) and says so (windowBasis).
+            // The temp-basal delta, when the slot carries it, is added so smbU + tempDeltaU is provision net
+            // of withheld basal (TOOL #7). Legacy rows are never rewritten.
+            const scheduledOverWindow = (sched, wStart, wEnd) => {
                 if (!sched) return null;
                 const entries = Object.entries(sched)
-                    .map(([t, v]) => {
-                        const parts = String(t).split(':').map(Number);
-                        return { min: parts[0] * 60 + (parts[1] || 0), rate: v };
-                    })
-                    .filter(e => isFinite(e.min) && typeof e.rate === 'number' && isFinite(e.rate))
-                    .sort((a, b) => a.min - b.min);
-                if (!entries.length) return null;
-                const wStart = GAP_WINDOW_HOURS[0] * 60, wEnd = GAP_WINDOW_HOURS[1] * 60;
+                    .map(([t, v]) => { const parts = String(t).split(':').map(Number); return { min: parts[0] * 60 + (parts[1] || 0), rate: v }; })
+                    .filter(e => isFinite(e.min) && typeof e.rate === 'number' && isFinite(e.rate)).sort((a, b) => a.min - b.min);
+                if (!entries.length || !(wEnd > wStart)) return null;
                 let total = 0;
                 for (let i = 0; i < entries.length; i++) {
-                    const start = entries[i].min;
-                    const end = i + 1 < entries.length ? entries[i + 1].min : 24 * 60;
+                    const start = entries[i].min, end = i + 1 < entries.length ? entries[i + 1].min : 24 * 60;
                     const ovStart = Math.max(start, wStart), ovEnd = Math.min(end, wEnd);
                     if (ovEnd > ovStart) total += entries[i].rate * (ovEnd - ovStart) / 60;
                 }
-                if (entries[0].min > wStart) {
-                    const ovEnd = Math.min(entries[0].min, wEnd);
-                    if (ovEnd > wStart) total += entries[entries.length - 1].rate * (ovEnd - wStart) / 60;
-                }
+                if (entries[0].min > wStart) { const ovEnd = Math.min(entries[0].min, wEnd); if (ovEnd > wStart) total += entries[entries.length - 1].rate * (ovEnd - wStart) / 60; }
                 return total;
             };
+            const slotWindowMin = (slot) => {
+                const toMin = (t) => { if (typeof t !== 'string') return NaN; const p = t.split(':').map(Number); return Number.isFinite(p[0]) ? p[0] * 60 + (Number.isFinite(p[1]) ? p[1] : 0) : NaN; };
+                const a = toMin(slot && slot.windowStart), b = toMin(slot && slot.windowEnd);
+                return (Number.isFinite(a) && Number.isFinite(b) && b > a) ? { wStart: a, wEnd: b, basis: 'slot_window' } : { wStart: GAP_WINDOW_HOURS[0] * 60, wEnd: GAP_WINDOW_HOURS[1] * 60, basis: 'legacy_4_8' };
+            };
+            // [GAP-C-END]
             const rows = (Array.isArray(history) ? history : [])
                 .filter(e => e && e.date)
                 .sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -5959,18 +6317,21 @@
                     // absence is unknown, never fabricated.
                     if (!slot || slot.date == null || slot.volume == null) return;
                     if (seenDates.has(slot.date)) return; // keep-first
-                    const scheduledU = scheduledDawnU(parseSched(e.basalSchedule));
+                    const win = slotWindowMin(slot);   // DEF-271 Part C
+                    const scheduledU = scheduledOverWindow(parseSched(e.basalSchedule), win.wStart, win.wEnd);   // DEF-271 Part C (was scheduledDawnU)
                     if (scheduledU == null) { skippedRows++; return; } // never fabricate provision
                     seenDates.add(slot.date);
+                    const tempDeltaU = typeof slot.tempDeltaU === 'number' && Number.isFinite(slot.tempDeltaU) ? slot.tempDeltaU : null;   // DEF-271 Part C
                     const smbU = slot.volume;
-                    const requirementU = scheduledU + smbU;
+                    const requirementU = scheduledU + smbU + (tempDeltaU ?? 0);   // DEF-271 Part C: net of withheld basal when the slot carries it
                     series.push({
                         date: slot.date,
                         scheduledU: Math.round(scheduledU * 1000) / 1000,
                         smbU,
                         requirementU: Math.round(requirementU * 1000) / 1000,
                         closurePct: requirementU > 1e-9 ? Math.round(scheduledU / requirementU * 1000) / 10 : null,
-                        bgDelta: slot.bgDelta ?? null
+                        bgDelta: slot.bgDelta ?? null,
+                        windowBasis: win.basis, tempDeltaU, netOfTemp: tempDeltaU !== null   // DEF-271 Part C
                     });
                 });
             });
@@ -9664,12 +10025,23 @@
                             const tBgDelta = tGlucose.length >= 2
                                 ? tGlucose[tGlucose.length - 1].sgv - tGlucose[0].sgv
                                 : null;
+                            // [GAP-C-SLOT-START] DEF-271 Part C (v4.2.0): the slot carries the SMB window it actually
+                            // used and the temp-basal delta inside it, so computeRequirementGap can sum scheduled basal
+                            // over the same window and read provision net of withheld basal (TOOL #7). Legacy rows
+                            // without these fields are read as before.
+                            const hhmm = (d) => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+                            const tTempDeltaU = (() => { try {
+                                const temps = readTempBasals(nightscoutData.treatments);
+                                return Math.round(tempDeltaUnits(temps, (d) => basalRateAtTime(basalSchedule, d), tFourThirtyAM.getTime(), tWindowEnd.getTime()) * 1000) / 1000;
+                            } catch (e) { return null; } })();
+                            // [GAP-C-SLOT-END]
                             dawnRequirementOut.today = {
                                 date: todayISO,
                                 volume: Math.round(todayVolume * 100) / 100,
                                 bgDelta: tBgDelta == null ? null : Math.round(tBgDelta),
                                 native: isNativeToday,
-                                available: true
+                                available: true,
+                                windowStart: hhmm(tFourThirtyAM), windowEnd: hhmm(tWindowEnd), tempDeltaU: tTempDeltaU   // DEF-271 Part C
                             };
                         }
                     } catch (reqErr) {
@@ -10864,7 +11236,7 @@
                 
                 if (basalSchedule && tdd && tdd > 0) {
                     // Calculate current basal % of TDD
-                    const totalDailyBasal = basalSchedule.reduce((sum, entry) => sum + entry.value, 0);
+                    const totalDailyBasal = computeBasalDailyTotal(basalSchedule);   // DEF-271 Part D: was a raw rate sum (correct only on 24 hourly entries)
                     currentBasalPercent = (totalDailyBasal / tdd) * 100;
                     
                     // Get tiered adjustment based on weighted deviation
@@ -12601,7 +12973,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.1.6',
+                            version: '4.2.0',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -12651,6 +13023,10 @@
                         blockPersistence: computeBlockPersistence(bundles, excludeToday(cachedHistory || [])),
                         // DEF-157: declares the schedule's shape. Both emitters.
                         scheduleShape: computeScheduleShape(schedules?.basal, { pumpIncrement: CONFIG.pumpIncrement }),
+                        // DEF-271 (v4.2.0): the fast path carries no signals object; it gains one carrying the
+                        // measured requirement alone, so the key is signals.basalRequirement on BOTH emitters.
+                        signals: { basalRequirement: analysisResults?.basalRequirement ?? UNAVAILABLE('basalRequirement'),
+                                   note: 'fast path — only the measured basal requirement rides here (DEF-271); periods and basalPercentOfTDD are full-path fields' },
                         // DEF-158 instrument. Both emitters.
                         cobDecay: computeCobDecay(analysisResults?.nightscoutData, fetchAsOf(analysisResults), analysisResults?.profileFacts?.carbsHr ?? null),
                         // DEF-172: the fast path carries no signals.periods, so the gate's cost
@@ -13118,7 +13494,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.1.6',
+                        version: '4.2.0',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -13319,6 +13695,8 @@
                         carbAdjustedSensitivity: analysisResults.carbAdjSensitivity
                             ? parseFloat(analysisResults.carbAdjSensitivity)
                             : (hMeta.historyAvailable ? null : UNAVAILABLE('carbAdjustedSensitivity')),
+                        // DEF-271 (v4.2.0): the measured requirement. Both emitters.
+                        basalRequirement: analysisResults?.basalRequirement ?? UNAVAILABLE('basalRequirement'),
                         basalPercentOfTDD: {
                             current: analysisResults.signalAnalysis?.currentBasalPercent || null,
                             signal: analysisResults.signalAnalysis?.signalOnlyAnchor || null,
@@ -13330,7 +13708,8 @@
                                 ? { tdd: analysisResults.basalPctDenominator.value, source: analysisResults.basalPctDenominator.source }
                                 : { unavailable: true, section: 'basalPercentOfTDD.currentDenominator' },
                             meaning: { current: 'scheduled daily basal ÷ currentDenominator.tdd', signal: 'current + tiered nudge from clean windows',
-                                       target: 'effective target (see targetSource)', final: 'target, rate-limited' }
+                                       target: 'effective target (see targetSource)', final: 'target, rate-limited',
+                                       supersededBy: 'signals.basalRequirement' }   // DEF-271 Part F: A/B for 14 logged sessions, then retirement by a separate spec
                         },
                         weightedDeviation: analysisResults.signalAnalysis?.weightedDeviation || null,
                         analysisWindow: analysisResults.signalAnalysis?.analysisWindow ?? { unavailable: true, section: 'analysisWindow', reason: 'not_computed' },
@@ -16271,6 +16650,17 @@
                     // degraded night leaves a trace the by-date upsert cannot erase.
                     historySource: historyRunProvenance.source,
                     historyAgeHours: historyRunProvenance.source === 'unavailable' ? null : historyAgeHoursNow(),
+                    // [BASAL-REQ-LOG-START] DEF-271 (v4.2.0, Part E): written only when the block computed (the
+                    // App Script writes a column only when the payload carries the key — dawnCorrectionSlots pattern).
+                    // Slots are the day observations of the most recent COMPLETE local date (R10); a date entirely
+                    // under override or with no eligible reading writes [].
+                    ...((instrMetrics && instrMetrics.basalRequirement && !instrMetrics.basalRequirement.unavailable) ? {
+                        basalRequirementU: instrMetrics.basalRequirement.daily?.requirementU ?? null,
+                        basalRequirementGapU: instrMetrics.basalRequirement.daily?.gapU ?? null,
+                        basalRequirementObservedShare: instrMetrics.basalRequirement.daily?.observedShareOfRequirement ?? null,
+                        basalRequirementSlots: instrMetrics.basalRequirement.logSlots?.slots ?? []
+                    } : {}),
+                    // [BASAL-REQ-LOG-END]
                     dawnCorrectionSlots: (() => {
                         try {
                             const t = dawnRequirement.today;
@@ -16279,7 +16669,8 @@
                             // row still written. Never write a zero on an override day — a scaled
                             // night's zero would falsely read as "basal adequate."
                             if (t && t.available && t.native) {
-                                return [{ date: t.date, volume: t.volume, bgDelta: t.bgDelta }];
+                                return [{ date: t.date, volume: t.volume, bgDelta: t.bgDelta,
+                                          ...(t.windowStart ? { windowStart: t.windowStart, windowEnd: t.windowEnd, tempDeltaU: t.tempDeltaU } : {}) }];   // DEF-271 Part C
                             }
                             return [];
                         } catch (e) { return []; }
@@ -16497,6 +16888,20 @@
                     // as the old parenthetical claimed four lines under "24-hour: 31.7 U".
                     const basalPctDenominator = { value: tddForSignal ?? null,
                         source: tdd2Week ? 'tdd2Week' : (tdd24h ? 'tdd24h' : null) };
+                    // [BASAL-REQ-RUN-START] DEF-271 (v4.2.0): the measured basal requirement, computed once per run
+                    // beside the dawn-requirement sink. Pooled slots come from the history rows this run resolved
+                    // (Part E); the 7-day estimate itself needs no history and emits on a degraded run.
+                    const basalRequirement = (() => {
+                        try {
+                            return computeBasalRequirement(nightscoutData, activeSchedules?.basal || basalSchedule, {
+                                schedules: activeSchedules, profileHistory, overrideObserved: buildOverrideObserved(nightscoutData),
+                                tdd: { value: tddForSignal ?? null, source: basalPctDenominator.source },
+                                historySlots: historySlotsFromRows(resolvedHistoryForRun.rows),
+                                historyAvailable: resolvedHistoryForRun.meta?.historyAvailable === true,
+                                fetchedAt: nightscoutData?.fetchedAt ?? null, windowDays: basalSignalWindow || 7, pumpIncrement: CONFIG.pumpIncrement });
+                        } catch (ex) { console.log('[BASAL-REQ] computation failed', ex && ex.message); return UNAVAILABLE_BASAL_REQ('failed: ' + (ex && ex.message)); }
+                    })();
+                    // [BASAL-REQ-RUN-END]
                     console.log('TDD extracted:', {
                         tdd24h: tdd24h,
                         tdd2Week: tdd2Week,
@@ -17494,6 +17899,7 @@
                         projectedBasalSchedule,      // Part C: finding-driven projection
                         tdd: tddForSignal,  // For calculations (2-week preferred)
                         basalPctDenominator,        // DEF-122: which TDD Basal% divides by
+                        basalRequirement,           // DEF-271 (v4.2.0): the measured requirement; both emitters read it
                         tdd24h: tdd24h,     // 24-hour TDD for trend comparison
                         tdd2Week: tdd2Week, // 2-week TDD for stable baseline
                         totalCarbs24h: totalCarbs24h,  // Total carbs in last 24h (logged + estimated treatment)
@@ -17510,7 +17916,7 @@
                     setStep('results');
                     
                     // Auto-log to Google Sheets (if configured and not in override)
-                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity, dawnRequirement, { gateCost, shadowUnblock });
+                    attemptAutoLog(signalAnalysis, detectedState, aggregatedFindings, basalRatioInfo, nightscoutData, effectiveBasalTarget, yesterdayFinal, activeSchedules, processedBundles, carbAdjSensitivity, dawnRequirement, { gateCost, shadowUnblock, basalRequirement });
                     
                 } catch (err) {
                     console.error('Analysis error:', err);
@@ -18606,7 +19012,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.1.6 — measurement-only export · DEF-269 autoISF observed: the ratio the loop dosed at, declared beside the profile ISF · v4.1.5 underneath · DEF-266 effective ISF/CR read against the Carb-floor base, basis declared per field · v4.1.4 underneath · DEF-264 the fasted median names its SMBs · DEF-265 the dawn run counts itself · DEF-267 the plan declares what the calculator saw · v4.1.3 underneath · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.2.0 — measurement-only export · DEF-271 basal requirement: per-hour U/h from post-absorption readings, days counted, thin hours carried and labelled · v4.1.6 underneath · DEF-269 autoISF observed: the ratio the loop dosed at, declared beside the profile ISF · v4.1.5 underneath · DEF-266 effective ISF/CR read against the Carb-floor base, basis declared per field · v4.1.4 underneath · DEF-264 the fasted median names its SMBs · DEF-265 the dawn run counts itself · DEF-267 the plan declares what the calculator saw · v4.1.3 underneath · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the screen, the Copy and the sheet row carry no bundles, priorities or recommended values. Press ⬇ Raw fetch before copying.
@@ -18982,6 +19388,20 @@
                                                 </div>
                                             )}
                                         </div>
+                                        {/* [BASAL-REQ-SCREEN-START] DEF-271 (v4.2.0): display only — the measured requirement beside the basal-% line. */}
+                                        {analysisResults.basalRequirement && !analysisResults.basalRequirement.unavailable && (() => {
+                                            const br = analysisResults.basalRequirement, d = br.daily;
+                                            const carried = br.perHour.filter(p => p.source === 'prior_only').length;
+                                            return (
+                                                <div className="mt-1 text-xs text-gray-500">
+                                                    {`Requirement ${d.requirementU === null ? 'n/a' : d.requirementU.toFixed(1)} U/day vs scheduled ${d.scheduledU === null ? 'n/a' : d.scheduledU.toFixed(1)}`
+                                                        + ` \u00b7 ${d.observedShareOfRequirement === null ? 'n/a' : Math.round(d.observedShareOfRequirement * 100) + ' %'} measured`
+                                                        + ` \u00b7 ${carried} of 24 hours carried`
+                                                        + (br.prior.nightScaleBasis === 'insufficient_night_evidence' ? ' \u00b7 night scale not measured' : '')}
+                                                </div>
+                                            );
+                                        })()}
+                                        {/* [BASAL-REQ-SCREEN-END] */}
                                         
                                         {/* Show weighted deviation for context */}
                                         {analysisResults.signalAnalysis?.weightedDeviation !== undefined && (
