@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.2.0</title>
+    <title>Daily Insulin Settings Review v4.2.1</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -416,6 +416,9 @@
                 activityTailH: [12, 24]      // readings 12–24 h after an activity-class override ends are tagged
             },
             basalShareBand: { low: 40, high: 50 },   // A9: a static guardrail band of TDD; flags, never steers
+            // v4.2.1 HOTFIX (DEF-273). devicestatus is fetched a day at a time: the single 8-day query crossed
+            // Cloudflare's ~100 s origin timeout on Oct 30 (524, surfaced as CORS / "Load failed").
+            deviceStatusFetch: { chunkHours: 24, perChunkCount: 2000, timeoutMs: 45000, retries: 1, splitOnCap: true },
             // v4.0.0. Measurement-only export: the tool emits what it measured and the facts
             // the gates consumed; bundles, priorities, severities, recommended values and the
             // detectors' classifications are not exported. The judgement engine still RUNS
@@ -3891,6 +3894,69 @@
             return { active: true, percent: pick.parsed.percent ?? (ep ? ep.percent : null), preset: ep ? ep.preset : null };
         };
         // [OVERRIDE-OBSERVED-END]
+        // [CHUNKED-FETCH-START] v4.2.1 HOTFIX (DEF-273). A Nightscout collection fetched in half-open
+        // date chunks, SEQUENTIALLY (the server is the bottleneck), each with its own AbortController
+        // timeout and one retry on anything thrown or non-2xx (a Cloudflare 524 reaches the browser as
+        // a CORS TypeError). A chunk that returns exactly perChunkCount was truncated by the server and
+        // is re-fetched as two halves, once; a half that also caps fails. Assembly is newest-first by the
+        // date field, the order the single call returned and the order the minute de-dup and every
+        // findDeviceStatusAt caller assume. Failure is loud and never partial: a missing day would bias
+        // every 7-day instrument silently. Generic over `collection` so treatments can follow by config.
+        const chunkedFetchOnce = async (url, headers, timeoutMs, fetchImpl) => {
+            const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+            const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null;
+            try {
+                const res = await fetchImpl(url, { headers, signal: ctl ? ctl.signal : undefined });
+                if (!res || !res.ok) throw new Error('HTTP ' + (res ? res.status + ' ' + (res.statusText || '') : 'no response'));
+                const body = await res.json();
+                if (!Array.isArray(body)) throw new Error('non-array body');
+                return body;
+            } catch (e) {
+                throw new Error((e && e.name === 'AbortError') ? ('timeout after ' + timeoutMs + ' ms') : String(e && e.message || e));
+            } finally { if (timer) clearTimeout(timer); }
+        };
+        const fetchCollectionChunked = async ({ baseUrl, collection = 'devicestatus', dateField = 'created_at', startISO, endMs, authParam = '', headers = {}, cfg, fetchImpl, log }) => {
+            const c = cfg || CONFIG.deviceStatusFetch;
+            const doFetch = fetchImpl || ((u, o) => fetch(u, o));
+            const say = log || ((m) => console.log(m));
+            const startMs = new Date(startISO).getTime();
+            if (!Number.isFinite(startMs)) throw new Error(collection + ' fetch: bad start ' + startISO);
+            const finalEnd = (Number.isFinite(endMs) ? endMs : Date.now()) + 60000;   // the last chunk runs to now + 1 min
+            const stepMs = (c.chunkHours || 24) * 3600000;
+            const urlFor = (a, b) => `${baseUrl}/api/v1/${collection}.json?count=${c.perChunkCount}&find[${dateField}][$gte]=${new Date(a).toISOString()}&find[${dateField}][$lt]=${new Date(b).toISOString()}${authParam}`;
+            const t0 = Date.now();
+            // one chunk with its retry; returns { records, attempts, reason }
+            const fetchChunk = async (a, b) => {
+                let attempts = 0, lastErr = null;
+                while (attempts <= (c.retries ?? 1)) {
+                    attempts++;
+                    try { const recs = await chunkedFetchOnce(urlFor(a, b), headers, c.timeoutMs || 45000, doFetch); return { records: recs, attempts }; }
+                    catch (e) { lastErr = e; }
+                }
+                throw new Error(`${collection} fetch failed for ${new Date(a).toISOString()} → ${new Date(b).toISOString()} after ${attempts} attempts: ${lastErr && lastErr.message}`);
+            };
+            const chunks = []; let all = [];
+            for (let a = startMs; a < finalEnd; a += stepMs) {
+                const b = Math.min(a + stepMs, finalEnd); const tc = Date.now();
+                let { records, attempts } = await fetchChunk(a, b); let split = false;
+                if (c.splitOnCap !== false && records.length >= c.perChunkCount) {
+                    // truncated by the server: two halves, once; a half that still caps fails loudly, naming the half
+                    const mid = a + Math.floor((b - a) / 2); split = true;
+                    const h1 = await fetchChunk(a, mid), h2 = await fetchChunk(mid, b); attempts += h1.attempts + h2.attempts;
+                    if (h1.records.length >= c.perChunkCount) throw new Error(`${collection} fetch: half ${new Date(a).toISOString()} → ${new Date(mid).toISOString()} still returned ${h1.records.length} records (perChunkCount ${c.perChunkCount}) — truncated`);
+                    if (h2.records.length >= c.perChunkCount) throw new Error(`${collection} fetch: half ${new Date(mid).toISOString()} → ${new Date(b).toISOString()} still returned ${h2.records.length} records (perChunkCount ${c.perChunkCount}) — truncated`);
+                    records = h1.records.concat(h2.records);
+                }
+                const ms = Date.now() - tc;
+                chunks.push({ from: new Date(a).toISOString(), to: new Date(b).toISOString(), records: records.length, ms, attempts, split });
+                say(`${collection} chunk ${chunks.length}: ${records.length} records in ${ms} ms (${attempts} attempt${attempts === 1 ? '' : 's'}${split ? ', split' : ''})`);
+                all = all.concat(records);
+            }
+            all.sort((x, y) => { const tx = Date.parse(x && x[dateField]) || 0, ty = Date.parse(y && y[dateField]) || 0; return ty - tx; });   // newest first
+            return { records: all, telemetry: { collection, chunkHours: c.chunkHours, perChunkCount: c.perChunkCount, timeoutMs: c.timeoutMs, retries: c.retries, chunks, totalMs: Date.now() - t0,
+                                                 basis: 'half-open [from, to) date chunks fetched in series; per-chunk timeout + 1 retry; cap-split once; newest-first reassembly; any chunk failure stops the run (DEF-273)' } };
+        };
+        // [CHUNKED-FETCH-END]
         // [CYCLE-DEDUP-START] v4.2.0 (DEF-271; carried from the v4.1.6 ruling). iAPS re-posts a
         // loop cycle under a later created_at (the Oct 1 raw: 52 of 2,163 records, e.g. the 20:45 Z
         // cycle again at 21:16:27 Z). One record per cycle, keyed on openaps.iob.time; the EARLIEST
@@ -12894,6 +12960,11 @@
                     };
                 })() : UNAVAILABLE('fetchTelemetry');
                 // [FETCH-TELEMETRY-END]
+                // DEF-273 (v4.2.1): the devicestatus chunk record rides on the same fetchTelemetry object, both
+                // emitters — added here, outside the Sheets-telemetry block, which stays byte-identical.
+                (() => { const dsTel = analysisResults?.nightscoutData?.deviceStatusFetch || null;
+                    Object.assign(fTel, { deviceStatusChunks: dsTel ? dsTel.chunks : null, deviceStatusTotalMs: dsTel ? dsTel.totalMs : null,
+                                          deviceStatusFetchBasis: dsTel ? dsTel.basis : 'no chunk record on this run (pre-v4.2.1 raw, or devicestatus not fetched)' }); })();
                 // Calculate AGP (same as formatForClaude)
                 const agp7day = agpForRun(analysisResults, 7);   // DEF-247: the same object formatForClaude reads
                 const agp48h = agpForRun(analysisResults, 2);
@@ -12973,7 +13044,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.2.0',
+                            version: '4.2.1',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -13494,7 +13565,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.2.0',
+                        version: '4.2.1',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -15768,17 +15839,15 @@
                     const treatments = await treatmentsRes.json();
                     console.log('Treatments fetched:', treatments.length);
                     
-                    // Fetch device status
-                    const deviceStatusUrl = `${baseUrl}/api/v1/devicestatus.json?count=${count}${createdAtDateFilter}${authParam}`;
-                    console.log('Fetching device status...');
-                    const deviceStatusRes = await fetch(deviceStatusUrl, { headers });
-                    let deviceStatus = [];
-                    if (deviceStatusRes.ok) {
-                        deviceStatus = await deviceStatusRes.json();
-                        console.log('Device status fetched:', deviceStatus.length);
-                    } else {
-                        console.warn('Device status fetch failed (non-fatal):', deviceStatusRes.status);
-                    }
+                    // Fetch device status — v4.2.1 HOTFIX (DEF-273): a day at a time, in series, loud on failure.
+                    // The old single query and its "non-fatal" warning path are gone: a chunk that fails after
+                    // its retry throws with the chunk named, and DEF-237's stop-on-failed-live-read holds.
+                    // A 2xx with an empty array is still non-fatal (an empty day is a fact, not a failure).
+                    console.log('Fetching device status in ' + CONFIG.deviceStatusFetch.chunkHours + ' h chunks...');
+                    const dsFetch = await fetchCollectionChunked({ baseUrl, collection: 'devicestatus', dateField: 'created_at', startISO: fetchStartISO, endMs: Date.now(), authParam, headers, cfg: CONFIG.deviceStatusFetch });
+                    const deviceStatus = dsFetch.records;
+                    const deviceStatusFetch = dsFetch.telemetry;
+                    console.log('Device status fetched:', deviceStatus.length, 'in', deviceStatusFetch.chunks.length, 'chunks,', deviceStatusFetch.totalMs, 'ms');
                     
                     // Fetch profile - CRITICAL for correct schedule data
                     // DEF-251 (v4.1.1): Nightscout stores EVERY profile document iAPS uploads, each
@@ -15860,7 +15929,10 @@
 
                     // DEF-189 (v3.6.37): the fetch's own timestamp, so the raw-fetch file and the
                     // Copy export can be paired by fact rather than by inference from click times.
-                    return { glucose: dedupedGlucose, treatments, deviceStatus: dedupedDeviceStatus, profile, profiles, fetchedAt: new Date().toISOString() };
+                    // DEF-273 (v4.2.1): the chunk telemetry rides with the data; the DEF-189 return line itself is unchanged.
+                    const fetched = { glucose: dedupedGlucose, treatments, deviceStatus: dedupedDeviceStatus, profile, profiles, fetchedAt: new Date().toISOString() };
+                    fetched.deviceStatusFetch = deviceStatusFetch;
+                    return fetched;
                     
                 } catch (err) {
                     console.error('Nightscout fetch error:', err);
@@ -19012,7 +19084,15 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.2.0 — measurement-only export · DEF-271 basal requirement: per-hour U/h from post-absorption readings, days counted, thin hours carried and labelled · v4.1.6 underneath · DEF-269 autoISF observed: the ratio the loop dosed at, declared beside the profile ISF · v4.1.5 underneath · DEF-266 effective ISF/CR read against the Carb-floor base, basis declared per field · v4.1.4 underneath · DEF-264 the fasted median names its SMBs · DEF-265 the dawn run counts itself · DEF-267 the plan declares what the calculator saw · v4.1.3 underneath · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.2.1 — HOTFIX DEF-273: devicestatus fetched a day at a time (the 8-day query timed out at the edge) · v4.2.0 underneath · DEF-271 basal requirement: per-hour U/h from post-absorption readings, days counted, thin hours carried and labelled · v4.1.6 underneath · DEF-269 autoISF observed: the ratio the loop dosed at, declared beside the profile ISF · v4.1.5 underneath · DEF-266 effective ISF/CR read against the Carb-floor base, basis declared per field · v4.1.4 underneath · DEF-264 the fasted median names its SMBs · DEF-265 the dawn run counts itself · DEF-267 the plan declares what the calculator saw · v4.1.3 underneath · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
+                                    {/* [DS-FETCH-SCREEN-START] DEF-273 (v4.2.1): the devicestatus fetch, chunk by chunk, where the owner can see it. */}
+                                    {analysisResults?.nightscoutData?.deviceStatusFetch && (
+                                        <p className="text-gray-500 text-xs mt-1">
+                                            {`devicestatus: ${analysisResults.nightscoutData.deviceStatusFetch.chunks.length} chunks · ${analysisResults.nightscoutData.deviceStatusFetch.chunks.reduce((a, c) => a + c.records, 0).toLocaleString()} records · ${Math.round(analysisResults.nightscoutData.deviceStatusFetch.totalMs / 1000)} s`
+                                                + (analysisResults.nightscoutData.deviceStatusFetch.chunks.some(c => c.attempts > 1 || c.split) ? ` · ${analysisResults.nightscoutData.deviceStatusFetch.chunks.filter(c => c.attempts > 1).length} retried, ${analysisResults.nightscoutData.deviceStatusFetch.chunks.filter(c => c.split).length} split` : '')}
+                                        </p>
+                                    )}
+                                    {/* [DS-FETCH-SCREEN-END] */}
                                     {CONFIG.measurementOnly === true && (
                                         <p className="text-amber-300 text-xs mt-1">
                                             MEASUREMENT-ONLY: the screen, the Copy and the sheet row carry no bundles, priorities or recommended values. Press ⬇ Raw fetch before copying.
