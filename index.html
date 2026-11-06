@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.2.1</title>
+    <title>Daily Insulin Settings Review v4.2.3</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2949,7 +2949,18 @@
             const expected = perEntry.every(x => Number.isFinite(x)) ? perEntry.reduce((a, x) => a + x, 0) : null;
             const fromMs = new Date(episode[0].created_at).getTime() - 2 * 60000;
             const toMs = new Date(episode[episode.length - 1].created_at).getTime() + 180 * 60000;
-            const inHorizon = (treatments || []).filter(t => t && t.created_at && t.insulin > 0 && new Date(t.created_at).getTime() >= fromMs && new Date(t.created_at).getTime() <= toMs);
+            // DEF-272 (v4.2.3): the delivery window stops where the next carb entry starts. The plan counts only
+            // THIS episode's entries, so insulin for any later entry is foreign to it; a snack bolus inside
+            // last + 180 min read as `unpaired` and sent the record indeterminate (Oct 16 lunch). The next
+            // entry's own window opens at −2 min (the DEF-225 pairing rule), so cutting there makes adjacent
+            // windows disjoint. Any later entry with carbs > 0 counts — the same filter ledgerMealEpisode uses.
+            const lastMs = new Date(episode[episode.length - 1].created_at).getTime();
+            const nextEntry = (treatments || []).filter(t => t && t.created_at && typeof t.carbs === 'number' && t.carbs > 0)
+                .map(t => ({ ms: new Date(t.created_at).getTime(), carbs: t.carbs })).filter(x => Number.isFinite(x.ms) && x.ms > lastMs).sort((a, b) => a.ms - b.ms)[0] || null;
+            const cutMs = nextEntry ? nextEntry.ms - 2 * 60000 : null;
+            const horizonEndMs = (cutMs !== null && cutMs < toMs) ? cutMs : toMs;
+            const inHorizon = (treatments || []).filter(t => t && t.created_at && t.insulin > 0 && new Date(t.created_at).getTime() >= fromMs && new Date(t.created_at).getTime() <= horizonEndMs);
+            const smbUnitsAfterCut = horizonEndMs < toMs ? parseFloat((treatments || []).filter(t => t && t.created_at && t.insulin > 0 && t.eventType && String(t.eventType).includes('SMB') && new Date(t.created_at).getTime() > horizonEndMs && new Date(t.created_at).getTime() <= toMs).reduce((a, t) => a + t.insulin, 0).toFixed(3)) : null;
             const isSmb = (t) => !!(t.eventType && String(t.eventType).includes('SMB'));
             const paired = (pairs || []).map(p => p.bolus).filter(Boolean);
             const same = (a, b) => new Date(a.created_at).getTime() === new Date(b.created_at).getTime() && a.insulin === b.insulin;
@@ -2971,8 +2982,12 @@
                 deliveredUnits: r3(delivered), deliveredShareOfPlan: determinate ? upper : null,
                 budgetDeterminate: determinate, budgetRatioLower: lower, budgetRatioUpper: upper,
                 mealBolusUnits: r3(pairedUnits), smbUnitsInHorizon: r3(smbUnits), unpairedBolusUnits: r3(unpairedUnits), unpairedBolusCount: unpaired.length,
-                horizon: { fromISO: new Date(fromMs).toISOString(), toISO: new Date(toMs).toISOString(), rule: '[first entry −2 min, last entry +180 min]' },
-                basis: 'episode plan — expected Σ grams_i / CR(t_i); delivered = every insulin record in the horizon; Lower = paired meal boluses, Upper = delivered; Lower ≤ Upper by construction; CR(t_i) is the profile in effect at t_i (DEF-251)',
+                horizon: { fromISO: new Date(fromMs).toISOString(), toISO: new Date(horizonEndMs).toISOString(), nominalToISO: new Date(toMs).toISOString(),
+                           cutAt: horizonEndMs < toMs ? new Date(horizonEndMs).toISOString() : null, cutReason: horizonEndMs < toMs ? 'next_carb_entry' : null,
+                           nextEntryTime: nextEntry ? new Date(nextEntry.ms).toISOString() : null, nextEntryGrams: nextEntry ? nextEntry.carbs : null,
+                           smbUnitsAfterCut,
+                           rule: '[first entry −2 min, min(last entry +180 min, next carb entry −2 min)]' },
+                basis: 'episode plan — expected Σ grams_i / CR(t_i); delivered = every insulin record in the horizon; Lower = paired meal boluses, Upper = delivered; Lower ≤ Upper by construction; CR(t_i) is the profile in effect at t_i (DEF-251); the horizon ends at the earlier of the last entry +180 min and the next carb entry −2 min (DEF-272); insulin after the cut belongs to the later entry',
                 note: expected === null ? 'no CR for an entry in the episode — no plan'
                     : determinate ? 'determinate — every non-SMB bolus in the horizon is a paired meal bolus; bounds collapse onto deliveredShareOfPlan'
                     : `indeterminate — ${unpaired.length} unpaired non-SMB bolus(es) in the horizon; bounds only, no share`
@@ -3596,7 +3611,8 @@
                                 'eventLedger[].context.daysSinceBlockChanged', 'safetyFacts.slotAge[].daysSince',
                                 'appliedBasalDelta (priorTotal, newTotal, deltaUPerDay, deltaPercent) — DEF-262',
                                 'safetyFacts.autoISFExposure and autoISFAtEvent (ledger and lowEvents) — DEF-269',
-                                'signals.basalRequirement (window, day keys, logSlots date) — DEF-271'],
+                                'signals.basalRequirement (window, day keys, logSlots date) — DEF-271',
+                                'scheduleHistory (month buckets, exclude-today) — DEF-275'],
                 readsTheRenderClock: [
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
                     { field: 'meta.pageAgeHours', why: 'the gap between the fetch and the Copy (DEF-242); it exists to be non-zero' },
@@ -5754,6 +5770,104 @@
             });
             return out;
         };
+        // [SCHEDULE-HISTORY-START] v4.2.3 (DEF-275). Every block's dated changes over the history,
+        // beside the outcomes — the Nov 5 session's evidence (the evening basal ramp built over ten
+        // months) had to be dug out of decision-log prose. Measurement-only: dated values, counts,
+        // means and quoted log headlines. No trend call, no attribution, no "since this change".
+        // Change points come from the same ChangeRecord every gate reads; REANCHOR marks follow
+        // DEF-253's rule (token on the change's row or the one before); monthly means follow
+        // computeMonthlyOutcomes (an absent field is excluded and counted, never read as zero).
+        // Pinned to dataFetchedAt (DEF-262 pattern): "today" is the fetch's today.
+        const SCHEDULE_HISTORY_BASIS = 'dated schedule snapshots from the Sheets history diffed per block (ChangeRecord); monthly means of logged period fields; one log headline per change date, quoted verbatim (first non-empty line that is neither a markdown heading nor a fence, ≤ 160 chars; backtick fences escaped as ˋˋˋ so the paste\'s JSON block survives) — a headline is the date\'s, not the block\'s; M is a string match on the clock time only, not the parameter; no trend, attribution or causal claim is made (DEF-275 r2)';
+        const buildScheduleHistory = (historyRows, changeRecord, liveSchedules, { asOf = null } = {}) => {
+            const r1 = (x) => (x === null || x === undefined || !Number.isFinite(x)) ? null : Math.round(x * 10) / 10;
+            const num = (v) => { if (v === null || v === undefined || v === '') return null; const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+            // Two row sets. `dated` (every row with a readable date) feeds the monthly means, exactly as
+            // computeMonthlyOutcomes buckets them; `rows` (those also carrying a parseable basal snapshot)
+            // feed the per-block history. A row with no date is skipped from both; one with an unparseable
+            // basal snapshot is skipped from the block history only — both counted in meta.rowsSkipped.
+            let rowsSkipped = 0, rowsNoDate = 0;
+            const dated = (Array.isArray(historyRows) ? historyRows : []).map(e => {
+                const key = e && gapLocalDateKey(e.date || e.timestamp);
+                if (!key) { rowsNoDate++; rowsSkipped++; return null; }
+                const basal = parseSnapshot(e.basalSchedule);
+                if (!basal) rowsSkipped++;
+                return { key, date: e.date || e.timestamp, hasBasal: !!basal, scheds: { basal, cr: parseSnapshot(e.crSchedule), isf: parseSnapshot(e.isfSchedule) },
+                         log: typeof e.decisionLog === 'string' ? e.decisionLog : (e.decisionLog == null ? null : String(e.decisionLog)),
+                         reanchors: parseReanchorTokens(e.decisionLog), row: e };
+            }).filter(Boolean).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+            const rows = dated.filter(r => r.hasBasal);
+            const past = dated.filter(r => isBeforeToday(r.date, asOf));   // "today" is the fetch's today (DEF-262)
+            // r2 (PM ruling Nov 6): the headline belongs to the DATE, not the block — emitted once per change date in
+            // headlinesByDate. It is the first non-empty line that is neither a markdown heading (`# …`, which carries
+            // nothing — 8 of the 30 most recent were titles) nor a bare fence; any ``` inside it is replaced with ˋˋˋ
+            // (U+02CB) because the paste carries this JSON inside a ```json fence (the Aug 24 log opens with one); cut at 160.
+            const headlineOf = (row) => { if (!row || typeof row.log !== 'string') return null; const first = row.log.split(/\r?\n/).map(l => l.trim()).find(l => l.length && !/^`{3,}\w*$/.test(l) && !/^#{1,6}\s/.test(l)); if (!first) return null; const t = first.replace(/`{3,}/g, (m) => 'ˋ'.repeat(m.length)); return t.length > 160 ? t.slice(0, 160) : t; };
+            // `M`: that date's full Decision_Log mentions the block's clock string — a match on the time only, not the parameter.
+            const logMentions = (row, block) => !!(row && typeof row.log === 'string' && row.log.includes(block));
+            const changeDates = new Set();
+            const rowOn = (dateKey) => rows.find(r => r.key === dateKey) || null;
+            const idxOn = (dateKey) => rows.findIndex(r => r.key === dateKey);
+            const reanchoredOn = (dateKey, param, block) => { const i = idxOn(dateKey); return [i, i - 1].some(j => j >= 0 && rows[j] && rows[j].reanchors.some(x => x.param === param && x.block === block)); };
+            const allChanges = (changeRecord && changeRecord.available === true && Array.isArray(changeRecord.changes)) ? changeRecord.changes : [];
+            const live = { basal: scheduleArrayToMap(liveSchedules?.basal), cr: scheduleArrayToMap(liveSchedules?.cr), isf: scheduleArrayToMap(liveSchedules?.isf) };
+            const timeSort = (a, b) => String(a).localeCompare(String(b));
+            const monthEnds = (() => { const m = new Map(); past.filter(r => r.hasBasal).forEach(r => m.set(r.key.slice(0, 7), r)); return m; })();   // the last snapshot-carrying row of each month
+            const describe = (param, block, currentValue) => {
+                const carrying = rows.filter(r => r.scheds[param] && typeof r.scheds[param][block] === 'number' && Number.isFinite(r.scheds[param][block]));
+                const first = carrying[0] || null;
+                const changes = allChanges.filter(c => c.param === param && c.scheduleTime === block).slice()
+                    .sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0)
+                    .map(c => { changeDates.add(c.date); const row = rowOn(c.date);
+                                const flags = (reanchoredOn(c.date, param, block) ? 'R' : '') + ((c.origin || 'logged') === 'overlay' ? 'O' : '') + (logMentions(row, block) ? 'M' : '');
+                                return [c.date, c.oldValue, c.newValue, flags]; });   // r2 tuple: [date, from, to, flags] — see meta.changeFormat
+                const graded = changes.filter(c => !c[3].includes('R'));
+                let reversals = 0; for (let i = 1; i < graded.length; i++) { const a = Math.sign(graded[i - 1][2] - graded[i - 1][1]), b = Math.sign(graded[i][2] - graded[i][1]); if (a !== 0 && b !== 0 && a !== b) reversals++; }
+                const valueAtMonthEnd = {}; monthEnds.forEach((r, ym) => { const v = r.scheds[param] ? r.scheds[param][block] : undefined; valueAtMonthEnd[ym] = (typeof v === 'number' && Number.isFinite(v)) ? v : null; });
+                return { param, block, currentValue,
+                         firstSeen: first ? { date: first.key, value: first.scheds[param][block] } : null,
+                         changes, touches: graded.length, reversals,
+                         netChangePct: (first && typeof currentValue === 'number' && first.scheds[param][block] !== 0) ? r1((currentValue - first.scheds[param][block]) / first.scheds[param][block] * 100) : null,
+                         valueAtMonthEnd };
+            };
+            const blocks = [], retiredBlocks = [];
+            SNAPSHOT_PARAMS.forEach(param => {
+                const current = live[param] || {};
+                Object.keys(current).sort(timeSort).forEach(block => { if (typeof current[block] === 'number' && Number.isFinite(current[block])) blocks.push(describe(param, block, current[block])); });
+                const seen = new Set(); rows.forEach(r => { if (r.scheds[param]) Object.keys(r.scheds[param]).forEach(k => { if (typeof r.scheds[param][k] === 'number') seen.add(k); }); });
+                [...seen].filter(k => !(k in current)).sort(timeSort).forEach(block => {
+                    const d = describe(param, block, null);
+                    let lastIdx = -1; rows.forEach((r, i) => { if (r.scheds[param] && typeof r.scheds[param][block] === 'number') lastIdx = i; });
+                    d.retiredOn = lastIdx >= 0 && rows[lastIdx + 1] ? rows[lastIdx + 1].key : null;
+                    retiredBlocks.push(d);
+                });
+            });
+            // monthlyByPeriod — computeMonthlyOutcomes' bucket rule, with the per-period fields beside it
+            const buckets = new Map();
+            past.forEach(r => {
+                const ym = r.key.slice(0, 7);
+                if (!buckets.has(ym)) buckets.set(ym, { sessions: 0, days: new Set(), tir: [], tbr: [], excluded: { tir7d: 0, lowPct: 0 }, periods: Object.fromEntries(Object.keys(LEDGER_PERIOD_KEYS).map(p => [p, { dev: [], low: [], excluded: { dev: 0, low: 0 } }])) });
+                const b = buckets.get(ym); b.sessions++; b.days.add(r.key);
+                [['tir7d', b.tir], ['lowPct', b.tbr]].forEach(([f, arr]) => { const v = parseFloat(r.row[f]); if (Number.isFinite(v)) arr.push(v); else b.excluded[f]++; });
+                Object.entries(LEDGER_PERIOD_KEYS).forEach(([p, k]) => { const pb = b.periods[p];
+                    const dv = num(r.row.periodDeviations ? r.row.periodDeviations[k.dev] : null); if (dv === null) pb.excluded.dev++; else pb.dev.push(dv);
+                    const lv = num(r.row[k.low]); if (lv === null) pb.excluded.low++; else pb.low.push(lv); });
+            });
+            const mean = (a) => a.length ? Math.round((a.reduce((s, v) => s + v, 0) / a.length) * 100) / 100 : null;
+            const monthlyByPeriod = [...buckets.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1).map(([ym, b]) => { const inMonth = monthDayCount(ym);
+                return { month: ym, sessions: b.sessions, partial: inMonth == null ? true : b.days.size * 2 <= inMonth, meanTIR7d: mean(b.tir), meanTBRunder70: mean(b.tbr), excludedRows: { ...b.excluded },
+                         periods: Object.fromEntries(Object.entries(b.periods).map(([p, pb]) => [p, { meanDev: mean(pb.dev), meanLowPct: mean(pb.low), n: pb.dev.length, excluded: { ...pb.excluded } }])) }; });
+            const firstKey = dated.length ? dated[0].key : null, lastKey = dated.length ? dated[dated.length - 1].key : null;
+            // one headline per date that carries at least one change (blocks + retired), null when the log has no qualifying line
+            const headlinesByDate = {}; [...changeDates].sort().forEach(d => { headlinesByDate[d] = headlineOf(rowOn(d)); });
+            return { blocks, retiredBlocks, headlinesByDate, monthlyByPeriod,
+                     meta: { windowDays: (firstKey && lastKey) ? Math.round((Date.parse(lastKey) - Date.parse(firstKey)) / 86400000) + 1 : 0, rows: dated.length, rowsWithSnapshot: rows.length, rowsSkipped, rowsNoDate,
+                             firstDate: firstKey, lastDate: lastKey, firstSnapshotDate: rows.length ? rows[0].key : null,
+                             changeRecordAvailable: !!(changeRecord && changeRecord.available === true), asOfBasis: 'dataFetchedAt (DEF-262 pattern)',
+                             changeFormat: 'changes[] = [date, from, to, flags]; flags: R = reanchor (REANCHOR token on this row or the one before, DEF-253), O = same-day overlay (live profile vs the last logged snapshot; logged is the default), M = that date\'s Decision_Log text contains the block\'s clock string; "" when none; the headline for a date is in headlinesByDate',
+                             basis: SCHEDULE_HISTORY_BASIS } };
+        };
+        // [SCHEDULE-HISTORY-END]
         const computeChangeEffectiveness = (history) => {
             const parseSched = (v) => {
                 if (!v) return null;
@@ -13044,7 +13158,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.2.1',
+                            version: '4.2.3',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -13142,6 +13256,8 @@
                         // v3.6.16: both surfaces. The markdown renders these in the trend
                         // section; an unavailable history DECLARES rather than emitting [].
                         monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
+                        // DEF-275 (v4.2.3): every block's dated changes beside the outcomes. Both emitters.
+                        scheduleHistory: hMeta.historyAvailable ? buildScheduleHistory(cachedHistory, ChangeRecord.get(), schedules, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('scheduleHistory'),
                         appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal, analysisResults?.nightscoutData?.fetchedAt ?? null) : UNAVAILABLE('appliedBasalDelta'),
                         currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date())
                     });
@@ -13565,7 +13681,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.2.1',
+                        version: '4.2.3',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -13727,6 +13843,8 @@
                     // v3.6.16 Part A: monthly aggregates, no trend claim. Part B: NET
                     // APPLIED basal change, the calibration input v5.55's gate lacks.
                     monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
+                    // DEF-275 (v4.2.3): every block's dated changes beside the outcomes. Both emitters.
+                    scheduleHistory: hMeta.historyAvailable ? buildScheduleHistory(cachedHistory, ChangeRecord.get(), schedules, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('scheduleHistory'),
                     appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal, analysisResults?.nightscoutData?.fetchedAt ?? null) : UNAVAILABLE('appliedBasalDelta'),
                     // v3.5.91: run-time IOB vs the pill — verification aid, no consumer
                     currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date()),
@@ -19084,7 +19202,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.2.1 — HOTFIX DEF-273: devicestatus fetched a day at a time (the 8-day query timed out at the edge) · v4.2.0 underneath · DEF-271 basal requirement: per-hour U/h from post-absorption readings, days counted, thin hours carried and labelled · v4.1.6 underneath · DEF-269 autoISF observed: the ratio the loop dosed at, declared beside the profile ISF · v4.1.5 underneath · DEF-266 effective ISF/CR read against the Carb-floor base, basis declared per field · v4.1.4 underneath · DEF-264 the fasted median names its SMBs · DEF-265 the dawn run counts itself · DEF-267 the plan declares what the calculator saw · v4.1.3 underneath · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.2.3 — DEF-275 scheduleHistory: every block's dated changes beside the outcomes · DEF-272 the delivery window stops at the next carb entry · v4.2.1 underneath · HOTFIX DEF-273: devicestatus fetched a day at a time · v4.2.0 underneath · DEF-271 basal requirement: per-hour U/h from post-absorption readings, days counted, thin hours carried and labelled · v4.1.6 underneath · DEF-269 autoISF observed: the ratio the loop dosed at, declared beside the profile ISF · v4.1.5 underneath · DEF-266 effective ISF/CR read against the Carb-floor base, basis declared per field · v4.1.4 underneath · DEF-264 the fasted median names its SMBs · DEF-265 the dawn run counts itself · DEF-267 the plan declares what the calculator saw · v4.1.3 underneath · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
                                     {/* [DS-FETCH-SCREEN-START] DEF-273 (v4.2.1): the devicestatus fetch, chunk by chunk, where the owner can see it. */}
                                     {analysisResults?.nightscoutData?.deviceStatusFetch && (
                                         <p className="text-gray-500 text-xs mt-1">
