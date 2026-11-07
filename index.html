@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.2.3</title>
+    <title>Daily Insulin Settings Review v4.2.5</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -2902,16 +2902,46 @@
             }
             return episode;
         };
+        // The nearest carb entry strictly after (dir > 0) or before (dir < 0) atMs, over the whole
+        // treatment list. Only a dated, numeric, positive entry counts: a null, 0 g or string carbs
+        // value never bounds a window.
+        const ledgerAdjacentCarbEntry = (treatments, atMs, dir) => {
+            let best = null;
+            (treatments || []).forEach(t => {
+                if (!t || !t.created_at || typeof t.carbs !== 'number' || !(t.carbs > 0)) return;
+                const at = new Date(t.created_at).getTime();
+                if (!Number.isFinite(at) || (dir > 0 ? !(at > atMs) : !(at < atMs))) return;
+                if (best === null || (dir > 0 ? at < best.ms : at > best.ms)) best = { ms: at, carbs: t.carbs };
+            });
+            return best;
+        };
+        const ledgerNextCarbEntry = (treatments, afterMs) => ledgerAdjacentCarbEntry(treatments, afterMs, 1);
+        // The one boundary between an entry (or an episode's last entry) at aMs and the next entry at bMs,
+        // read by meal-bolus pairing (DEF-277) and the plan horizon (DEF-278): b itself while a's +90 min
+        // window is still open at b's 2-min pre-window (b − a ≤ 92 min), otherwise b − 2 min, where b's
+        // own [−2, +90] window opens. A bolus delivered before an entry is logged belongs to the entry
+        // already open: across Sep 3 – Oct 2 every bolus in [b − 2, b) with an open earlier entry was
+        // that entry's (b had its own bolus seconds later), so a b − 2 min boundary handed it to b.
+        const LEDGER_PAIR_PRE_MS = 2 * 60000, LEDGER_PAIR_POST_MS = 90 * 60000;
+        const nextEntryBoundaryMs = (aMs, bMs) => (bMs - aMs <= LEDGER_PAIR_POST_MS + LEDGER_PAIR_PRE_MS) ? bMs : bMs - LEDGER_PAIR_PRE_MS;
         // DEF-225 (v4.0.2, completing DEF-218): the bolus that paid for a carb entry is the FIRST
-        // non-SMB bolus in [−2, +90] min of the entry — _decomposeSMBs's upfront rule, reused. A
-        // bolus pairs with one entry only; an entry with no bolus in its window pairs with none.
+        // non-SMB bolus in [−2, +90] min of the entry. A bolus pairs with one entry only; an entry
+        // with no bolus in its window pairs with none.
+        // DEF-277 (v4.2.4): the window is also bounded by the neighbouring entries — it opens no
+        // earlier than the boundary with the previous entry and ends (exclusive) at the boundary with
+        // the next, so adjacent windows are disjoint and one bolus pairs one entry across separate
+        // calls. Neighbours are read from `treatments`, not the list passed in, so every call site
+        // sees the same windows.
         const ledgerPairMealBoluses = (episode, treatments) => {
             const nonSmb = (treatments || []).filter(t => t && t.created_at && t.insulin > 0 && !(t.eventType && String(t.eventType).includes('SMB')))
                 .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
             const used = new Set();
             return (episode || []).map(entry => {
                 const cMs = new Date(entry.created_at).getTime();
-                const bolus = nonSmb.find(t => { if (used.has(t)) return false; const m = (new Date(t.created_at).getTime() - cMs) / 60000; return m >= -2 && m <= 90; }) || null;
+                const next = ledgerNextCarbEntry(treatments, cMs), prev = ledgerAdjacentCarbEntry(treatments, cMs, -1);
+                const fromMs = prev ? nextEntryBoundaryMs(prev.ms, cMs) : cMs - LEDGER_PAIR_PRE_MS;
+                const cutMs = next ? nextEntryBoundaryMs(cMs, next.ms) : null;
+                const bolus = nonSmb.find(t => { if (used.has(t)) return false; const at = new Date(t.created_at).getTime(); return at >= fromMs && at <= cMs + LEDGER_PAIR_POST_MS && (cutMs === null || at < cutMs); }) || null;
                 if (bolus) used.add(bolus);
                 return { entry, bolus };
             });
@@ -2954,10 +2984,14 @@
             // last + 180 min read as `unpaired` and sent the record indeterminate (Oct 16 lunch). The next
             // entry's own window opens at −2 min (the DEF-225 pairing rule), so cutting there makes adjacent
             // windows disjoint. Any later entry with carbs > 0 counts — the same filter ledgerMealEpisode uses.
+            // DEF-278 (v4.2.4): the cut is pairing's own boundary (nextEntryBoundaryMs) — at the next entry
+            // itself when it is ≤ 92 min after the last entry. At −2 min, an entry logged under 2 min later
+            // ended the horizon before this episode's own last entry and its bolus (Sep 11 11:20).
             const lastMs = new Date(episode[episode.length - 1].created_at).getTime();
             const nextEntry = (treatments || []).filter(t => t && t.created_at && typeof t.carbs === 'number' && t.carbs > 0)
                 .map(t => ({ ms: new Date(t.created_at).getTime(), carbs: t.carbs })).filter(x => Number.isFinite(x.ms) && x.ms > lastMs).sort((a, b) => a.ms - b.ms)[0] || null;
-            const cutMs = nextEntry ? nextEntry.ms - 2 * 60000 : null;
+            const cutMs = nextEntry ? nextEntryBoundaryMs(lastMs, nextEntry.ms) : null;
+            const cutAtEntry = !!nextEntry && cutMs === nextEntry.ms;
             const horizonEndMs = (cutMs !== null && cutMs < toMs) ? cutMs : toMs;
             const inHorizon = (treatments || []).filter(t => t && t.created_at && t.insulin > 0 && new Date(t.created_at).getTime() >= fromMs && new Date(t.created_at).getTime() <= horizonEndMs);
             const smbUnitsAfterCut = horizonEndMs < toMs ? parseFloat((treatments || []).filter(t => t && t.created_at && t.insulin > 0 && t.eventType && String(t.eventType).includes('SMB') && new Date(t.created_at).getTime() > horizonEndMs && new Date(t.created_at).getTime() <= toMs).reduce((a, t) => a + t.insulin, 0).toFixed(3)) : null;
@@ -2983,11 +3017,11 @@
                 budgetDeterminate: determinate, budgetRatioLower: lower, budgetRatioUpper: upper,
                 mealBolusUnits: r3(pairedUnits), smbUnitsInHorizon: r3(smbUnits), unpairedBolusUnits: r3(unpairedUnits), unpairedBolusCount: unpaired.length,
                 horizon: { fromISO: new Date(fromMs).toISOString(), toISO: new Date(horizonEndMs).toISOString(), nominalToISO: new Date(toMs).toISOString(),
-                           cutAt: horizonEndMs < toMs ? new Date(horizonEndMs).toISOString() : null, cutReason: horizonEndMs < toMs ? 'next_carb_entry' : null,
+                           cutAt: horizonEndMs < toMs ? new Date(horizonEndMs).toISOString() : null, cutReason: horizonEndMs < toMs ? (cutAtEntry ? 'next_carb_entry_open_window' : 'next_carb_entry') : null,
                            nextEntryTime: nextEntry ? new Date(nextEntry.ms).toISOString() : null, nextEntryGrams: nextEntry ? nextEntry.carbs : null,
                            smbUnitsAfterCut,
-                           rule: '[first entry −2 min, min(last entry +180 min, next carb entry −2 min)]' },
-                basis: 'episode plan — expected Σ grams_i / CR(t_i); delivered = every insulin record in the horizon; Lower = paired meal boluses, Upper = delivered; Lower ≤ Upper by construction; CR(t_i) is the profile in effect at t_i (DEF-251); the horizon ends at the earlier of the last entry +180 min and the next carb entry −2 min (DEF-272); insulin after the cut belongs to the later entry',
+                           rule: '[first entry −2 min, min(last entry +180 min, next carb entry −2 min)]; the next entry itself when it is ≤ 92 min after the last entry (DEF-278, the pairing boundary)' },
+                basis: 'episode plan — expected Σ grams_i / CR(t_i); delivered = every insulin record in the horizon; Lower = paired meal boluses, Upper = delivered; Lower ≤ Upper by construction; CR(t_i) is the profile in effect at t_i (DEF-251); the horizon ends at the earlier of the last entry +180 min and the next carb entry −2 min (DEF-272), or the next entry itself when it is ≤ 92 min after the last entry — the boundary meal-bolus pairing uses (DEF-278); insulin after the cut belongs to the later entry',
                 note: expected === null ? 'no CR for an entry in the episode — no plan'
                     : determinate ? 'determinate — every non-SMB bolus in the horizon is a paired meal bolus; bounds collapse onto deliveredShareOfPlan'
                     : `indeterminate — ${unpaired.length} unpaired non-SMB bolus(es) in the horizon; bounds only, no share`
@@ -3060,7 +3094,16 @@
                 if (records.has(key)) { census.dedupedDuplicates++; return; }
                 const ms = evDate.getTime();
                 // glucose shape over [−180, +240] min
-                const win = readingsBetween(ms - 180 * 60000, ms + 240 * 60000);
+                // DEF-276 (v4.2.4): the forward edge stops at the next carb entry − 2 min (DEF-272's
+                // rule). The whole-window peak, nadir, reading count, gaps and the DEF-222/230 fall
+                // bounds all read `win`; a later meal's spike inside +240 became the hyper's peak and
+                // its completion crash the window nadir. Never earlier than the event itself.
+                const nominalEndMs = ms + 240 * 60000;
+                const shapeNext = (() => { const n = ledgerNextCarbEntry(treatments, ms); return (n && n.ms - 2 * 60000 < nominalEndMs) ? n : null; })();
+                const shapeEndMs = shapeNext ? Math.max(ms, Math.min(nominalEndMs, shapeNext.ms - 2 * 60000)) : nominalEndMs;
+                const windowCut = shapeEndMs < nominalEndMs ? { atMin: Math.round((shapeEndMs - ms) / 60000), nextEntryTime: new Date(shapeNext.ms).toISOString(), nextEntryGrams: shapeNext.carbs,
+                                                                 rule: 'shape window ends at the next carb entry − 2 min (DEF-272 rule)' } : null;
+                const win = readingsBetween(ms - 180 * 60000, shapeEndMs);
                 const nadir = win.reduce((m, r) => (!m || r.sgv < m.sgv) ? r : m, null);
                 const peak = win.reduce((m, r) => (!m || r.sgv > m.sgv) ? r : m, null);
                 let gapsInWindow = 0; for (let i = 1; i < win.length; i++) if (new Date(win[i].dateString) - new Date(win[i - 1].dateString) > 15 * 60000) gapsInWindow++;
@@ -3071,7 +3114,7 @@
                 // they fire every five minutes in a hyper and would null the fall on every record —
                 // so their volume between peak and nadir is emitted beside the truncation instead.
                 const peakMs = peak ? new Date(peak.dateString).getTime() : null;
-                const windowEndMs = ms + 240 * 60000;
+                const windowEndMs = shapeEndMs;
                 const fallTrunc = peakMs === null ? null : treatments.filter(t => t && t.created_at && ((t.carbs > 0) || (t.insulin > 0 && !(t.eventType && String(t.eventType).includes('SMB')))))
                     .map(t => ({ t, at: new Date(t.created_at).getTime() })).filter(x => x.at > peakMs && x.at <= windowEndMs).sort((a, b) => a.at - b.at)[0] || null;
                 const fallEndMs = fallTrunc ? fallTrunc.at : windowEndMs;
@@ -3180,6 +3223,12 @@
                     nadirBG: fallNadirBG, nadirAtMin: anchorHypo ? (eventBGValue === null ? null : 0) : anchorCW ? (cwNadir ? minAt(new Date(cwNadir.dateString).getTime()) : null) : (postPeakNadir ? minAt(postPeakNadirMs) : null),
                     truncatedAtMin: anchorHypo ? null : anchorCW ? (cwTrunc ? minAt(cwTrunc.at) : null) : (fallTrunc ? minAt(fallTrunc.at) : null)
                 };
+                // DEF-279 (v4.2.4): the declared fall span is the anchored fall's — from fallAnchor's peak to where
+                // that fall's search stops (the event on a hypo; the truncation or the shape-window edge otherwise).
+                // Built from the DEF-222 window peak for every type, it described a different fall than fallAnchor
+                // on hypo and correction_window records. Its length is what says whether authorityShare is a read.
+                const fallSearchEndMin = anchorHypo ? fallAnchor.nadirAtMin : anchorCW ? (prePeakMs === null ? null : minAt(cwEndMs)) : (peak ? minAt(fallEndMs) : null);
+                const fallWindowMin = (fallAnchor.peakAtMin !== null && fallSearchEndMin !== null) ? [fallAnchor.peakAtMin, fallSearchEndMin] : null;
                 const autoISFAtEvent = autoISFAtTime(ledgerAutoIsf, deviceStatus, treatments, evDate);   // DEF-269
                 const correctionAuthority = { ...computeCorrectionAuthority(corrUnits, isfAt, fallPeakBG, fallNadirBG),
                     atDosedISF: correctionAuthorityAtDosedISF(corrections, autoISFAtEvent, fallPeakBG, fallNadirBG),   // DEF-269 r4
@@ -3187,7 +3236,8 @@
                     fallAnchor,
                     isfBasis: 'volume-weighted over candidateBlocks.isf (each correction at its own ISF)',
                     fallBasis: 'peak → post-peak nadir (glucose.postPeakNadirBG), truncated at the next non-SMB bolus or carb entry after the peak (glucose.fallTruncatedAt); null when no reading follows the peak',
-                    fallWindowMin: peak ? [Math.round((peakMs - ms) / 60000), Math.round((fallEndMs - ms) / 60000)] : null,
+                    fallWindowMin,
+                    fallWindowBasis: 'fallAnchor.peakAtMin → the end of that fall\'s search: the event (hypo); the truncation, else the shape-window edge (correction_window, hyper) (DEF-279)',
                     smbUnitsPeakToNadir,
                     note: 'true corrections in [−180, 0] min, excluding every paired meal bolus whose bolus falls in that window (insulin.excludedFromCorrections), against the peak→post-peak-nadir fall; declared only, no threshold' };
                 const record = {
@@ -3201,7 +3251,7 @@
                                fallTruncatedAt: fallTrunc ? { time: new Date(fallTrunc.at).toISOString(), atMin: Math.round((fallTrunc.at - ms) / 60000), kind: fallTrunc.t.carbs > 0 ? 'carb_entry' : 'bolus',
                                                              grams: fallTrunc.t.carbs > 0 ? fallTrunc.t.carbs : null, units: fallTrunc.t.insulin > 0 ? fallTrunc.t.insulin : null } : null,
                                bgAtMin180: readingNear(ms + 180 * 60000), bgAtMin240: readingNear(ms + 240 * 60000), readingsInWindow: win.length, gapsInWindow,
-                               windowMin: [-180, 240] },
+                               windowMin: [-180, windowCut ? windowCut.atMin : 240], windowCut },
                     insulin: { iobAtEvent: iob.value ?? null, iobSource: iob.value == null ? null : 'openaps.iob (before-record)', iobRecordAgeMin: iob.ageMinutes ?? null,
                                // DEF-252: the split, at the event, from the same before-record.
                                bolusIobAtEvent: (() => { const rec = findDeviceStatusAt(deviceStatus, evDate, { direction: 'before' }); return rec ? extractBolusIOB(rec) : null; })(),
@@ -3212,7 +3262,7 @@
                                mealBoluses: pairs.map(p => ({ carbEntryTime: new Date(p.entry.created_at).toISOString(), grams: p.entry.carbs,
                                                               time: p.bolus ? new Date(p.bolus.created_at).toISOString() : null, units: p.bolus ? p.bolus.insulin : null,
                                                               excludedFromCorrections: p.bolus ? inWindow(p.bolus) : false })),
-                               mealBolusRule: 'first non-SMB bolus in [−2, +90] min of each carb entry (_decomposeSMBs upfront rule); excluded from corrections by exact identity when inside [−180, 0]',
+                               mealBolusRule: 'first non-SMB bolus in [−2, +90] min of each carb entry, ending at the next carb entry when that entry is ≤ 92 min later — which then opens at its own time, not −2 min (DEF-277); excluded from corrections by exact identity when inside [−180, 0]',
                                smbUnitsInWindow: parseFloat(smbs.reduce((a, t) => a + t.insulin, 0).toFixed(3)), correctionUnitsInWindow: parseFloat(corrUnits.toFixed(3)), correctionCount: corrections.length,
                                corrections: corrections.map(t => ({ time: new Date(t.created_at).toISOString(), units: t.insulin })),
                                excludedFromCorrections,
@@ -3613,6 +3663,7 @@
                                 'safetyFacts.autoISFExposure and autoISFAtEvent (ledger and lowEvents) — DEF-269',
                                 'signals.basalRequirement (window, day keys, logSlots date) — DEF-271',
                                 'scheduleHistory (month buckets, exclude-today) — DEF-275'],
+                notClockDependent: ['presetCatalog — a stored profile document; no clock is read (v4.2.5)'],
                 readsTheRenderClock: [
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
                     { field: 'meta.pageAgeHours', why: 'the gap between the fetch and the Copy (DEF-242); it exists to be non-zero' },
@@ -3784,7 +3835,7 @@
         // `Override: 85` ran). The withdrawn design would have declared an override on nine of nine
         // nights when none ran. Declared only: which preset it was, and whether it should have run,
         // is the reviewer's.
-        const OVERRIDE_OBSERVED_BASIS = 'treatments eventType "Exercise" (notes = preset, duration = minutes) joined to the Override On/Off, Override: N, SMBs off, Target N and ISF/Basal/CR was/now tokens in deviceStatus openaps.suggested.reason; target_bg and sensitivityRatio are NOT override signals (DEF-249, corrected Sep 22); effective ISF/CR read against the Carb-floor base — was/now when it differs from the base, base ÷ percent when it equals it (DEF-266)';
+        const OVERRIDE_OBSERVED_BASIS = 'treatments eventType "Exercise" (notes = preset, duration = minutes) joined to the Override On/Off, Override: N, SMBs off, Target N and ISF/Basal/CR was/now tokens in deviceStatus openaps.suggested.reason; target_bg and sensitivityRatio are NOT override signals (DEF-249, corrected Sep 22); effective ISF/CR read against the Carb-floor base — was/now when it differs from the base, base ÷ percent when it equals it (DEF-266); an episode splits at an Exercise record more than 10 min inside it that an Override On status within 10 min after it corroborates (endBasis next_preset_start — one preset handed straight to another with no Off between); statusAtStart is the parsed state of the first status row in [start, start + 10 min]; a percent change with no record to split on is declared in percentChanges, not split (DEF-280)';
         // [OVERRIDE-EFFECTIVE-START] v4.1.5 (DEF-266, PM ruling Oct 2). The `ISF was/now` and
         // `CR was/now` tokens carried the override-SCALED values through 2026-09-28 23:02 Z and the
         // UNSCALED profile values from 2026-09-29 18:02 Z (the first episode after the owner's Sep 28
@@ -3874,6 +3925,29 @@
                 const m = exercises.find(e => !e.used && Math.abs(e.t - ep.startMs) <= 10 * 60000);
                 if (m) { m.used = true; ep.preset = m.preset; ep.durationMin = m.durationMin; ep.sources = ['devicestatus.reason', 'treatments']; }
             });
+            // DEF-280 (v4.2.5): one preset handing straight to another (a successor chain, or a hand start
+            // over a running preset) writes no Override Off, so the walk above merged both runs under the
+            // first name and the second record surfaced as an overlapping treatments-only episode (Nov 6:
+            // Pod Day 1's 75 % rows read as Night Correct). A record strictly inside an episode, with an On
+            // status in the 10 min after it, starts the next part there.
+            const SPLIT_WINDOW_MS = 10 * 60000;
+            const activeRowsIn = (fromMs, toMs) => rows.filter(r => r.parsed.active === true && r.t >= fromMs && (toMs === null || r.t < toMs));
+            const targetsOf = (rs) => [...new Set(rs.map(r => r.parsed.target).filter(v => v != null))];
+            exercises.filter(e => !e.used).forEach(e => {
+                const ep = episodes.find(x => e.t > x.startMs + SPLIT_WINDOW_MS && (x.endMs === null || e.t < x.endMs));
+                if (!ep || !rows.some(r => r.parsed.active === true && r.t >= e.t && r.t <= e.t + SPLIT_WINDOW_MS)) return;
+                const after = activeRowsIn(e.t, ep.endMs), first = after[0] || null;
+                episodes.push({ startMs: e.t, endMs: ep.endMs, endBasis: ep.endBasis, preset: e.preset, durationMin: e.durationMin,
+                                percent: first ? first.parsed.percent : null, smbsOff: first ? first.parsed.smbsOff : null, targets: targetsOf(after),
+                                effective: !first ? effectiveFromTokens(null, null, null, null)
+                                    : (first.parsed.base === null && typeof profileBaseAt === 'function')
+                                        ? effectiveFromTokens(first.parsed.wasNow, first.parsed.percent, profileBaseAt(first.t), 'schedulesAt')
+                                        : first.parsed.effective,
+                                sources: ['devicestatus.reason', 'treatments'] });
+                ep.endMs = e.t; ep.endBasis = 'next_preset_start'; ep.targets = targetsOf(activeRowsIn(ep.startMs, e.t));
+                e.used = true;
+                episodes.sort((a, b) => a.startMs - b.startMs);
+            });
             // An Exercise record the reason strings never confirmed still opens an episode: the
             // activation happened, and the tool says so from the one source that recorded it.
             exercises.filter(e => !e.used).forEach(e => episodes.push({
@@ -3882,11 +3956,20 @@
                 preset: e.preset, durationMin: e.durationMin, percent: null, smbsOff: null, targets: [],
                 effective: effectiveFromTokens(null, null, null, null), sources: ['treatments'] }));
             episodes.sort((a, b) => a.startMs - b.startMs);
-            const out = episodes.map(ep => ({ start: iso(ep.startMs), end: iso(ep.endMs), endBasis: ep.endBasis,
+            episodes.forEach(ep => {
+                const r0 = rows.find(r => r.t >= ep.startMs && r.t <= ep.startMs + SPLIT_WINDOW_MS) || null;
+                ep.statusAtStart = !r0 || r0.parsed.active === null ? null : (r0.parsed.active ? 'on' : 'off');
+                const steps = ep.sources.includes('devicestatus.reason') ? activeRowsIn(ep.startMs, ep.endMs).filter(r => r.parsed.percent != null) : [];
+                ep.percentChanges = [];
+                for (let i = 1; i < steps.length; i++) if (steps[i].parsed.percent !== steps[i - 1].parsed.percent)
+                    ep.percentChanges.push({ at: iso(steps[i].t), from: steps[i - 1].parsed.percent, to: steps[i].parsed.percent });
+            });
+            const out = episodes.map(ep => ({ start: iso(ep.startMs), end: iso(ep.endMs), endBasis: ep.endBasis, statusAtStart: ep.statusAtStart,
                 preset: ep.preset, durationMin: ep.durationMin, percent: ep.percent, smbsOff: ep.smbsOff,
                 target: ep.targets.length ? ep.targets[0] : null,
                 ...(ep.targets.length > 1 ? { targets: ep.targets } : {}),
-                effective: ep.effective, sources: ep.sources }));
+                effective: ep.effective, sources: ep.sources,
+                ...(ep.percentChanges.length ? { percentChanges: ep.percentChanges } : {}) }));
             const last = rows.length ? rows[rows.length - 1] : null;
             const openEp = episodes.find(ep => ep.endMs === null && ep.endBasis === 'open_at_fetch') || null;
             const current = last && last.parsed.active === true
@@ -3906,10 +3989,80 @@
             for (const r of rows) { if (r.t <= t) pick = r; else break; }
             if (!pick || pick.parsed.active === null) return { active: null, percent: null, preset: null };
             if (pick.parsed.active !== true) return { active: false, percent: null, preset: null };
-            const ep = (observed._episodes || []).find(e => e.startMs <= t && (e.endMs === null || t <= e.endMs)) || null;
+            // a part that ended at the next preset's start does not contain that instant (DEF-280)
+            const ep = (observed._episodes || []).find(e => e.startMs <= t && (e.endMs === null || t < e.endMs || (t === e.endMs && e.endBasis !== 'next_preset_start'))) || null;
             return { active: true, percent: pick.parsed.percent ?? (ep ? ep.percent : null), preset: ep ? ep.preset : null };
         };
         // [OVERRIDE-OBSERVED-END]
+        // [PRESET-CATALOG-START] v4.2.5. The phone's override presets as it uploaded them (Spec H:
+        // `iapsOverridePresets` on every Nightscout profile document), normalised, with declared flags.
+        // Table 5 needs exact names, stored durations and successor / end toggles without hand
+        // maintenance; nothing else carries them. Measurement-only: a flag is a declared rule with its
+        // source, never a verdict on whether a preset is safe.
+        const PRESET_CATALOG_BASIS = 'presets as the phone uploaded them; target ≤ 6 = none; duration 0 or indefinite = null; flags are declared rules with their source, not verdicts';
+        const PRESET_BOOLEAN_KEYS = ['indefininite', 'endWIthNewCarbs', 'glucoseOverrideThresholdActive', 'glucoseOverrideThresholdActiveDown', 'advancedSettings', 'overrideMaxIOB', 'smbIsOff', 'smbAlwaysOff', 'overrideAutoISF'];
+        const buildPresetCatalog = (profiles, overrideObserved) => {
+            const docMs = (d) => { const v = Date.parse(d?.startDate ?? d?.created_at ?? ''); return Number.isFinite(v) ? v : null; };
+            const docs = (Array.isArray(profiles) ? profiles : []).filter(d => d && typeof d === 'object').map(d => ({ d, ms: docMs(d) })).filter(x => x.ms !== null).sort((a, b) => b.ms - a.ms);
+            const carrying = docs.filter(x => x.d.iapsOverridePresets && typeof x.d.iapsOverridePresets === 'object');
+            if (!carrying.length) return { available: false, reason: 'no profile document carries iapsOverridePresets (Spec H not installed or not yet uploaded)' };
+            // The newest document that carries the field decides: a newer schema is not read from an older document.
+            const src = carrying[0], cat = src.d.iapsOverridePresets;
+            if (cat.schema !== 1) return { available: false, reason: 'unknown schema ' + cat.schema };
+            const entries = Array.isArray(cat.presets) ? cat.presets.filter(e => e && e.preset && typeof e.preset === 'object') : [];
+            const absent = {}; PRESET_BOOLEAN_KEYS.forEach(k => { absent[k] = []; });
+            let succeedingAbsent = 0;
+            const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+            const episodes = Array.isArray(overrideObserved?.episodes) ? overrideObserved.episodes : [];
+            const presets = entries.map(e => {
+                const p = e.preset, name = typeof p.name === 'string' ? p.name : null;
+                PRESET_BOOLEAN_KEYS.forEach(k => { if (!(k in p)) absent[k].push(name); });
+                if (!('succeeding' in p) || p.succeeding === null) succeedingAbsent++;
+                const indefinite = p.indefininite === true;
+                const hi = p.glucoseOverrideThresholdActive === true, lo = p.glucoseOverrideThresholdActiveDown === true;
+                const succ = (typeof p.succeeding === 'string' && p.succeeding) ? { id: p.succeeding, name: e.succeedingName ?? null } : null;
+                const out = { name, id: p.id ?? null, savedAt: p.date ?? null, percent: num(p.percentage),
+                    targetMgdl: num(p.target) !== null && p.target > 6 ? p.target : null,
+                    indefinite, durationMin: (!indefinite && num(p.duration) !== null && p.duration > 0) ? p.duration : null,
+                    successor: succ, endWithNewCarbs: p.endWIthNewCarbs === true,
+                    glucoseThresholdHigh: { on: hi, value: hi ? num(p.glucoseOverrideThreshold) : null },
+                    glucoseThresholdLow: { on: lo, value: lo ? num(p.glucoseOverrideThresholdDown) : null },
+                    advancedSettings: p.advancedSettings === true,
+                    maxIOB: { override: p.overrideMaxIOB === true, value: num(p.maxIOB) },
+                    smb: { off: p.smbIsOff === true, alwaysOffWindow: p.smbAlwaysOff === true ? [num(p.start), num(p.end)] : null, smbMinutes: num(p.smbMinutes), uamMinutes: num(p.uamMinutes) },
+                    switches: { isfAndCr: p.isndAndCr ?? null, isf: p.isf ?? null, cr: p.cr ?? null, basal: p.basal ?? null },
+                    ownAutoISF: p.overrideAutoISF === true };
+                if (out.ownAutoISF) out.autoISF = p.autoISF ?? null;
+                return out;
+            });
+            const names = presets.map(x => x.name);
+            presets.forEach(x => {
+                const f = [];
+                if (x.successor && (x.endWithNewCarbs || x.glucoseThresholdHigh.on || x.glucoseThresholdLow.on))
+                    f.push('successor_will_not_start: ' + [x.endWithNewCarbs ? 'endWithNewCarbs' : null, x.glucoseThresholdHigh.on ? 'glucoseThresholdHigh' : null, x.glucoseThresholdLow.on ? 'glucoseThresholdLow' : null].filter(Boolean).join(', ') + ' (upgrade review item 4)');
+                if (x.successor && x.successor.name === null) f.push('successor_missing: id ' + x.successor.id + ' is not in the list (Spec H §3.5)');
+                if (!x.advancedSettings) { const still = [x.maxIOB.override ? 'maxIOB.override' : null, x.smb.alwaysOffWindow ? 'smb.alwaysOffWindow' : null, x.switches.isfAndCr === false ? 'switches.isfAndCr=false' : null].filter(Boolean);
+                    if (still.length) f.push('advanced_off_values_still_applied: ' + still.join(', ') + ' (upgrade review item 3)'); }
+                if (x.name === null || !x.name.trim() || x.name.includes(':')) f.push('name_not_schedulable: ' + (x.name === null || !x.name.trim() ? 'blank' : 'contains ":"') + ' (scheduler R1)');
+                if (x.name !== null) { const chars = ['&', '<', '>'].filter(c => x.name.includes(c)); const entity = /&(#\d+|#x[0-9a-f]+|[a-z]+);/i.test(x.name);
+                    if (chars.length) f.push('name_html_chars: ' + chars.join(' ') + (entity ? ' (an HTML entity)' : '') + ' (Nightscout 15.x purifier, Spec H §3.6)'); }
+                const dup = names.filter(n => n === x.name).length; if (dup > 1) f.push('duplicate_name: ' + dup + ' presets (the scheduler matches by name)');
+                x.flags = f;
+                const ep = episodes.filter(e => e && e.preset === x.name && e.start).sort((a, b) => Date.parse(b.start) - Date.parse(a.start))[0] || null;
+                x.lastObserved = ep ? { start: ep.start, percent: ep.percent ?? null } : null;
+                x.observedPercentDiffers = (ep && ep.percent != null && x.percent !== null) ? ep.percent !== x.percent : null;
+            });
+            presets.sort((a, b) => String(a.name) < String(b.name) ? -1 : String(a.name) > String(b.name) ? 1 : 0);
+            const readAsFalse = PRESET_BOOLEAN_KEYS.filter(k => absent[k].length).map(k => ({ field: k, presets: absent[k] }));
+            return { available: true, presets,
+                     meta: { available: true, source: 'nightscout profile.iapsOverridePresets (Spec H)', schema: cat.schema, generatedAt: cat.generatedAt ?? null,
+                             profileDocStartDate: src.d.startDate ?? src.d.created_at ?? null, isNewestProfileDoc: docs[0] === src,
+                             newerDocsWithoutCatalog: docs.filter(x => x.ms > src.ms && !x.d.iapsOverridePresets).length, count: presets.length,
+                             absentFields: { readAsFalse,
+                                             absentByDesign: succeedingAbsent ? [{ field: 'succeeding', presets: succeedingAbsent, why: 'no successor — the backup serializer omits nil, and an absent key reads the same as null (not an anomaly)' }] : [] },
+                             basis: PRESET_CATALOG_BASIS } };
+        };
+        // [PRESET-CATALOG-END]
         // [CHUNKED-FETCH-START] v4.2.1 HOTFIX (DEF-273). A Nightscout collection fetched in half-open
         // date chunks, SEQUENTIALLY (the server is the bottleneck), each with its own AbortController
         // timeout and one retry on anything thrown or non-2xx (a Cloudflare 524 reaches the browser as
@@ -13158,7 +13311,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.2.3',
+                            version: '4.2.5',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -13258,6 +13411,8 @@
                         monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
                         // DEF-275 (v4.2.3): every block's dated changes beside the outcomes. Both emitters.
                         scheduleHistory: hMeta.historyAvailable ? buildScheduleHistory(cachedHistory, ChangeRecord.get(), schedules, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('scheduleHistory'),
+                        // v4.2.5: the phone's presets (Spec H) beside the history. Both emitters. lastObserved reads the episodes only, so no profile base is needed here.
+                        presetCatalog: Array.isArray(analysisResults?.nightscoutData?.profiles) ? buildPresetCatalog(analysisResults.nightscoutData.profiles, buildOverrideObserved(analysisResults.nightscoutData)) : UNAVAILABLE('presetCatalog'),
                         appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal, analysisResults?.nightscoutData?.fetchedAt ?? null) : UNAVAILABLE('appliedBasalDelta'),
                         currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date())
                     });
@@ -13681,7 +13836,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.2.3',
+                        version: '4.2.5',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -13845,6 +14000,8 @@
                     monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
                     // DEF-275 (v4.2.3): every block's dated changes beside the outcomes. Both emitters.
                     scheduleHistory: hMeta.historyAvailable ? buildScheduleHistory(cachedHistory, ChangeRecord.get(), schedules, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('scheduleHistory'),
+                    // v4.2.5: the phone's presets (Spec H) beside the history. Both emitters. lastObserved reads the episodes only, so no profile base is needed here.
+                    presetCatalog: Array.isArray(analysisResults?.nightscoutData?.profiles) ? buildPresetCatalog(analysisResults.nightscoutData.profiles, buildOverrideObserved(analysisResults.nightscoutData)) : UNAVAILABLE('presetCatalog'),
                     appliedBasalDelta: hMeta.historyAvailable ? computeAppliedBasalDelta(cachedHistory, schedules?.basal, analysisResults?.nightscoutData?.fetchedAt ?? null) : UNAVAILABLE('appliedBasalDelta'),
                     // v3.5.91: run-time IOB vs the pill — verification aid, no consumer
                     currentIOB: currentIOBDiagnostic(analysisResults?.nightscoutData?.deviceStatus, ledgerParseTime(analysisResults?.nightscoutData?.fetchedAt) || new Date()),
@@ -19202,7 +19359,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.2.3 — DEF-275 scheduleHistory: every block's dated changes beside the outcomes · DEF-272 the delivery window stops at the next carb entry · v4.2.1 underneath · HOTFIX DEF-273: devicestatus fetched a day at a time · v4.2.0 underneath · DEF-271 basal requirement: per-hour U/h from post-absorption readings, days counted, thin hours carried and labelled · v4.1.6 underneath · DEF-269 autoISF observed: the ratio the loop dosed at, declared beside the profile ISF · v4.1.5 underneath · DEF-266 effective ISF/CR read against the Carb-floor base, basis declared per field · v4.1.4 underneath · DEF-264 the fasted median names its SMBs · DEF-265 the dawn run counts itself · DEF-267 the plan declares what the calculator saw · v4.1.3 underneath · DEF-253 a re-anchor is not a graded change · DEF-254 Rule 1's join declared per block · DEF-260 every candidate episode listed · DEF-255 trace events name themselves · DEF-256 Copy takes the raw · DEF-257/252/259 profile, IOB split and device ages declared · v4.1.1 underneath</p>
+                                    <p className="text-gray-400 text-sm">v4.2.5 — presetCatalog: the phone's override presets from Nightscout · DEF-280 back-to-back presets split into their own episodes</p>
                                     {/* [DS-FETCH-SCREEN-START] DEF-273 (v4.2.1): the devicestatus fetch, chunk by chunk, where the owner can see it. */}
                                     {analysisResults?.nightscoutData?.deviceStatusFetch && (
                                         <p className="text-gray-500 text-xs mt-1">
