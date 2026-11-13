@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.2.8</title>
+    <title>Daily Insulin Settings Review v4.2.9</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3342,7 +3342,7 @@
         };
         // [EVENT-LEDGER-END]
         // [SAFETY-FACTS-START] v4.0.0 (§5). No window model: the ingredients, unjoined.
-        const buildSafetyFacts = ({ eventLedger, nightscoutData, schedules, agp7day, periods, analysisWindowDays, profileHistory = [] }) => {
+        const buildSafetyFacts = ({ eventLedger, nightscoutData, schedules, agp7day, periods, analysisWindowDays, profileHistory = [], historyRows = null, refutedUnavailable = null }) => {
             // DEF-247 (v4.1.1): the fetch is this builder's clock too.
             const safetyAsOf = nightscoutData?.fetchedAt ?? null;
             // DEF-251: this builder resolves the same way the ledger does, and tallies the same way.
@@ -3523,7 +3523,10 @@
             };
             // DEF-283: the middleware window, from the latest SLEEP[] win (else v2.3's 21:00–03:00), for the in-window low join
             const sfSleepWin = sleepWindowOf((nightscoutData?.deviceStatus || []).slice().sort((a, b) => new Date(a?.created_at || 0) - new Date(b?.created_at || 0)).map(d => parseSleepModeReason(d?.openaps?.suggested?.reason).settingsToken));
-            const lows = lowEvents.map(e => { const rec = findDeviceStatusAt(nightscoutData?.deviceStatus || [], new Date(e.time), { direction: 'before' }); const shape = lowShape(e);
+            // DEF-286: REFUTED lines matched to these events; an unreadable history is UNAVAILABLE and touches no event
+            const refutedBuilt = refutedUnavailable ? null : buildRefuted({ lowEvents, glucoseInput: nightscoutData?.glucose || [], agp7day, hourlyLowMass,
+                windowStartMs: safetyWindow.startMs, windowEndMs: safetyWindow.endMs, historyRows, asOf: safetyAsOf });
+            const lows = lowEvents.map((e, ei) => { const rec = findDeviceStatusAt(nightscoutData?.deviceStatus || [], new Date(e.time), { direction: 'before' }); const shape = lowShape(e);
                 return { time: new Date(e.time).toISOString(), bg: e.bg, hour: new Date(e.time).getHours(), netIob: rec ? extractIOB(rec) : null, basalIob: rec ? extractBasalIOB(rec) : null, treatmentCarbsImputed: null,
                          rapidRecovery: shape.rapidRecovery, isolated: shape.isolated, gapsNearEvent: shape.gapsNearEvent, readingsNearEvent: shape.readingsNearEvent, shapeFlagged: shape.shapeFlagged, readingsInEvent: e.readings.length,
                          overrideAtEvent: overrideAtTime(safetyOverride, new Date(e.time)),
@@ -3531,7 +3534,8 @@
                          podAgeHours: deviceAgeHoursAt(sfTreatments, 'pod', new Date(e.time).getTime()),
                          sensorAgeHours: deviceAgeHoursAt(sfTreatments, 'sensor', new Date(e.time).getTime()),
                          candidateBlocks: lowCandidateBlocks(new Date(e.time)),
-                         ...(() => { if (!(e.bg < SLEEP_STATE_LOW_BG) || shape.shapeFlagged) return {}; const st = sleepStateAtLow(nightscoutData?.deviceStatus || [], new Date(e.time).getTime(), sfSleepWin); return st ? { sleepStateAtLow: st } : {}; })() }; });
+                         ...(() => { if (!(e.bg < SLEEP_STATE_LOW_BG) || shape.shapeFlagged) return {}; const st = sleepStateAtLow(nightscoutData?.deviceStatus || [], new Date(e.time).getTime(), sfSleepWin); return st ? { sleepStateAtLow: st } : {}; })(),
+                         ...(refutedBuilt && refutedBuilt.perEvent.has(ei) ? { refuted: refutedBuilt.perEvent.get(ei) } : {}) }; });
             // hourlyLowMass's second figure: lowPct with the shape-flagged events' own readings removed
             // from the low count, over the same hourly denominator (calculateAGP's count); emitted on
             // every hour, equal or not (DEF-183 — silence must not read as agreement).
@@ -3555,7 +3559,7 @@
                 const rows = [];
                 lows.forEach((lw, i) => {
                     const cb = lw.candidateBlocks || {};
-                    const base = { time: lw.time, bg: lw.bg, hour: lw.hour, readingsInEvent: lw.readingsInEvent, shapeFlagged: lw.shapeFlagged };
+                    const base = { time: lw.time, bg: lw.bg, hour: lw.hour, readingsInEvent: lw.readingsInEvent, shapeFlagged: lw.shapeFlagged, ...(lw.refuted ? { refuted: lw.refuted.class } : {}) };
                     if (sp.parameter === 'basal') {
                         if ((cb.basal?.blocks || []).some(b => b.time === sp.time)) rows.push(base);
                     } else if (sp.parameter === 'cr') {
@@ -3602,6 +3606,7 @@
                      rule1JoinBasis: 'one row per parameterSpans entry; a low appears under a block when the join v7.2 §1 names puts it there. No exclusions are applied — voids, superseded regimes and fingerstick contradictions are the reviewer\'s, per event. Nothing reads this field (DEF-254).',
                      lowEventsWindow: { start: safetyWindow.start, end: safetyWindow.end, days: safetyWindow.days, basis: 'analysisWindow (DEF-258) — ' + safetyWindow.basis },
                      lowEventsCoverLowMass: { lowEventReadings, hourlyLowMassReadings, equal: lowEventReadings === hourlyLowMassReadings },
+                     refuted: refutedUnavailable || refutedBuilt.out,
                      profileLookups: safetyProfileTally,
                      note: 'ingredients only — no forward-risk window is precomputed for any parameter; the reviewer applies the lag they will defend' };
         };
@@ -3618,7 +3623,8 @@
             if (!structured || typeof structured !== 'object') return structured;
             const { eventLedger, eventCensus, profileLookups } = buildEventLedger({ findings: ctx.findings, findingsBasis: ctx.findingsBasis, suppressed: ctx.suppressed, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, profileHistory: ctx.profileHistory || [] });
             const safetyFacts = buildSafetyFacts({ eventLedger, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, agp7day: ctx.agp7day,
-                                                   periods: ctx.periods, analysisWindowDays: ctx.analysisWindowDays, profileHistory: ctx.profileHistory || [] });
+                                                   periods: ctx.periods, analysisWindowDays: ctx.analysisWindowDays, profileHistory: ctx.profileHistory || [],
+                                                   historyRows: ctx.historyRows ?? null, refutedUnavailable: ctx.refutedUnavailable ?? null });
             // DEF-249 (v4.1.1): the override record itself, beside the two builders that read it
             // per event. The walk's working arrays (_rows, _episodes) are internal and never ship.
             const { _rows, _episodes, ...overrideObserved } = buildOverrideObserved(ctx.nightscoutData,
@@ -3684,7 +3690,8 @@
                                 'safetyFacts.autoISFExposure and autoISFAtEvent (ledger and lowEvents) — DEF-269',
                                 'signals.basalRequirement (window, day keys, logSlots date) — DEF-271',
                                 'scheduleHistory (month buckets, exclude-today) — DEF-275',
-                                'protocolRegister (history rows dated after the fetch ignored) — DEF-285'],
+                                'protocolRegister (history rows dated after the fetch ignored) — DEF-285',
+                                'safetyFacts.refuted (history rows dated after the fetch ignored) — DEF-286'],
                 notClockDependent: ['presetCatalog — a stored profile document; no clock is read (v4.2.5)', 'sleepModeObserved — the records\' own timestamps only; asOf marks a night still open at fetch (DEF-282)'],
                 readsTheRenderClock: [
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
@@ -3732,7 +3739,7 @@
                 .filter(r => r.text.length > 0 && !isNaN(new Date(r.date).getTime()) && new Date(r.date).getTime() >= cutoff)
                 .sort((a, b) => new Date(b.date) - new Date(a.date));
             return { windowDays: DECISION_LOG_WINDOW_DAYS, asOf: new Date(asOf).toISOString(), count: rows.length, source: 'history Decision_Log column (the sheet), rows within windowDays of the fetch, newest first',
-                     entries: rows.map(r => ({ date: new Date(r.date).toISOString(), headline: r.text.split('\n').find(l => l.trim())?.trim() ?? '', text: r.text })) };
+                     entries: rows.map(r => ({ date: new Date(r.date).toISOString(), headline: r.text.split('\n').find(l => l.trim())?.trim() ?? '', text: stripRegisterLines(r.text) })) };
         };
         const formatDecisionLogMarkdown = (log) => {
             if (!log || !Array.isArray(log.entries) || log.entries.length === 0) return '## Decision Log History\n\n_No Decision_Log rows within the last ' + (log?.windowDays ?? DECISION_LOG_WINDOW_DAYS) + ' days._\n\n';
@@ -3741,6 +3748,141 @@
             return out + '\n';
         };
         // [DECISION-LOG-END]
+        // [DECISION-LOG-LINES-START] v4.2.9. What the tagged decision-log grammars (REGISTER:, REFUTED:) share: one line-start
+        // rule, one real-calendar check, one history accessor and one asOf pin — so the two readers cannot drift apart.
+        const taggedLineBody = (line, tag) => {
+            const m = String(line).match(new RegExp('^\\s*(?:[-*]\\s+)?(`?)\\s*' + tag + ':\\s*(.*)$', 'i'));
+            if (!m) return null;
+            return m[1] === '`' ? m[2].replace(/`\s*$/, '') : m[2];
+        };
+        const isRealLocalDate = (y, mo, d) => { const dt = new Date(y, mo - 1, d); return dt.getFullYear() === y && dt.getMonth() === mo - 1 && dt.getDate() === d; };
+        const decisionLogTextOf = (r) => String(r.decisionLog || r.Decision_Log || r.notes || '');
+        // History rows with a readable date, oldest log first (same-date rows by write time, then sheet order); rows dated after
+        // asOf (dataFetchedAt) are dropped and counted (DEF-262 pattern).
+        const decisionLogRowsAsOf = (historyRows, asOf) => {
+            const asOfMs = asOf == null ? NaN : new Date(asOf).getTime();
+            let ignoredAfterAsOf = 0;
+            const rows = (Array.isArray(historyRows) ? historyRows : []).map((r, i) => {
+                const when = r && (r.date || r.timestamp); const ms = when ? new Date(when).getTime() : NaN;
+                return Number.isFinite(ms) ? { r, i, ms, key: gapLocalDateKey(when), tms: new Date(r.timestamp || when).getTime() } : null; })
+                .filter(Boolean).filter(x => { if (Number.isFinite(asOfMs) && x.ms > asOfMs) { ignoredAfterAsOf++; return false; } return true; })
+                .sort((a, b) => a.ms - b.ms || (a.tms || 0) - (b.tms || 0) || a.i - b.i);
+            return { rows, ignoredAfterAsOf };
+        };
+        // DEF-288: the decision-log history prints a REGISTER: block once per Copy for 14 days although protocolRegister is
+        // its reading surface. Every line parseRegisterLine recognises (malformed included) leaves the text; one marker takes
+        // the first one's place. A text with none comes back unchanged.
+        const stripRegisterLines = (text) => {
+            const lines = String(text).split(/\r?\n/), isReg = lines.map(l => parseRegisterLine(l) !== null), n = isReg.filter(Boolean).length;
+            if (!n) return text;
+            const out = []; let marked = false;
+            lines.forEach((l, i) => { if (!isReg[i]) out.push(l); else if (!marked) { out.push('[' + n + ' REGISTER lines — read protocolRegister]'); marked = true; } });
+            return out.join('\n');
+        };
+        // [DECISION-LOG-LINES-END]
+        // [REFUTED-START] v4.2.9 (DEF-286). A fingerstick against a CGM low, stated in the log, because the owner does not log
+        // fingersticks in Nightscout and every session had been netting refuted lows out of TBR by hand. A line is applied only
+        // to the low event it names, and only when that event holds a reading within ±5 of the stated CGM value. Measurement-
+        // only: the net figures sit beside the printed ones and nothing reads them.
+        // Grammar (Instructions v7.13): REFUTED: <YYYY-MM-DD HH:MM> | cgm=<n> | fs=<n> [| note=<text>]
+        const REFUTED_BASIS = 'a REFUTED line declares a fingerstick against a CGM low; net figures sit beside the printed ones and nothing reads them — which figure a rule uses is the instructions\' call';
+        const REFUTED_FIELDS = ['cgm', 'fs', 'note'];
+        const parseRefutedLine = (line) => {
+            const rest = taggedLineBody(line, 'REFUTED'); if (rest === null) return null;
+            const parts = rest.split(' | '), statedTime = parts[0].trim();
+            const dm = statedTime.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/);
+            if (!dm || !isRealLocalDate(Number(dm[1]), Number(dm[2]), Number(dm[3])) || Number(dm[4]) > 23 || Number(dm[5]) > 59) return { error: 'bad datetime "' + statedTime.slice(0, 40) + '"' };
+            const fields = {}, extra = {};
+            for (const raw of parts.slice(1)) {
+                const p = raw.trim(), eq = p.indexOf('=');
+                if (eq <= 0) return { error: 'field without key=value: "' + p.slice(0, 60) + '" (a value may not contain " | ")' };
+                const key = p.slice(0, eq).trim(), value = p.slice(eq + 1).trim(), bucket = REFUTED_FIELDS.includes(key) ? fields : extra;
+                if (key in bucket) return { error: 'duplicate key ' + key };
+                bucket[key] = value;
+            }
+            for (const k of ['cgm', 'fs']) {
+                if (!(k in fields) || fields[k] === '') return { error: 'missing required ' + k };
+                if (!/^\d+$/.test(fields[k]) || Number(fields[k]) < 20 || Number(fields[k]) > 600) return { error: k + ' is not an integer in [20, 600] "' + fields[k] + '"' };
+            }
+            return { statedTime, statedMs: new Date(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), Number(dm[4]), Number(dm[5])).getTime(),
+                     cgm: Number(fields.cgm), fs: Number(fields.fs), note: fields.note ?? null, extra: Object.keys(extra).length ? extra : null };
+        };
+        // agp7day's own population, by reading object: calculateAGP's midnight-anchored window (input order), its first-in-
+        // minute de-dup, then its value filter. Its size is checked against agp7day.readingCount on every run.
+        const agpPopulationOf = (glucoseInput, days, asOf) => {
+            const asOfMs = asOf == null ? NaN : new Date(asOf).getTime(), now = Number.isFinite(asOfMs) ? new Date(asOfMs) : new Date();
+            const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59), start = new Date(end);
+            start.setDate(start.getDate() - days + 1); start.setHours(0, 0, 0, 0);
+            const seen = new Set(), kept = new Set();
+            (glucoseInput || []).forEach(r => { if (!r || !r.dateString) return; const d = new Date(r.dateString); if (!(d >= start && d <= end)) return;
+                const k = r.dateString.substring(0, 16); if (seen.has(k)) return; seen.add(k); if (r.sgv && r.sgv > 20 && r.sgv < 500) kept.add(r); });
+            return kept;
+        };
+        // lowEvents: safetyFacts' internal events ({ time (nadir), bg, readings }); returns per-event matches and safetyFacts.refuted.
+        const buildRefuted = ({ lowEvents, glucoseInput, agp7day, hourlyLowMass, windowStartMs, windowEndMs, historyRows, asOf }) => {
+            const { rows, ignoredAfterAsOf } = decisionLogRowsAsOf(historyRows, asOf);
+            const malformed = [], parsed = []; let linesParsed = 0;
+            rows.forEach(x => decisionLogTextOf(x.r).split(/\r?\n/).forEach(line => {
+                const p = parseRefutedLine(line); if (p === null) return; linesParsed++;
+                if (p.error) { malformed.push({ loggedOn: x.key, line: line.trim().slice(0, 200), reason: p.error }); return; }
+                parsed.push({ ...p, loggedOn: x.key });
+            }));
+            const MIN = 60000, ev = lowEvents.map(e => { const ms = e.readings.map(r => new Date(r.dateString).getTime()); return { e, startMs: Math.min(...ms), endMs: Math.max(...ms), nadirMs: new Date(e.time).getTime() }; });
+            const nearestTo = (e, cgm) => Math.min(...e.readings.map(r => Math.abs(r.sgv - cgm)));
+            const outcomes = parsed.map(l => {
+                if (!(l.statedMs >= windowStartMs && l.statedMs <= windowEndMs)) return { l, idx: null, reason: 'outside lowEventsWindow', outOfWindow: true };
+                let cands = ev.map((x, i) => i).filter(i => l.statedMs >= ev[i].startMs - 10 * MIN && l.statedMs <= ev[i].endMs + 10 * MIN), ambiguous = false;
+                if (cands.length > 1) { ambiguous = true; cands.sort((a, b) => nearestTo(ev[a].e, l.cgm) - nearestTo(ev[b].e, l.cgm) || ev[a].nadirMs - ev[b].nadirMs); }
+                if (!cands.length) cands = ev.map((x, i) => i).filter(i => Math.abs(ev[i].nadirMs - l.statedMs) <= 20 * MIN)
+                    .sort((a, b) => Math.abs(ev[a].nadirMs - l.statedMs) - Math.abs(ev[b].nadirMs - l.statedMs) || ev[a].nadirMs - ev[b].nadirMs);
+                if (!cands.length) return { l, idx: null, reason: 'no low event within 20 min' };
+                const i = cands[0];
+                if (!(nearestTo(ev[i].e, l.cgm) <= 5)) return { l, idx: null, reason: 'no reading near cgm=' + l.cgm + ' in the event at ' + new Date(ev[i].e.time).toISOString() };
+                return { l, idx: i, ambiguous, reason: null };
+            });
+            const winner = new Map(); outcomes.forEach((o, k) => { if (o.idx !== null) winner.set(o.idx, k); });
+            const pop = agpPopulationOf(glucoseInput, agp7day?.days ?? 7, asOf);
+            const perEvent = new Map(); let removed = 0, removedVeryLow = 0, moved = 0; const removedByHour = {};
+            winner.forEach((k, i) => {
+                const o = outcomes[k], e = ev[i].e, fs = o.l.fs;
+                const cls = fs >= 70 ? 'refuted' : (fs >= 54 && e.readings.some(r => r.sgv < 54)) ? 'downgraded' : 'confirmed';
+                const moves = cls === 'refuted' ? e.readings.filter(r => r.sgv < 70) : cls === 'downgraded' ? e.readings.filter(r => r.sgv < 54) : [];
+                const inside = moves.filter(r => pop.has(r)), outside = moves.length - inside.length;
+                if (cls === 'refuted') { removed += inside.length; removedVeryLow += inside.filter(r => r.sgv < 54).length;
+                    inside.forEach(r => { const h = new Date(r.dateString).getHours(); removedByHour[h] = (removedByHour[h] || 0) + 1; }); }
+                if (cls === 'downgraded') moved += inside.length;
+                perEvent.set(i, { class: cls, fs, cgm: o.l.cgm, statedTime: o.l.statedTime, loggedOn: o.l.loggedOn, note: o.l.note, ambiguous: o.ambiguous === true,
+                                  readingsAffected: inside.length, readingsOutsideDenominator: outside });
+            });
+            const lines = outcomes.map((o, k) => {
+                const won = o.idx !== null && winner.get(o.idx) === k, lost = o.idx !== null && !won;
+                return { statedTime: o.l.statedTime, cgm: o.l.cgm, fs: o.l.fs, loggedOn: o.l.loggedOn, matchedEventTime: o.idx !== null ? new Date(ev[o.idx].e.time).toISOString() : null,
+                         class: won ? perEvent.get(o.idx).class : null,
+                         reason: lost ? 'superseded by the ' + outcomes[winner.get(o.idx)].l.loggedOn + ' line' : o.reason };
+            });
+            let net = null, netUnavailableReason = null;
+            if (agp7day && Number.isFinite(agp7day.readingCount) && agp7day.readingCount > 0) {
+                const N = agp7day.readingCount, pct = (c) => c / N * 100;
+                const lowC = Math.round((Number(agp7day.tir?.low) || 0) * N / 100), vlC = Math.round((Number(agp7day.tir?.veryLow) || 0) * N / 100);
+                const u70 = lowC + vlC - removed, vl = vlC - removedVeryLow - moved;
+                net = { denominator: N, printed: { lowPct: agp7day.tir?.low ?? null, veryLowPct: agp7day.tir?.veryLow ?? null, under70Pct: (Number(agp7day.tir?.low) || 0) + (Number(agp7day.tir?.veryLow) || 0) },
+                        net: { lowPct: removed || moved ? pct(u70 - vl) : agp7day.tir?.low ?? null, veryLowPct: removed || moved ? pct(vl) : agp7day.tir?.veryLow ?? null,
+                               under70Pct: removed ? pct(u70) : (Number(agp7day.tir?.low) || 0) + (Number(agp7day.tir?.veryLow) || 0) },
+                        readingsRemovedFromUnder70: removed, readingsMovedTo54to69: moved,
+                        byHour: Object.keys(removedByHour).map(Number).sort((a, b) => a - b).map(h => { const row = (hourlyLowMass || []).find(x => x.hour === h);
+                            return row && row.readings > 0 && row.lowPct !== null ? { hour: h, lowPctPrinted: row.lowPct, lowPctNet: row.lowPct - removedByHour[h] / row.readings * 100 } : null; }).filter(Boolean) };
+            } else netUnavailableReason = 'agp7day unavailable (fewer than 100 readings)';
+            const out = { lines, net,
+                          meta: { source: 'REFUTED: lines in the Decision_Log history (DEF-286)', linesParsed, linesMatched: winner.size,
+                                  unmatched: outcomes.filter(o => o.idx === null && !o.outOfWindow).length, outOfWindow: outcomes.filter(o => o.outOfWindow).length,
+                                  malformed, superseded: outcomes.filter((o, k) => o.idx !== null && winner.get(o.idx) !== k).length,
+                                  rowsIgnoredAfterAsOf: ignoredAfterAsOf, asOfBasis: 'dataFetchedAt',
+                                  populationCheck: { readings: pop.size, agpReadingCount: agp7day?.readingCount ?? null, equal: agp7day ? pop.size === agp7day.readingCount : null },
+                                  ...(netUnavailableReason ? { netUnavailableReason } : {}),
+                                  basis: REFUTED_BASIS, ...(linesParsed === 0 ? { note: 'no REFUTED lines in the history yet' } : {}) } };
+            return { perEvent, out };
+        };
+        // [REFUTED-END]
         // DEF-237 (v4.0.5): a cached session says so in the FIRST line of every surface — the
         // dashboard header, this paste header, the auto-log row's Notes — not in meta.
         const historyAgeLabel = (ageHours) => Number.isFinite(ageHours) ? ageHours.toFixed(1) : '?';
@@ -6138,9 +6280,7 @@
         const REGISTER_FIELDS = ['kind', 'when', 'what', 'window', 'undo', 'falsifier', 'status', 'since'], REGISTER_REQUIRED = ['kind', 'what', 'status', 'since'];
         // One line → { id, fields, extra } or { error }; null when the line is not a REGISTER: line at all.
         const parseRegisterLine = (line) => {
-            const m = String(line).match(/^\s*(?:[-*]\s+)?(`?)\s*REGISTER:\s*(.*)$/i);
-            if (!m) return null;
-            let rest = m[2]; if (m[1] === '`') rest = rest.replace(/`\s*$/, '');
+            const rest = taggedLineBody(line, 'REGISTER'); if (rest === null) return null;
             const parts = rest.split(' | ');
             const id = parts[0].trim();
             if (!/^[A-Za-z0-9_-]{2,32}$/.test(id)) return { error: 'bad ID' + (id ? ' "' + id.slice(0, 40) + '"' : ' (empty)') };
@@ -6157,21 +6297,26 @@
             if (missing.length) return { error: 'missing required ' + missing.join(', ') };
             if (!REGISTER_KINDS.includes(fields.kind)) return { error: 'bad kind "' + fields.kind + '"' };
             if (!REGISTER_STATUSES.includes(fields.status)) return { error: 'bad status "' + fields.status + '"' };
-            const d = fields.since.match(/^(\d{4})-(\d{2})-(\d{2})$/), dt = d ? new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3])) : null;
-            if (!d || dt.getFullYear() !== Number(d[1]) || dt.getMonth() !== Number(d[2]) - 1 || dt.getDate() !== Number(d[3])) return { error: 'since is not a date "' + fields.since + '"' };
+            const d = fields.since.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (!d || !isRealLocalDate(Number(d[1]), Number(d[2]), Number(d[3]))) return { error: 'since is not a date "' + fields.since + '"' };
             return { id, fields, extra };
         };
-        const buildProtocolRegister = (historyRows, { asOf = null } = {}) => {
+        // DEF-287 (v4.2.9): a row ratified once and never restated drops out of the 365-day history on day 366, silently. It is
+        // flagged REGISTER_REFRESH_MARGIN_DAYS before that so the review restates it.
+        const REGISTER_REFRESH_MARGIN_DAYS = 35;
+        const buildProtocolRegister = (historyRows, { asOf = null, windowDays = null } = {}) => {
             const asOfMs = asOf == null ? NaN : new Date(asOf).getTime();
-            let ignoredAfterAsOf = 0;
-            const rows = (Array.isArray(historyRows) ? historyRows : []).map((r, i) => {
-                const when = r && (r.date || r.timestamp); const ms = when ? new Date(when).getTime() : NaN;
-                return Number.isFinite(ms) ? { r, i, ms, key: gapLocalDateKey(when), tms: new Date(r.timestamp || when).getTime() } : null; })
-                .filter(Boolean).filter(x => { if (Number.isFinite(asOfMs) && x.ms > asOfMs) { ignoredAfterAsOf++; return false; } return true; })
-                .sort((a, b) => a.ms - b.ms || (a.tms || 0) - (b.tms || 0) || a.i - b.i);
+            const { rows, ignoredAfterAsOf } = decisionLogRowsAsOf(historyRows, asOf);
+            const asOfKey = Number.isFinite(asOfMs) ? getLocalDateString(new Date(asOfMs)) : null;
+            const ageOf = (key) => (asOfKey && key) ? Math.round((new Date(asOfKey + 'T00:00:00') - new Date(key + 'T00:00:00')) / 86400000) : null;
+            // A window no longer than the margin cannot say a row is near the edge: on DEF-137's 14-day substitution every visible
+            // row would read due. Any read shorter than the full year hides rows last logged before its start.
+            const winN = Number.isFinite(windowDays) ? windowDays : null, refreshComputable = winN !== null && winN > REGISTER_REFRESH_MARGIN_DAYS;
+            const windowShort = winN === null || winN < FULL_HISTORY_WINDOW_DAYS;
+            const visibleFrom = (asOfKey && winN !== null) ? (() => { const d = new Date(asOfKey + 'T00:00:00'); d.setDate(d.getDate() - winN); return getLocalDateString(d); })() : null;
             const versions = new Map(), malformed = []; let linesParsed = 0, linesApplied = 0;
             rows.forEach(x => {
-                String(x.r.decisionLog || x.r.Decision_Log || x.r.notes || '').split(/\r?\n/).forEach(line => {
+                decisionLogTextOf(x.r).split(/\r?\n/).forEach(line => {
                     const p = parseRegisterLine(line); if (p === null) return;
                     linesParsed++;
                     if (p.error) { malformed.push({ loggedOn: x.key, line: line.trim().slice(0, 200), reason: p.error }); return; }
@@ -6183,7 +6328,8 @@
                 return { id, kind: f.kind, when: f.when ?? null, what: f.what, window: f.window ?? null, undo: f.undo ?? null, falsifier: f.falsifier ?? null, status: f.status, since: f.since,
                          loggedOn: w.loggedOn, firstLoggedOn: vs[0].loggedOn, versions: vs.length,
                          previous: prev ? { loggedOn: prev.loggedOn, what: prev.fields.what, window: prev.fields.window ?? null, status: prev.fields.status } : null,
-                         extra: Object.keys(w.extra).length ? w.extra : null }; };
+                         extra: Object.keys(w.extra).length ? w.extra : null, ageDays: ageOf(w.loggedOn),
+                         ...(f.status === 'retired' ? {} : { refreshDue: (ageOf(w.loggedOn) !== null && refreshComputable) ? ageOf(w.loggedOn) >= winN - REGISTER_REFRESH_MARGIN_DAYS : null }) }; };
             const all = [...versions.entries()].map(([id, vs]) => emit(id, vs));
             const byKindId = (a, b) => a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
             const applied = [...versions.values()].flat().map(v => v.loggedOn).filter(Boolean).sort();
@@ -6191,6 +6337,12 @@
                      meta: { source: 'REGISTER: lines in the Decision_Log history (DEF-285)', linesParsed, linesApplied, malformed,
                              firstLoggedOn: applied.length ? applied[0] : null, latestLoggedOn: applied.length ? applied[applied.length - 1] : null,
                              historyRows: rows.length, rowsIgnoredAfterAsOf: ignoredAfterAsOf, asOfBasis: 'dataFetchedAt', basis: PROTOCOL_REGISTER_BASIS,
+                             windowDays: winN, refreshMarginDays: REGISTER_REFRESH_MARGIN_DAYS,
+                             refreshDue: all.filter(x => x.status !== 'retired' && x.refreshDue === true).sort(byKindId).map(x => x.id),
+                             ...(winN !== null && !refreshComputable ? { refreshUnavailableReason: 'history window ' + winN + ' days ≤ ' + REGISTER_REFRESH_MARGIN_DAYS + '-day margin' } : {}),
+                             windowShort, ...(windowShort ? { windowShortReason: winN === null
+                                 ? 'history window not stated (of ' + FULL_HISTORY_WINDOW_DAYS + ' days) — rows last logged outside the read window are not visible'
+                                 : 'history window ' + winN + ' of ' + FULL_HISTORY_WINDOW_DAYS + ' days — rows last logged before ' + (visibleFrom || 'the window start') + ' are not visible' } : {}),
                              ...(linesParsed === 0 ? { note: 'no REGISTER lines in the history yet' } : {}) } };
         };
         // [PROTOCOL-REGISTER-END]
@@ -13576,13 +13728,15 @@
                     analysisWindowDays: config.basalSignalWindow || 7,
                     rawCaptureTaken: runContext?.rawCaptureTaken === true,
                     rawCaptureSource: runContext?.rawCaptureSource ?? null,
-                    rawCaptureError: runContext?.rawCaptureError ?? null
+                    rawCaptureError: runContext?.rawCaptureError ?? null,
+                    historyRows: hMeta.historyAvailable ? cachedHistory : null,   // DEF-286
+                    refutedUnavailable: hMeta.historyAvailable ? null : UNAVAILABLE('safetyFacts.refuted')
                 });
                 const atExportBoundary = (exp) => CONFIG.measurementOnly === true ? toMeasurementOnlyExport(exp, measurementCtx()) : exp;
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.2.8',
+                            version: '4.2.9',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -13683,7 +13837,7 @@
                         // DEF-275 (v4.2.3): every block's dated changes beside the outcomes. Both emitters.
                         scheduleHistory: hMeta.historyAvailable ? buildScheduleHistory(cachedHistory, ChangeRecord.get(), schedules, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('scheduleHistory'),
                         // DEF-285 (v4.2.8): the protocol register from REGISTER: lines in the log. Both emitters. A history that could not be read is UNAVAILABLE; one that was read and carries no lines is an empty register.
-                        protocolRegister: hMeta.historyAvailable ? buildProtocolRegister(cachedHistory, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('protocolRegister'),
+                        protocolRegister: hMeta.historyAvailable ? buildProtocolRegister(cachedHistory, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null, windowDays: hMeta.historyWindowDays ?? null }) : UNAVAILABLE('protocolRegister'),
                         // v4.2.5: the phone's presets (Spec H) beside the history. Both emitters. lastObserved reads the episodes only, so no profile base is needed here.
                         presetCatalog: Array.isArray(analysisResults?.nightscoutData?.profiles) ? buildPresetCatalog(analysisResults.nightscoutData.profiles, buildOverrideObserved(analysisResults.nightscoutData)) : UNAVAILABLE('presetCatalog'),
                         // DEF-282 (v4.2.6): the middleware's sleep mode, night by night. Both emitters.
@@ -14111,7 +14265,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.2.8',
+                        version: '4.2.9',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -14277,7 +14431,7 @@
                     // DEF-275 (v4.2.3): every block's dated changes beside the outcomes. Both emitters.
                     scheduleHistory: hMeta.historyAvailable ? buildScheduleHistory(cachedHistory, ChangeRecord.get(), schedules, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('scheduleHistory'),
                     // DEF-285 (v4.2.8): the protocol register from REGISTER: lines in the log. Both emitters. A history that could not be read is UNAVAILABLE; one that was read and carries no lines is an empty register.
-                    protocolRegister: hMeta.historyAvailable ? buildProtocolRegister(cachedHistory, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('protocolRegister'),
+                    protocolRegister: hMeta.historyAvailable ? buildProtocolRegister(cachedHistory, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null, windowDays: hMeta.historyWindowDays ?? null }) : UNAVAILABLE('protocolRegister'),
                     // v4.2.5: the phone's presets (Spec H) beside the history. Both emitters. lastObserved reads the episodes only, so no profile base is needed here.
                     presetCatalog: Array.isArray(analysisResults?.nightscoutData?.profiles) ? buildPresetCatalog(analysisResults.nightscoutData.profiles, buildOverrideObserved(analysisResults.nightscoutData)) : UNAVAILABLE('presetCatalog'),
                     // DEF-282 (v4.2.6): the middleware's sleep mode, night by night. Both emitters.
@@ -15796,7 +15950,7 @@
                     output += '_Prior session notes and override context — use to interpret anomalous rows above._\n\n';
                     for (const e of entriesWithLogs) {
                         const date = e.date ? new Date(e.date).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '?';
-                        const log = String(e.decisionLog).trim();
+                        const log = stripRegisterLines(String(e.decisionLog).trim());
                         output += `- **${date}:** ${log}\n`;
                     }
                     output += '\n';
@@ -19641,7 +19795,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.2.8 — protocolRegister: the ratified protocol rows from REGISTER: lines in the log (DEF-285)</p>
+                                    <p className="text-gray-400 text-sm">v4.2.9 — REFUTED: fingersticks against CGM lows, net TBR beside printed (DEF-286) · register refresh flag (DEF-287) · REGISTER lines out of the decision-log history (DEF-288)</p>
                                     {/* [DS-FETCH-SCREEN-START] DEF-273 (v4.2.1): the devicestatus fetch, chunk by chunk, where the owner can see it. */}
                                     {analysisResults?.nightscoutData?.deviceStatusFetch && (
                                         <p className="text-gray-500 text-xs mt-1">
