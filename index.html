@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.2.7</title>
+    <title>Daily Insulin Settings Review v4.2.8</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3683,7 +3683,8 @@
                                 'appliedBasalDelta (priorTotal, newTotal, deltaUPerDay, deltaPercent) — DEF-262',
                                 'safetyFacts.autoISFExposure and autoISFAtEvent (ledger and lowEvents) — DEF-269',
                                 'signals.basalRequirement (window, day keys, logSlots date) — DEF-271',
-                                'scheduleHistory (month buckets, exclude-today) — DEF-275'],
+                                'scheduleHistory (month buckets, exclude-today) — DEF-275',
+                                'protocolRegister (history rows dated after the fetch ignored) — DEF-285'],
                 notClockDependent: ['presetCatalog — a stored profile document; no clock is read (v4.2.5)', 'sleepModeObserved — the records\' own timestamps only; asOf marks a night still open at fetch (DEF-282)'],
                 readsTheRenderClock: [
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
@@ -6126,6 +6127,73 @@
             });
             return out;
         };
+        // [PROTOCOL-REGISTER-START] v4.2.8 (DEF-285). Owner-ratified protocol rows (preset rows, dosing protocols,
+        // armed revert triggers) had no home the next session reads: the matrix in the instructions goes stale the
+        // night a row is ratified, and the revert map lived in decision-log prose. The review writes each ratified row
+        // as a REGISTER: line in the Decision_Log, which reaches the sheet nightly; this assembles the current register
+        // (the VOIDS: / REANCHOR: pattern). Measurement-only: it reports what the log ratified, never whether it is right.
+        // Grammar (Instructions v7.12): REGISTER: <ID> | kind=… | when=… | what=… | window=… | undo=… | falsifier=… | status=… | since=YYYY-MM-DD
+        const PROTOCOL_REGISTER_BASIS = 'the latest REGISTER: line per ID wins; retired IDs listed separately; malformed lines declared, never applied; the register reports what the log ratified, not whether it is right';
+        const REGISTER_KINDS = ['preset', 'dosing', 'revert'], REGISTER_STATUSES = ['ratified', 'provisional', 'retired'];
+        const REGISTER_FIELDS = ['kind', 'when', 'what', 'window', 'undo', 'falsifier', 'status', 'since'], REGISTER_REQUIRED = ['kind', 'what', 'status', 'since'];
+        // One line → { id, fields, extra } or { error }; null when the line is not a REGISTER: line at all.
+        const parseRegisterLine = (line) => {
+            const m = String(line).match(/^\s*(?:[-*]\s+)?(`?)\s*REGISTER:\s*(.*)$/i);
+            if (!m) return null;
+            let rest = m[2]; if (m[1] === '`') rest = rest.replace(/`\s*$/, '');
+            const parts = rest.split(' | ');
+            const id = parts[0].trim();
+            if (!/^[A-Za-z0-9_-]{2,32}$/.test(id)) return { error: 'bad ID' + (id ? ' "' + id.slice(0, 40) + '"' : ' (empty)') };
+            const fields = {}, extra = {};
+            for (const raw of parts.slice(1)) {
+                const p = raw.trim(), eq = p.indexOf('=');
+                if (eq <= 0) return { error: 'field without key=value: "' + p.slice(0, 60) + '" (a value may not contain " | ")' };
+                const key = p.slice(0, eq).trim(), value = p.slice(eq + 1).trim();
+                const bucket = REGISTER_FIELDS.includes(key) ? fields : extra;
+                if (key in bucket) return { error: 'duplicate key ' + key };
+                bucket[key] = value;
+            }
+            const missing = REGISTER_REQUIRED.filter(k => !fields[k]);
+            if (missing.length) return { error: 'missing required ' + missing.join(', ') };
+            if (!REGISTER_KINDS.includes(fields.kind)) return { error: 'bad kind "' + fields.kind + '"' };
+            if (!REGISTER_STATUSES.includes(fields.status)) return { error: 'bad status "' + fields.status + '"' };
+            const d = fields.since.match(/^(\d{4})-(\d{2})-(\d{2})$/), dt = d ? new Date(Number(d[1]), Number(d[2]) - 1, Number(d[3])) : null;
+            if (!d || dt.getFullYear() !== Number(d[1]) || dt.getMonth() !== Number(d[2]) - 1 || dt.getDate() !== Number(d[3])) return { error: 'since is not a date "' + fields.since + '"' };
+            return { id, fields, extra };
+        };
+        const buildProtocolRegister = (historyRows, { asOf = null } = {}) => {
+            const asOfMs = asOf == null ? NaN : new Date(asOf).getTime();
+            let ignoredAfterAsOf = 0;
+            const rows = (Array.isArray(historyRows) ? historyRows : []).map((r, i) => {
+                const when = r && (r.date || r.timestamp); const ms = when ? new Date(when).getTime() : NaN;
+                return Number.isFinite(ms) ? { r, i, ms, key: gapLocalDateKey(when), tms: new Date(r.timestamp || when).getTime() } : null; })
+                .filter(Boolean).filter(x => { if (Number.isFinite(asOfMs) && x.ms > asOfMs) { ignoredAfterAsOf++; return false; } return true; })
+                .sort((a, b) => a.ms - b.ms || (a.tms || 0) - (b.tms || 0) || a.i - b.i);
+            const versions = new Map(), malformed = []; let linesParsed = 0, linesApplied = 0;
+            rows.forEach(x => {
+                String(x.r.decisionLog || x.r.Decision_Log || x.r.notes || '').split(/\r?\n/).forEach(line => {
+                    const p = parseRegisterLine(line); if (p === null) return;
+                    linesParsed++;
+                    if (p.error) { malformed.push({ loggedOn: x.key, line: line.trim().slice(0, 200), reason: p.error }); return; }
+                    linesApplied++;
+                    (versions.get(p.id) || versions.set(p.id, []).get(p.id)).push({ loggedOn: x.key, ...p });
+                });
+            });
+            const emit = (id, vs) => { const w = vs[vs.length - 1], prev = vs.length > 1 ? vs[vs.length - 2] : null, f = w.fields;
+                return { id, kind: f.kind, when: f.when ?? null, what: f.what, window: f.window ?? null, undo: f.undo ?? null, falsifier: f.falsifier ?? null, status: f.status, since: f.since,
+                         loggedOn: w.loggedOn, firstLoggedOn: vs[0].loggedOn, versions: vs.length,
+                         previous: prev ? { loggedOn: prev.loggedOn, what: prev.fields.what, window: prev.fields.window ?? null, status: prev.fields.status } : null,
+                         extra: Object.keys(w.extra).length ? w.extra : null }; };
+            const all = [...versions.entries()].map(([id, vs]) => emit(id, vs));
+            const byKindId = (a, b) => a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+            const applied = [...versions.values()].flat().map(v => v.loggedOn).filter(Boolean).sort();
+            return { rows: all.filter(x => x.status !== 'retired').sort(byKindId), retired: all.filter(x => x.status === 'retired').sort(byKindId),
+                     meta: { source: 'REGISTER: lines in the Decision_Log history (DEF-285)', linesParsed, linesApplied, malformed,
+                             firstLoggedOn: applied.length ? applied[0] : null, latestLoggedOn: applied.length ? applied[applied.length - 1] : null,
+                             historyRows: rows.length, rowsIgnoredAfterAsOf: ignoredAfterAsOf, asOfBasis: 'dataFetchedAt', basis: PROTOCOL_REGISTER_BASIS,
+                             ...(linesParsed === 0 ? { note: 'no REGISTER lines in the history yet' } : {}) } };
+        };
+        // [PROTOCOL-REGISTER-END]
         // [SCHEDULE-HISTORY-START] v4.2.3 (DEF-275). Every block's dated changes over the history,
         // beside the outcomes — the Nov 5 session's evidence (the evening basal ramp built over ten
         // months) had to be dug out of decision-log prose. Measurement-only: dated values, counts,
@@ -13514,7 +13582,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.2.7',
+                            version: '4.2.8',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -13614,6 +13682,8 @@
                         monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
                         // DEF-275 (v4.2.3): every block's dated changes beside the outcomes. Both emitters.
                         scheduleHistory: hMeta.historyAvailable ? buildScheduleHistory(cachedHistory, ChangeRecord.get(), schedules, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('scheduleHistory'),
+                        // DEF-285 (v4.2.8): the protocol register from REGISTER: lines in the log. Both emitters. A history that could not be read is UNAVAILABLE; one that was read and carries no lines is an empty register.
+                        protocolRegister: hMeta.historyAvailable ? buildProtocolRegister(cachedHistory, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('protocolRegister'),
                         // v4.2.5: the phone's presets (Spec H) beside the history. Both emitters. lastObserved reads the episodes only, so no profile base is needed here.
                         presetCatalog: Array.isArray(analysisResults?.nightscoutData?.profiles) ? buildPresetCatalog(analysisResults.nightscoutData.profiles, buildOverrideObserved(analysisResults.nightscoutData)) : UNAVAILABLE('presetCatalog'),
                         // DEF-282 (v4.2.6): the middleware's sleep mode, night by night. Both emitters.
@@ -14041,7 +14111,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.2.7',
+                        version: '4.2.8',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -14206,6 +14276,8 @@
                     monthlyOutcomes: hMeta.historyAvailable ? computeMonthlyOutcomes(cachedHistory) : UNAVAILABLE('monthlyOutcomes'),
                     // DEF-275 (v4.2.3): every block's dated changes beside the outcomes. Both emitters.
                     scheduleHistory: hMeta.historyAvailable ? buildScheduleHistory(cachedHistory, ChangeRecord.get(), schedules, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('scheduleHistory'),
+                    // DEF-285 (v4.2.8): the protocol register from REGISTER: lines in the log. Both emitters. A history that could not be read is UNAVAILABLE; one that was read and carries no lines is an empty register.
+                    protocolRegister: hMeta.historyAvailable ? buildProtocolRegister(cachedHistory, { asOf: analysisResults?.nightscoutData?.fetchedAt ?? null }) : UNAVAILABLE('protocolRegister'),
                     // v4.2.5: the phone's presets (Spec H) beside the history. Both emitters. lastObserved reads the episodes only, so no profile base is needed here.
                     presetCatalog: Array.isArray(analysisResults?.nightscoutData?.profiles) ? buildPresetCatalog(analysisResults.nightscoutData.profiles, buildOverrideObserved(analysisResults.nightscoutData)) : UNAVAILABLE('presetCatalog'),
                     // DEF-282 (v4.2.6): the middleware's sleep mode, night by night. Both emitters.
@@ -19569,7 +19641,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.2.7 — middleware v2.4 per-loop sleep state + delivered temp in hypo loops (DEF-283) · HIGH_VARIABILITY counts only usable periods (DEF-284)</p>
+                                    <p className="text-gray-400 text-sm">v4.2.8 — protocolRegister: the ratified protocol rows from REGISTER: lines in the log (DEF-285)</p>
                                     {/* [DS-FETCH-SCREEN-START] DEF-273 (v4.2.1): the devicestatus fetch, chunk by chunk, where the owner can see it. */}
                                     {analysisResults?.nightscoutData?.deviceStatusFetch && (
                                         <p className="text-gray-500 text-xs mt-1">
