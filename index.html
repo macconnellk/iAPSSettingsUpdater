@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.2.9</title>
+    <title>Daily Insulin Settings Review v4.2.10</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3044,7 +3044,7 @@
                     : `indeterminate — ${unpaired.length} unpaired non-SMB bolus(es) in the horizon; bounds only, no share`
             };
         };
-        const buildEventLedger = ({ findings, findingsBasis = 'unstated', suppressed, nightscoutData, schedules, profileHistory = [], now = new Date() }) => {
+        const buildEventLedger = ({ findings, findingsBasis = 'unstated', suppressed, nightscoutData, schedules, profileHistory = [], analysisWindowDays = null, now = new Date() }) => {
             // DEF-247 (v4.1.1): every as-of in this builder is the FETCH's, not the render's.
             const ledgerAsOf = nightscoutData?.fetchedAt ?? null;
             // DEF-249 (v4.1.1): what the loop was actually running under when the event happened.
@@ -3057,7 +3057,10 @@
             // block-level facts, each carb entry's for the plan (a multi-entry episode may straddle
             // an upload, and plan.basis has always said Σ gᵢ / CR(tᵢ)).
             const profileTally = newProfileLookupTally();
-            const schedAt = (dateLike) => { const r = schedulesAt(profileHistory, schedules, dateLike); tallyProfileLookup(profileTally, r.source); return r; };
+            const schedAtTallied = (tally) => (dateLike) => { const r = schedulesAt(profileHistory, schedules, dateLike); tallyProfileLookup(tally, r.source); return r; };
+            const schedAt = schedAtTallied(profileTally);
+            const crAtWith = (lookup) => (at) => (lookup(at).schedules?.cr || crS);
+            const sameEntry = (a, b) => new Date(a.created_at).getTime() === new Date(b.created_at).getTime() && a.carbs === b.carbs;
             const ledgerOverride = buildOverrideObserved(nightscoutData, profileBaseFromSchedules(schedAt));
             const ledgerAutoIsf = buildAutoIsfObserved(nightscoutData);   // DEF-269
             const census = { emittedByType: {}, droppedAsSignalByType: {}, droppedAsSignal: 0, droppedAsStructural: 0, dedupedDuplicates: 0, emittedRecords: 0, unclassified: 0,
@@ -3177,7 +3180,6 @@
                     .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
                 const windowPairs = ledgerPairMealBoluses(windowCarbEntries, treatments).filter(p => p.bolus && inWindow(p.bolus));
                 const pairedBoluses = windowPairs.map(p => p.bolus);
-                const sameEntry = (a, b) => new Date(a.created_at).getTime() === new Date(b.created_at).getTime() && a.carbs === b.carbs;
                 const govPair = pairs.length ? pairs[pairs.length - 1] : null;
                 const mealBolus = govPair && govPair.bolus ? govPair.bolus : null;
                 const correctionCandidates = insulinInWindow.filter(t => isTrueCorrection(t, treatments, crS));
@@ -3194,7 +3196,7 @@
                 const cobRead = recAtEvent ? extractCOB(recAtEvent) : { value: null, source: null };
                 const evSched = schedAt(evDate);
                 const evBasalS = evSched.schedules?.basal || basalS, evCrS = evSched.schedules?.cr || crS, evIsfS = evSched.schedules?.isf || isfS;
-                const crAtEntry = (at) => (schedAt(at).schedules?.cr || crS);
+                const crAtEntry = crAtWith(schedAt);
                 const plan = ledgerEpisodePlan(episode, pairs, treatments, crS, crAtEntry, deviceStatus, ledgerOverride);   // DEF-267
                 // DEF-218 (v4.0.1): the authority's ISF is the record's OWN per-correction lookup
                 // (candidateBlocks.isf), volume-weighted — one field pointing at another in the
@@ -3338,7 +3340,49 @@
                                          note: 'distinct dates in this run\'s ledger — no history column carries an observable-keyed record (DEF-206)' }; });
             census.emittedRecords = ledger.length;
             census.detected = detected + census.droppedAsSignal + census.droppedAsStructural;
-            return { eventLedger: ledger, eventCensus: census, profileLookups: profileTally };
+            // DEF-293 (v4.2.10): a delivery-vs-plan record for every carb episode in the analysis window, ledgered or not —
+            // a clean meal (the best CR read) had none, and a meal's plan sat on whatever event followed it. The same three
+            // builders and the same CR-at-entry and override closures as `plan` above, so where an event's plan is the whole
+            // episode the two cannot disagree. An event whose plan stops at an entry a later entry's episode extended is a view
+            // of the meal partway through: linked by ledgerEventsMidEpisode, never merged (r2, dev Q1). The lookups go through
+            // their own tally so meta.profileHistory.lookups keeps the ledger's count (r2, dev Q2).
+            const mealTally = newProfileLookupTally();
+            const mealCrAt = crAtWith(schedAtTallied(mealTally));
+            const mealWindow = pinnedAnalysisWindow(ledgerAsOf, analysisWindowDays,
+                glucose.reduce((m, r) => (r && r.dateString ? Math.max(m, new Date(r.dateString).getTime()) : m), -Infinity));
+            const asOfMs = ledgerAsOf == null ? NaN : new Date(ledgerAsOf).getTime();
+            const windowEntries = treatments.filter(t => t && t.created_at && t.carbs > 0).sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+                .filter(t => { const at = new Date(t.created_at).getTime(); return at >= mealWindow.startMs && at <= mealWindow.endMs; });
+            const governing = windowEntries.filter((e, i) => { const n = windowEntries[i + 1]; return !n || !ledgerMealEpisode(n, treatments, deviceStatus).some(x => sameEntry(x, e)); });
+            const mealEpisodes = governing.map(g => {
+                const episode = ledgerMealEpisode(g, treatments, deviceStatus);
+                const p = ledgerEpisodePlan(episode, ledgerPairMealBoluses(episode, treatments), treatments, crS, mealCrAt, deviceStatus, ledgerOverride);
+                const crBlocks = [...new Set(episode.map(c => { const e = ledgerEntryAt(mealCrAt(c.created_at), new Date(c.created_at)); return e ? e.time : null; }).filter(x => x !== null))];
+                const record = { governingEntryTime: new Date(g.created_at).toISOString(), firstEntryTime: new Date(episode[0].created_at).toISOString(), entries: episode.length,
+                    grams: episode.reduce((a, c) => a + c.carbs, 0), crBlocks,
+                    expectedUnits: p.expectedUnits, deliveredUnits: p.deliveredUnits, deliveredShareOfPlan: p.deliveredShareOfPlan,
+                    budgetDeterminate: p.budgetDeterminate, budgetRatioLower: p.budgetRatioLower, budgetRatioUpper: p.budgetRatioUpper,
+                    mealBolusUnits: p.mealBolusUnits, smbUnitsInHorizon: p.smbUnitsInHorizon, unpairedBolusUnits: p.unpairedBolusUnits, unpairedBolusCount: p.unpairedBolusCount,
+                    horizon: p.horizon ? { fromISO: p.horizon.fromISO, toISO: p.horizon.toISO, cutReason: p.horizon.cutReason } : null,
+                    openAtFetch: (p.horizon && Number.isFinite(asOfMs)) ? new Date(p.horizon.toISO).getTime() > asOfMs : null,
+                    presetAtFirstEntry: { percent: p.presetAtFirstEntry?.percent ?? null, preset: p.presetAtFirstEntry?.preset ?? null },
+                    iobAtFirstEntryNet: p.iobAtFirstEntry ? p.iobAtFirstEntry.net : null,
+                    ...(p.expectedUnits === null ? { note: p.note } : {}),
+                    ledgerEvents: [], ledgerEventsMidEpisode: [] };
+                return { record, episode };
+            });
+            ledger.forEach(r => {
+                const gov = r.carbs?.latestEntryTime; if (!gov) return;
+                const exact = mealEpisodes.find(m => m.record.governingEntryTime === gov);
+                if (exact) { exact.record.ledgerEvents.push(r.eventTime); return; }
+                const within = mealEpisodes.find(m => m.episode.some(c => new Date(c.created_at).toISOString() === gov));
+                if (within) within.record.ledgerEventsMidEpisode.push({ eventTime: r.eventTime, planGoverningEntryTime: gov });
+            });
+            const mealPlans = { records: mealEpisodes.map(m => m.record),
+                meta: { windowStart: mealWindow.start, windowEnd: mealWindow.end, episodes: mealEpisodes.length, entries: windowEntries.length, profileLookups: mealTally,
+                        basis: 'one plan per carb episode in the analysis window, from the same builders as eventLedger[].plan; identical to it where an event exists; declared only, nothing reads it',
+                        asOfBasis: 'dataFetchedAt' } };
+            return { eventLedger: ledger, eventCensus: census, profileLookups: profileTally, mealPlans };
         };
         // [EVENT-LEDGER-END]
         // [SAFETY-FACTS-START] v4.0.0 (§5). No window model: the ingredients, unjoined.
@@ -3621,7 +3665,7 @@
             'directionWiring', 'informationalFindings', 'delta', 'recommendation'];
         const toMeasurementOnlyExport = (structured, ctx) => {
             if (!structured || typeof structured !== 'object') return structured;
-            const { eventLedger, eventCensus, profileLookups } = buildEventLedger({ findings: ctx.findings, findingsBasis: ctx.findingsBasis, suppressed: ctx.suppressed, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, profileHistory: ctx.profileHistory || [] });
+            const { eventLedger, eventCensus, profileLookups, mealPlans } = buildEventLedger({ findings: ctx.findings, findingsBasis: ctx.findingsBasis, suppressed: ctx.suppressed, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, profileHistory: ctx.profileHistory || [], analysisWindowDays: ctx.analysisWindowDays });
             const safetyFacts = buildSafetyFacts({ eventLedger, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, agp7day: ctx.agp7day,
                                                    periods: ctx.periods, analysisWindowDays: ctx.analysisWindowDays, profileHistory: ctx.profileHistory || [],
                                                    historyRows: ctx.historyRows ?? null, refutedUnavailable: ctx.refutedUnavailable ?? null });
@@ -3691,7 +3735,9 @@
                                 'signals.basalRequirement (window, day keys, logSlots date) — DEF-271',
                                 'scheduleHistory (month buckets, exclude-today) — DEF-275',
                                 'protocolRegister (history rows dated after the fetch ignored) — DEF-285',
-                                'safetyFacts.refuted (history rows dated after the fetch ignored) — DEF-286'],
+                                'safetyFacts.refuted (history rows dated after the fetch ignored) — DEF-286',
+                                'meta.deviceAges.pod.nextChange (hoursToDue, overdue) — DEF-292',
+                                'mealPlans (window, openAtFetch) — DEF-293'],
                 notClockDependent: ['presetCatalog — a stored profile document; no clock is read (v4.2.5)', 'sleepModeObserved — the records\' own timestamps only; asOf marks a night still open at fetch (DEF-282)'],
                 readsTheRenderClock: [
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
@@ -3714,9 +3760,9 @@
             Object.keys(structured).forEach(k => {
                 if (k === 'meta' || MEASUREMENT_ONLY_REMOVED_KEYS.includes(k)) return;
                 out[k] = structured[k];
-                if (k === 'signals') { out.eventLedger = eventLedger; out.safetyFacts = safetyFactsOut; out.overrideObserved = overrideObserved; }
+                if (k === 'signals') { out.eventLedger = eventLedger; out.mealPlans = mealPlans; out.safetyFacts = safetyFactsOut; out.overrideObserved = overrideObserved; }
             });
-            if (!('eventLedger' in out)) { out.eventLedger = eventLedger; out.safetyFacts = safetyFactsOut; out.overrideObserved = overrideObserved; }
+            if (!('eventLedger' in out)) { out.eventLedger = eventLedger; out.mealPlans = mealPlans; out.safetyFacts = safetyFactsOut; out.overrideObserved = overrideObserved; }
             if (out.summary && typeof out.summary === 'object' && 'watchListCount' in out.summary) {
                 const s = { ...out.summary }; delete s.watchListCount; out.summary = s;
             }
@@ -3917,6 +3963,23 @@
         // The tool has the record and was not reading it. Declared only — the owner corrects on
         // disagreement, and a category with no record in the fetch says so rather than reading zero.
         const DEVICE_AGE_TYPES = { pod: ['site change', 'insulin change'], sensor: ['sensor start', 'sensor change'] };
+        // DEF-292 (v4.2.10): the review worked the next change night out by hand every session from lastChangeAt, and a
+        // calendar preset is keyed to that night. Life and grace are the Omnipod's stated figures (asserted); the change-by
+        // time is the owner's (Nov 14: "pods are always changed by 10 pm"). Declared only — no preset time is emitted.
+        const POD_LIFE_H = 72;
+        const POD_GRACE_H = 8;
+        const POD_CHANGE_BY_LOCAL = { h: 22, m: 0 };
+        const POD_NEXT_CHANGE_BASIS = 'due = last Site Change + 72 h, grace + 8 h (Omnipod, asserted); predictedNight = latest local evening whose 22:00 change-by time (owner, Nov 14) falls within the grace; declared only — the review confirms the night with the owner and owns what is scheduled';
+        const podNextChange = (all, lastMs, atMs) => {
+            const H = 3600000, r2 = (x) => Math.round(x * 100) / 100, dueMs = lastMs + POD_LIFE_H * H, graceMs = dueMs + POD_GRACE_H * H, g = new Date(graceMs);
+            let night = new Date(g.getFullYear(), g.getMonth(), g.getDate(), POD_CHANGE_BY_LOCAL.h, POD_CHANGE_BY_LOCAL.m, 0, 0);
+            if (night.getTime() > graceMs) night = new Date(g.getFullYear(), g.getMonth(), g.getDate() - 1, POD_CHANGE_BY_LOCAL.h, POD_CHANGE_BY_LOCAL.m, 0, 0);
+            const pad = (n) => String(n).padStart(2, '0');
+            return { basisChangeAt: new Date(lastMs).toISOString(), dueAt: new Date(dueMs).toISOString(), graceEndAt: new Date(graceMs).toISOString(),
+                     predictedNight: night.getFullYear() + '-' + pad(night.getMonth() + 1) + '-' + pad(night.getDate()), predictedNightBy: night.toISOString(),
+                     hoursToDue: Number.isFinite(atMs) ? r2((dueMs - atMs) / H) : null, overdue: Number.isFinite(atMs) ? atMs > graceMs : null,
+                     intervalsH: all.slice(1).map((ms, i) => r2((ms - all[i]) / H)), basis: POD_NEXT_CHANGE_BASIS };
+        };
         const deviceAgeEvents = (treatments, kind) => (treatments || [])
             .filter(t => t && t.created_at && t.eventType && DEVICE_AGE_TYPES[kind].includes(String(t.eventType).trim().toLowerCase()))
             .map(t => new Date(t.created_at).getTime())
@@ -3937,8 +4000,11 @@
                          ageHoursAtFetch: Number.isFinite(atMs) ? Math.round(((atMs - last) / 3600000) * 100) / 100 : null,
                          [listKey]: all.filter(ms => windowStartMs === null || ms >= windowStartMs).map(ms => new Date(ms).toISOString()) };
             };
+            const pod = mk('pod', 'lastChangeAt', 'changesInWindow');
+            if (pod.lastChangeAt === null) { pod.nextChange = null; pod.nextChangeReason = 'no Site Change in the fetched treatments'; }
+            else pod.nextChange = podNextChange(deviceAgeEvents(treatments, 'pod'), new Date(pod.lastChangeAt).getTime(), atMs);
             return {
-                pod: mk('pod', 'lastChangeAt', 'changesInWindow'),
+                pod,
                 sensor: mk('sensor', 'lastStartAt', 'startsInWindow'),
                 basis: "treatments eventType 'Site Change' / 'Sensor Start' (also 'Sensor Change', 'Insulin Change' if present); age measured to dataFetchedAt",
                 note: 'declared only'
@@ -13736,7 +13802,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.2.9',
+                            version: '4.2.10',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -14265,7 +14331,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.2.9',
+                        version: '4.2.10',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -19795,7 +19861,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.2.9 — REFUTED: fingersticks against CGM lows, net TBR beside printed (DEF-286) · register refresh flag (DEF-287) · REGISTER lines out of the decision-log history (DEF-288)</p>
+                                    <p className="text-gray-400 text-sm">v4.2.10 — next pod change night (DEF-292) · mealPlans: a delivery-vs-plan record for every carb episode (DEF-293)</p>
                                     {/* [DS-FETCH-SCREEN-START] DEF-273 (v4.2.1): the devicestatus fetch, chunk by chunk, where the owner can see it. */}
                                     {analysisResults?.nightscoutData?.deviceStatusFetch && (
                                         <p className="text-gray-500 text-xs mt-1">
