@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Daily Insulin Settings Review v4.2.10</title>
+    <title>Daily Insulin Settings Review v4.2.11</title>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js"></script>
@@ -3371,15 +3371,21 @@
                     ledgerEvents: [], ledgerEventsMidEpisode: [] };
                 return { record, episode };
             });
+            // DEF-295 (v4.2.11): an event the placement cannot link (its governing entry is in no record, e.g. before
+            // windowStart) is declared rather than dropped, and events with no plan at all are counted, so placed +
+            // unplaced + without-plan is the whole ledger.
+            const unplaced = []; let withoutPlan = 0;
             ledger.forEach(r => {
-                const gov = r.carbs?.latestEntryTime; if (!gov) return;
+                const gov = r.carbs?.latestEntryTime; if (!gov) { withoutPlan++; return; }
                 const exact = mealEpisodes.find(m => m.record.governingEntryTime === gov);
                 if (exact) { exact.record.ledgerEvents.push(r.eventTime); return; }
                 const within = mealEpisodes.find(m => m.episode.some(c => new Date(c.created_at).toISOString() === gov));
                 if (within) within.record.ledgerEventsMidEpisode.push({ eventTime: r.eventTime, planGoverningEntryTime: gov });
+                else unplaced.push({ eventTime: r.eventTime, planGoverningEntryTime: gov });
             });
             const mealPlans = { records: mealEpisodes.map(m => m.record),
                 meta: { windowStart: mealWindow.start, windowEnd: mealWindow.end, episodes: mealEpisodes.length, entries: windowEntries.length, profileLookups: mealTally,
+                        ledgerEventsUnplaced: { count: unplaced.length, events: unplaced }, ledgerEventsWithoutPlan: withoutPlan,
                         basis: 'one plan per carb episode in the analysis window, from the same builders as eventLedger[].plan; identical to it where an event exists; declared only, nothing reads it',
                         asOfBasis: 'dataFetchedAt' } };
             return { eventLedger: ledger, eventCensus: census, profileLookups: profileTally, mealPlans };
@@ -3501,16 +3507,24 @@
             // Rule 1 source for basal — a dead event would block a live block. Same pinned bounds
             // as every other population in this builder; the two sums are declared beside it.
             const glucose = (nightscoutData?.glucose || []).slice().sort((a, b) => new Date(a.dateString) - new Date(b.dateString));
+            // DEF-298 (v4.2.11, SAFETY): the ≤ 30 min join keeps two lows one event even when BG recovers above the
+            // threshold between them (Nov 15: the treated 56 at 19:29, back to 100, and the 42 at 20:19). Grouping is
+            // unchanged; the event records where it recovered, as runs, so a REFUTED line nets out only the low it names.
+            // A finite reading at or above the threshold breaks the open run; a null or non-finite sgv neither breaks nor joins.
             const lowEvents = []; let cur = null;
+            const addToRun = (ev, r) => { if (!Number.isFinite(r.sgv)) return; if (ev.broken || !ev.runs.length) ev.runs.push([r]); else ev.runs[ev.runs.length - 1].push(r); ev.broken = false; };
             glucose.forEach(r => {
                 const t = new Date(r.dateString).getTime();
                 if (t < safetyWindow.startMs || t > safetyWindow.endMs) return;
                 if (r.sgv < CONFIG.lowThreshold) {
-                    if (cur && t - cur.lastMs <= 30 * 60000) { cur.lastMs = t; cur.readings.push(r); if (r.sgv < cur.bg) { cur.bg = r.sgv; cur.time = r.dateString; } }
-                    else { if (cur) lowEvents.push(cur); cur = { time: r.dateString, bg: r.sgv, lastMs: t, readings: [r] }; }
-                }
+                    if (cur && t - cur.lastMs <= 30 * 60000) { cur.lastMs = t; cur.readings.push(r); if (r.sgv < cur.bg) { cur.bg = r.sgv; cur.time = r.dateString; } addToRun(cur, r); }
+                    else { if (cur) lowEvents.push(cur); cur = { time: r.dateString, bg: r.sgv, lastMs: t, readings: [r], runs: [], broken: false }; addToRun(cur, r); }
+                } else if (cur && Number.isFinite(r.sgv)) cur.broken = true;
             });
             if (cur) lowEvents.push(cur);
+            const runSummary = (run) => { const nadir = run.reduce((m, r) => (r.sgv < m.sgv ? r : m), run[0]);
+                return { startTime: new Date(run[0].dateString).toISOString(), endTime: new Date(run[run.length - 1].dateString).toISOString(),
+                         nadirTime: new Date(nadir.dateString).toISOString(), nadirBg: nadir.sgv, readings: run.length }; };
             // [LOW-SHAPE-START] v4.0.4 (DEF-231). The pressure-artifact shape, declared clause by
             // clause — the detector's `likelyPressureLow` ANDs rapidRecovery, isolated and
             // nadir < 55, and DEF-232 showed the nadir gate misses fingerstick-confirmed artifacts
@@ -3573,6 +3587,7 @@
             const lows = lowEvents.map((e, ei) => { const rec = findDeviceStatusAt(nightscoutData?.deviceStatus || [], new Date(e.time), { direction: 'before' }); const shape = lowShape(e);
                 return { time: new Date(e.time).toISOString(), bg: e.bg, hour: new Date(e.time).getHours(), netIob: rec ? extractIOB(rec) : null, basalIob: rec ? extractBasalIOB(rec) : null, treatmentCarbsImputed: null,
                          rapidRecovery: shape.rapidRecovery, isolated: shape.isolated, gapsNearEvent: shape.gapsNearEvent, readingsNearEvent: shape.readingsNearEvent, shapeFlagged: shape.shapeFlagged, readingsInEvent: e.readings.length,
+                         runs: e.runs.map((run, ri) => ({ ...runSummary(run), ...(refutedBuilt && refutedBuilt.perRun.has(ei + ':' + ri) ? { refuted: refutedBuilt.perRun.get(ei + ':' + ri) } : {}) })),
                          overrideAtEvent: overrideAtTime(safetyOverride, new Date(e.time)),
                          autoISFAtEvent: autoISFAtTime(safetyAutoIsf, nightscoutData?.deviceStatus || [], sfTreatments, new Date(e.time)),   // DEF-269
                          podAgeHours: deviceAgeHoursAt(sfTreatments, 'pod', new Date(e.time).getTime()),
@@ -3663,6 +3678,26 @@
         // the sheet and what the screen rendered. What leaves here is the instrument.
         const MEASUREMENT_ONLY_REMOVED_KEYS = ['actions', 'watchList', 'gateCost', 'blockPersistence', 'shadowUnblock',
             'directionWiring', 'informationalFindings', 'delta', 'recommendation'];
+        // DEF-297 (v4.2.11): WeekendCR moves the lunch CR boundary 09:30 → 11:00 for a late weekend breakfast and back
+        // before a school day; a missed restore gives a 09:30 school snack the breakfast CR. The Nov 14 review caught the
+        // layout by reading schedules.cr by eye. Block START TIMES, document to document, read straight off the profile
+        // history — not through schedulesAt, so the lookup tally does not move. Value-only changes are scheduleHistory's.
+        const CR_LAYOUT_BASIS = "CR block start times compared document to document within the analysis window; value-only changes are parameter changes (scheduleHistory) and are not listed; declared only — whether a layout is right for the day is the review's";
+        const crLayoutOf = (doc) => { const cr = doc?.schedules?.cr;
+            if (!Array.isArray(cr) || !cr.length || cr.some(b => !b || typeof b.time !== 'string' || !Number.isFinite(b.value))) return null;
+            return cr.map(b => ({ time: b.time, value: b.value })); };
+        const buildCrLayout = (profileHistory, currentCr, startMs, endMs) => {
+            const docs = (Array.isArray(profileHistory) ? profileHistory : []).filter(d => d && Number.isFinite(d.startMs)).slice().sort((a, b) => a.startMs - b.startMs);
+            let prev = null, unreadable = 0; const changes = [];
+            docs.filter(d => d.startMs <= startMs).forEach(d => { const l = crLayoutOf(d); if (l) prev = l; });
+            docs.filter(d => d.startMs > startMs && d.startMs <= endMs).forEach(d => {
+                const l = crLayoutOf(d); if (!l) { unreadable++; return; }
+                if (prev && prev.map(b => b.time).join('|') !== l.map(b => b.time).join('|')) changes.push({ at: new Date(d.startMs).toISOString(), from: prev, to: l });
+                prev = l;
+            });
+            return { crLayoutAtFetch: (Array.isArray(currentCr) ? currentCr : []).map(b => ({ time: b.time, value: b.value })), crLayoutChanges: changes,
+                     crLayoutBasis: CR_LAYOUT_BASIS, crLayoutUnreadableDocs: unreadable };
+        };
         const toMeasurementOnlyExport = (structured, ctx) => {
             if (!structured || typeof structured !== 'object') return structured;
             const { eventLedger, eventCensus, profileLookups, mealPlans } = buildEventLedger({ findings: ctx.findings, findingsBasis: ctx.findingsBasis, suppressed: ctx.suppressed, nightscoutData: ctx.nightscoutData, schedules: ctx.schedules, profileHistory: ctx.profileHistory || [], analysisWindowDays: ctx.analysisWindowDays });
@@ -3708,7 +3743,8 @@
                 lookups: { profileAtTime: (profileLookups?.profileAtTime || 0) + sfLookups.profileAtTime,
                            earliestProfile: (profileLookups?.earliestProfile || 0) + sfLookups.earliestProfile,
                            currentProfile: (profileLookups?.currentProfile || 0) + sfLookups.currentProfile },
-                basis: 'every per-event and per-carb-entry lookup resolves the profile document in effect at its own timestamp (DEF-251); parameterSpans, slotAge.lastChanged, schedules and scheduleShape stay on the current profile — they describe the schedule as it is'
+                basis: 'every per-event and per-carb-entry lookup resolves the profile document in effect at its own timestamp (DEF-251); parameterSpans, slotAge.lastChanged, schedules and scheduleShape stay on the current profile — they describe the schedule as it is',
+                ...(() => { const w = pinnedAnalysisWindow(ctx.nightscoutData?.fetchedAt ?? null, ctx.analysisWindowDays); return buildCrLayout(ph, ctx.schedules?.cr, w.startMs, w.endMs); })()
             };
             meta.measurementOnly = true;
             // §12d: an observable, not a reminder. false is a value and is emitted as one.
@@ -3737,7 +3773,8 @@
                                 'protocolRegister (history rows dated after the fetch ignored) — DEF-285',
                                 'safetyFacts.refuted (history rows dated after the fetch ignored) — DEF-286',
                                 'meta.deviceAges.pod.nextChange (hoursToDue, overdue) — DEF-292',
-                                'mealPlans (window, openAtFetch) — DEF-293'],
+                                'mealPlans (window, openAtFetch) — DEF-293',
+                                'meta.profileHistory.crLayoutChanges — DEF-297'],
                 notClockDependent: ['presetCatalog — a stored profile document; no clock is read (v4.2.5)', 'sleepModeObserved — the records\' own timestamps only; asOf marks a night still open at fetch (DEF-282)'],
                 readsTheRenderClock: [
                     { field: 'meta.timestamp / meta.localTimestamp', why: 'when the Copy happened — that is what they mean' },
@@ -3873,37 +3910,57 @@
                 if (p.error) { malformed.push({ loggedOn: x.key, line: line.trim().slice(0, 200), reason: p.error }); return; }
                 parsed.push({ ...p, loggedOn: x.key });
             }));
-            const MIN = 60000, ev = lowEvents.map(e => { const ms = e.readings.map(r => new Date(r.dateString).getTime()); return { e, startMs: Math.min(...ms), endMs: Math.max(...ms), nadirMs: new Date(e.time).getTime() }; });
-            const nearestTo = (e, cgm) => Math.min(...e.readings.map(r => Math.abs(r.sgv - cgm)));
+            // DEF-298 (v4.2.11): lines match RUNS, not whole events — the same rules, over each sub-70 stretch the walk
+            // recorded, so a line naming one low moves only that low's readings.
+            const MIN = 60000, ev = lowEvents.flatMap((e, ei) => (e.runs || [e.readings]).filter(run => run.length).map((run, ri) => { const ms = run.map(r => new Date(r.dateString).getTime());
+                const nadir = run.reduce((m, r) => (r.sgv < m.sgv ? r : m), run[0]);
+                return { e, ei, ri, readings: run, startMs: Math.min(...ms), endMs: Math.max(...ms), nadirMs: new Date(nadir.dateString).getTime() }; }));
+            const nearestTo = (x, cgm) => Math.min(...x.readings.map(r => Math.abs(r.sgv - cgm)));
             const outcomes = parsed.map(l => {
                 if (!(l.statedMs >= windowStartMs && l.statedMs <= windowEndMs)) return { l, idx: null, reason: 'outside lowEventsWindow', outOfWindow: true };
                 let cands = ev.map((x, i) => i).filter(i => l.statedMs >= ev[i].startMs - 10 * MIN && l.statedMs <= ev[i].endMs + 10 * MIN), ambiguous = false;
-                if (cands.length > 1) { ambiguous = true; cands.sort((a, b) => nearestTo(ev[a].e, l.cgm) - nearestTo(ev[b].e, l.cgm) || ev[a].nadirMs - ev[b].nadirMs); }
+                if (cands.length > 1) { ambiguous = true; cands.sort((a, b) => nearestTo(ev[a], l.cgm) - nearestTo(ev[b], l.cgm) || ev[a].nadirMs - ev[b].nadirMs); }
                 if (!cands.length) cands = ev.map((x, i) => i).filter(i => Math.abs(ev[i].nadirMs - l.statedMs) <= 20 * MIN)
                     .sort((a, b) => Math.abs(ev[a].nadirMs - l.statedMs) - Math.abs(ev[b].nadirMs - l.statedMs) || ev[a].nadirMs - ev[b].nadirMs);
                 if (!cands.length) return { l, idx: null, reason: 'no low event within 20 min' };
                 const i = cands[0];
-                if (!(nearestTo(ev[i].e, l.cgm) <= 5)) return { l, idx: null, reason: 'no reading near cgm=' + l.cgm + ' in the event at ' + new Date(ev[i].e.time).toISOString() };
+                if (!(nearestTo(ev[i], l.cgm) <= 5)) return { l, idx: null, reason: 'no reading near cgm=' + l.cgm + ' in the event at ' + new Date(ev[i].e.time).toISOString() };
                 return { l, idx: i, ambiguous, reason: null };
             });
             const winner = new Map(); outcomes.forEach((o, k) => { if (o.idx !== null) winner.set(o.idx, k); });
             const pop = agpPopulationOf(glucoseInput, agp7day?.days ?? 7, asOf);
-            const perEvent = new Map(); let removed = 0, removedVeryLow = 0, moved = 0; const removedByHour = {};
+            const perRun = new Map(), perEvent = new Map(); let removed = 0, removedVeryLow = 0, moved = 0; const removedByHour = {};
             winner.forEach((k, i) => {
-                const o = outcomes[k], e = ev[i].e, fs = o.l.fs;
-                const cls = fs >= 70 ? 'refuted' : (fs >= 54 && e.readings.some(r => r.sgv < 54)) ? 'downgraded' : 'confirmed';
-                const moves = cls === 'refuted' ? e.readings.filter(r => r.sgv < 70) : cls === 'downgraded' ? e.readings.filter(r => r.sgv < 54) : [];
+                const o = outcomes[k], run = ev[i].readings, fs = o.l.fs;
+                const cls = fs >= 70 ? 'refuted' : (fs >= 54 && run.some(r => r.sgv < 54)) ? 'downgraded' : 'confirmed';
+                const moves = cls === 'refuted' ? run.filter(r => r.sgv < 70) : cls === 'downgraded' ? run.filter(r => r.sgv < 54) : [];
                 const inside = moves.filter(r => pop.has(r)), outside = moves.length - inside.length;
                 if (cls === 'refuted') { removed += inside.length; removedVeryLow += inside.filter(r => r.sgv < 54).length;
                     inside.forEach(r => { const h = new Date(r.dateString).getHours(); removedByHour[h] = (removedByHour[h] || 0) + 1; }); }
                 if (cls === 'downgraded') moved += inside.length;
-                perEvent.set(i, { class: cls, fs, cgm: o.l.cgm, statedTime: o.l.statedTime, loggedOn: o.l.loggedOn, note: o.l.note, ambiguous: o.ambiguous === true,
+                perRun.set(ev[i].ei + ':' + ev[i].ri, { class: cls, fs, cgm: o.l.cgm, statedTime: o.l.statedTime, loggedOn: o.l.loggedOn, note: o.l.note, ambiguous: o.ambiguous === true,
                                   readingsAffected: inside.length, readingsOutsideDenominator: outside });
+            });
+            // The event keeps an event-level refuted only when every run is matched; a partly refuted event stays live
+            // wherever that field is read. Its class is the least-removing run's; the line fields are that run's (the
+            // earliest on a tie), so every field keeps its single-run type (r2).
+            const CLASS_RANK = { confirmed: 0, downgraded: 1, refuted: 2 };
+            let partialEvents = 0;
+            lowEvents.forEach((e, ei) => {
+                const runRecs = ev.filter(x => x.ei === ei).map(x => perRun.get(ei + ':' + x.ri));
+                if (!runRecs.some(Boolean)) return;
+                if (!runRecs.every(Boolean)) { partialEvents++; return; }
+                if (runRecs.length === 1) { perEvent.set(ei, runRecs[0]); return; }
+                const lead = runRecs.reduce((m, x) => (CLASS_RANK[x.class] < CLASS_RANK[m.class] ? x : m), runRecs[0]);
+                perEvent.set(ei, { class: lead.class, fs: lead.fs, cgm: lead.cgm, statedTime: lead.statedTime, loggedOn: lead.loggedOn, note: lead.note, ambiguous: runRecs.some(x => x.ambiguous),
+                                   readingsAffected: runRecs.reduce((a, x) => a + x.readingsAffected, 0), readingsOutsideDenominator: runRecs.reduce((a, x) => a + x.readingsOutsideDenominator, 0),
+                                   runsMatched: runRecs.length });
             });
             const lines = outcomes.map((o, k) => {
                 const won = o.idx !== null && winner.get(o.idx) === k, lost = o.idx !== null && !won;
                 return { statedTime: o.l.statedTime, cgm: o.l.cgm, fs: o.l.fs, loggedOn: o.l.loggedOn, matchedEventTime: o.idx !== null ? new Date(ev[o.idx].e.time).toISOString() : null,
-                         class: won ? perEvent.get(o.idx).class : null,
+                         matchedRun: o.idx !== null ? ev[o.idx].ri : null,
+                         class: won ? perRun.get(ev[o.idx].ei + ':' + ev[o.idx].ri).class : null,
                          reason: lost ? 'superseded by the ' + outcomes[winner.get(o.idx)].l.loggedOn + ' line' : o.reason };
             });
             let net = null, netUnavailableReason = null;
@@ -3921,12 +3978,12 @@
             const out = { lines, net,
                           meta: { source: 'REFUTED: lines in the Decision_Log history (DEF-286)', linesParsed, linesMatched: winner.size,
                                   unmatched: outcomes.filter(o => o.idx === null && !o.outOfWindow).length, outOfWindow: outcomes.filter(o => o.outOfWindow).length,
-                                  malformed, superseded: outcomes.filter((o, k) => o.idx !== null && winner.get(o.idx) !== k).length,
+                                  malformed, superseded: outcomes.filter((o, k) => o.idx !== null && winner.get(o.idx) !== k).length, partialEvents,
                                   rowsIgnoredAfterAsOf: ignoredAfterAsOf, asOfBasis: 'dataFetchedAt',
                                   populationCheck: { readings: pop.size, agpReadingCount: agp7day?.readingCount ?? null, equal: agp7day ? pop.size === agp7day.readingCount : null },
                                   ...(netUnavailableReason ? { netUnavailableReason } : {}),
                                   basis: REFUTED_BASIS, ...(linesParsed === 0 ? { note: 'no REFUTED lines in the history yet' } : {}) } };
-            return { perEvent, out };
+            return { perEvent, perRun, out };
         };
         // [REFUTED-END]
         // DEF-237 (v4.0.5): a cached session says so in the FIRST line of every surface — the
@@ -13802,7 +13859,7 @@
                 if (primaryBundlesCheck.length === 0 && !hasUrgent && basalRatioOk && tirOk && veryLowOk && !hasSignificantSignals && !hasDivergences) {
                     return atExportBoundary({
                         meta: {
-                            version: '4.2.10',
+                            version: '4.2.11',
                             timestamp: new Date().toISOString(),
                             localTimestamp: new Date().toLocaleString(),
                             analysisWindow: config.basalSignalWindow || 7,
@@ -14331,7 +14388,7 @@
                 // Assemble structured export
                 const structured = {
                     meta: {
-                        version: '4.2.10',
+                        version: '4.2.11',
                         timestamp: new Date().toISOString(),
                         localTimestamp: new Date().toLocaleString(),
                         analysisWindow: config?.analysisWindow || 7,
@@ -19861,7 +19918,7 @@
                                     <h1 className="text-2xl font-bold text-white mb-1">
                                         Daily Insulin Settings Review
                                     </h1>
-                                    <p className="text-gray-400 text-sm">v4.2.10 — next pod change night (DEF-292) · mealPlans: a delivery-vs-plan record for every carb episode (DEF-293)</p>
+                                    <p className="text-gray-400 text-sm">v4.2.11 — low runs; REFUTED lines net per run (DEF-298) · unplaced meal-plan events declared (DEF-295) · CR layout changes (DEF-297)</p>
                                     {/* [DS-FETCH-SCREEN-START] DEF-273 (v4.2.1): the devicestatus fetch, chunk by chunk, where the owner can see it. */}
                                     {analysisResults?.nightscoutData?.deviceStatusFetch && (
                                         <p className="text-gray-500 text-xs mt-1">
